@@ -4,8 +4,9 @@
 
 - `CLONE_NEWUTS` for an isolated hostname
 - `CLONE_NEWPID` for a separate process-ID namespace
-- `CLONE_NEWNS` for a separate mount namespace
-- `chroot` for a filesystem boundary
+- `CLONE_NEWNS` for a separate mount namespace, made private so mounts don't leak to the host
+- `pivot_root` for a filesystem boundary, with the host's root detached
+- a fresh `/proc`, so `ps` and `top` only see the container's processes
 
 This is educational code, not a production container runtime. It currently requires Linux and root privileges for `run`.
 
@@ -48,6 +49,4 @@ make build
 sudo ./runt run --rootfs /var/lib/runt/rootfs -- /bin/hostname   # prints "runt"
 ```
 
-`/proc` is not mounted inside the container yet, so tools like `ps` won't work there.
-
-The next framework increments should add mounted `/proc`, capability dropping, cgroups v2, UID/GID namespaces, seccomp, a lifecycle state directory, and OCI image/config support.
+See [ROADMAP.md](ROADMAP.md) for the remaining steps toward a Docker-like runtime.
