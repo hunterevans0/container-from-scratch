@@ -7,16 +7,17 @@ The steps between `runt` and a Docker-like container runtime. Each stage builds 
 - [x] Mount a fresh `/proc` inside the container so `ps` and `top` work.
 - [x] Switch from `chroot` to `pivot_root`, and detach the host's old root.
 - [x] Make mounts private so mounts made inside the container don't leak to the host.
+- [x] Minimal `/dev` on tmpfs: `null`, `zero`, `full`, `random`, `urandom`, `tty` (bind-mounted from the host), plus `/dev/pts`, `/dev/shm`, and the standard symlinks.
+- [x] Network namespace (`CLONE_NEWNET`) with the loopback interface brought up.
+- [x] IPC namespace (`CLONE_NEWIPC`).
+- [x] User namespace (`CLONE_NEWUSER`): container root is host uid 100000, and `make rootfs` shifts file ownership to match.
+- [x] Cgroup namespace (`CLONE_NEWCGROUP`).
 
 ## Stage 1: Finish isolation
 
-All in `internal/runtime/runtime_linux.go`.
-
-- [ ] Create basic device nodes: `/dev/null`, `/dev/zero`, `/dev/urandom`, `/dev/tty`, and so on.
-- [ ] Network namespace (`CLONE_NEWNET`) so the container gets its own separate network.
-- [ ] IPC namespace (`CLONE_NEWIPC`) so the container can't reach host shared memory or message queues.
-- [ ] User namespace (`CLONE_NEWUSER`): root inside the container, an unprivileged user outside.
-- [ ] Cgroup namespace (`CLONE_NEWCGROUP`) so the container can't see the host's cgroup tree.
+- [ ] Mount `/sys` read-only (needs the network namespace, which is now in place).
+- [ ] Mount `/dev/mqueue` for POSIX message queues in the IPC namespace.
+- [ ] Make the user namespace ID range configurable instead of fixed at 100000, and read it from `/etc/subuid` and `/etc/subgid`.
 
 ## Stage 2: Security
 
@@ -86,4 +87,4 @@ All in `internal/runtime/runtime_linux.go`.
 
 ## Suggested next steps
 
-Device nodes, capability dropping, cgroups v2 memory/PID limits, and a state directory with an ID per container give the biggest improvement for the least work. After OCI support is in, existing tools can fill gaps: `skopeo` to pull images, `buildah` to build them.
+Capability dropping, cgroups v2 memory/PID limits, and a state directory with an ID per container give the biggest improvement for the least work. The bridge network (Stage 6) is what gives containers internet access again. After OCI support is in, existing tools can fill gaps: `skopeo` to pull images, `buildah` to build them.
