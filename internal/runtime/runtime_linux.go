@@ -11,19 +11,25 @@ import (
 	"unsafe"
 )
 
-// Container UIDs/GIDs 0-65535 map to host IDs idMapBase-(idMapBase+65535), so
-// root inside the container is an unprivileged user on the host. This must
-// match id_base in scripts/make-rootfs.sh, which shifts the rootfs ownership.
-const (
-	idMapBase = 100000
-	idMapSize = 65536
-)
-
 func Run(config Config) error {
 	if len(config.Command) == 0 {
 		return fmt.Errorf("command cannot be empty")
 	}
-	if err := checkRootfsOwner(config.Rootfs); err != nil {
+	// Container UIDs/GIDs 0..Size-1 map to host IDs Base..Base+Size-1, so root
+	// inside the container is an unprivileged user on the host. The ranges
+	// come from /etc/subuid and /etc/subgid; scripts/make-rootfs.sh reads the
+	// same files to shift the rootfs ownership to match.
+	user := usernsUser(config.UsernsUser)
+	explicit := config.UsernsUser != ""
+	uids, err := subIDRange("/etc/subuid", user, explicit)
+	if err != nil {
+		return fmt.Errorf("read subordinate UIDs: %w", err)
+	}
+	gids, err := subIDRange("/etc/subgid", user, explicit)
+	if err != nil {
+		return fmt.Errorf("read subordinate GIDs: %w", err)
+	}
+	if err := checkRootfsOwner(config.Rootfs, uids, gids); err != nil {
 		return err
 	}
 
@@ -41,11 +47,11 @@ func Run(config Config) error {
 			syscall.CLONE_NEWNET |
 			syscall.CLONE_NEWIPC |
 			syscall.CLONE_NEWCGROUP,
-		UidMappings: []syscall.SysProcIDMap{{ContainerID: 0, HostID: idMapBase, Size: idMapSize}},
-		GidMappings: []syscall.SysProcIDMap{{ContainerID: 0, HostID: idMapBase, Size: idMapSize}},
+		UidMappings: []syscall.SysProcIDMap{{ContainerID: 0, HostID: uids.Base, Size: uids.Size}},
+		GidMappings: []syscall.SysProcIDMap{{ContainerID: 0, HostID: gids.Base, Size: gids.Size}},
 		// Allow setgroups inside the container so tools like apt and su work.
 		GidMappingsEnableSetgroups: true,
-		// Become root of the new user namespace (host uid idMapBase). Without
+		// Become root of the new user namespace (host uid uids.Base). Without
 		// this the child stays host uid 0, which is unmapped there, so it
 		// would have no capabilities inside the container.
 		Credential: &syscall.Credential{Uid: 0, Gid: 0},
@@ -54,14 +60,14 @@ func Run(config Config) error {
 }
 
 // checkRootfsOwner fails early with a helpful message if the rootfs has not
-// been shifted into the user-namespace ID range.
-func checkRootfsOwner(rootfs string) error {
+// been shifted into the user-namespace ID ranges.
+func checkRootfsOwner(rootfs string, uids, gids IDRange) error {
 	var stat syscall.Stat_t
 	if err := syscall.Stat(rootfs, &stat); err != nil {
 		return fmt.Errorf("stat rootfs %q: %w", rootfs, err)
 	}
-	if stat.Uid != idMapBase {
-		return fmt.Errorf("rootfs %q is owned by host uid %d, but container root is host uid %d; run `make rootfs` to shift its ownership", rootfs, stat.Uid, idMapBase)
+	if int(stat.Uid) != uids.Base || int(stat.Gid) != gids.Base {
+		return fmt.Errorf("rootfs %q is owned by host %d:%d, but container root is host %d:%d; run `make rootfs` to shift its ownership", rootfs, stat.Uid, stat.Gid, uids.Base, gids.Base)
 	}
 	return nil
 }
@@ -91,16 +97,25 @@ func Init() error {
 	if err := syscall.Mount(rootfs, rootfs, "", syscall.MS_BIND|syscall.MS_REC, ""); err != nil {
 		return fmt.Errorf("bind mount rootfs %q: %w", rootfs, err)
 	}
-	// /proc and /dev are set up before pivot_root: inside a user namespace
-	// the kernel only allows mounting proc while the host's /proc is still
-	// visible, and /dev borrows device files from the host's /dev.
+	// /proc, /sys, and /dev are set up before pivot_root: inside a user
+	// namespace the kernel only allows mounting proc and sysfs while the
+	// host's copies are still visible, and /dev borrows device files from
+	// the host's /dev.
 	if err := mountProc(rootfs); err != nil {
+		return err
+	}
+	if err := mountSys(rootfs); err != nil {
 		return err
 	}
 	if err := setupDev(rootfs); err != nil {
 		return err
 	}
 	if err := pivotRoot(rootfs); err != nil {
+		return err
+	}
+	// Everything above needed full privileges in the user namespace; the
+	// command itself does not.
+	if err := dropCapabilities(); err != nil {
 		return err
 	}
 
@@ -142,6 +157,21 @@ func mountProc(rootfs string) error {
 	flags := uintptr(syscall.MS_NOSUID | syscall.MS_NOEXEC | syscall.MS_NODEV)
 	if err := syscall.Mount("proc", target, "proc", flags, ""); err != nil {
 		return fmt.Errorf("mount /proc: %w", err)
+	}
+	return nil
+}
+
+// mountSys mounts a read-only /sys. sysfs shows the network devices of the
+// mounting process's network namespace, so the container sees only its own
+// interfaces, and read-only keeps it from changing kernel settings.
+func mountSys(rootfs string) error {
+	target := filepath.Join(rootfs, "sys")
+	if err := os.MkdirAll(target, 0o555); err != nil {
+		return fmt.Errorf("create %q: %w", target, err)
+	}
+	flags := uintptr(syscall.MS_RDONLY | syscall.MS_NOSUID | syscall.MS_NOEXEC | syscall.MS_NODEV)
+	if err := syscall.Mount("sysfs", target, "sysfs", flags, ""); err != nil {
+		return fmt.Errorf("mount /sys: %w", err)
 	}
 	return nil
 }
@@ -201,6 +231,15 @@ func setupDev(rootfs string) error {
 	}
 	if err := syscall.Mount("shm", shm, "tmpfs", syscall.MS_NOSUID|syscall.MS_NODEV|syscall.MS_NOEXEC, "mode=1777,size=65536k"); err != nil {
 		return fmt.Errorf("mount /dev/shm: %w", err)
+	}
+
+	// mqueue shows the POSIX message queues of this IPC namespace.
+	mqueue := filepath.Join(dev, "mqueue")
+	if err := os.Mkdir(mqueue, 0o755); err != nil {
+		return fmt.Errorf("create %q: %w", mqueue, err)
+	}
+	if err := syscall.Mount("mqueue", mqueue, "mqueue", syscall.MS_NOSUID|syscall.MS_NODEV|syscall.MS_NOEXEC, ""); err != nil {
+		return fmt.Errorf("mount /dev/mqueue: %w", err)
 	}
 	return nil
 }

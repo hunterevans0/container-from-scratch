@@ -10,18 +10,15 @@ The steps between `runt` and a Docker-like container runtime. Each stage builds 
 - [x] Minimal `/dev` on tmpfs: `null`, `zero`, `full`, `random`, `urandom`, `tty` (bind-mounted from the host), plus `/dev/pts`, `/dev/shm`, and the standard symlinks.
 - [x] Network namespace (`CLONE_NEWNET`) with the loopback interface brought up.
 - [x] IPC namespace (`CLONE_NEWIPC`).
-- [x] User namespace (`CLONE_NEWUSER`): container root is host uid 100000, and `make rootfs` shifts file ownership to match.
+- [x] User namespace (`CLONE_NEWUSER`): container root is an unprivileged host uid, and `make rootfs` shifts file ownership to match.
 - [x] Cgroup namespace (`CLONE_NEWCGROUP`).
-
-## Stage 1: Finish isolation
-
-- [ ] Mount `/sys` read-only (needs the network namespace, which is now in place).
-- [ ] Mount `/dev/mqueue` for POSIX message queues in the IPC namespace.
-- [ ] Make the user namespace ID range configurable instead of fixed at 100000, and read it from `/etc/subuid` and `/etc/subgid`.
+- [x] Mount `/sys` read-only, showing only the container's network namespace.
+- [x] Mount `/dev/mqueue` for POSIX message queues in the IPC namespace.
+- [x] User namespace ID range read from `/etc/subuid` and `/etc/subgid` (`--userns-user` picks whose entry), instead of fixed at 100000.
+- [x] Drop Linux capabilities down to Docker's default set of 14.
 
 ## Stage 2: Security
 
-- [ ] Drop Linux capabilities down to Docker's default safe set.
 - [ ] seccomp filter to block dangerous syscalls (Docker blocks about 50 by default).
 - [ ] Mount sensitive paths read-only (`/proc/sys`, etc.) and hide others (`/proc/kcore`, etc.).
 - [ ] Set `no_new_privs` so programs can't gain privileges, for example through setuid binaries.
@@ -87,4 +84,4 @@ The steps between `runt` and a Docker-like container runtime. Each stage builds 
 
 ## Suggested next steps
 
-Capability dropping, cgroups v2 memory/PID limits, and a state directory with an ID per container give the biggest improvement for the least work. The bridge network (Stage 6) is what gives containers internet access again. After OCI support is in, existing tools can fill gaps: `skopeo` to pull images, `buildah` to build them.
+`no_new_privs`, cgroups v2 memory/PID limits, and a state directory with an ID per container give the biggest improvement for the least work. The bridge network (Stage 6) is what gives containers internet access again. After OCI support is in, existing tools can fill gaps: `skopeo` to pull images, `buildah` to build them.

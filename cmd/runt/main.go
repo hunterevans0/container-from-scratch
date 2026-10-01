@@ -37,6 +37,7 @@ func main() {
 func run(args []string) error {
 	flags := flag.NewFlagSet("run", flag.ContinueOnError)
 	rootfs := flags.String("rootfs", "", "path to an unpacked Linux root filesystem")
+	usernsUser := flags.String("userns-user", "", "user whose /etc/subuid and /etc/subgid ranges to map the container onto (default: the invoking user)")
 	if err := flags.Parse(args); err != nil {
 		return err
 	}
@@ -47,11 +48,11 @@ func run(args []string) error {
 	if len(command) == 0 {
 		return errors.New("a command is required after the run options")
 	}
-	return runtime.Run(runtime.Config{Rootfs: *rootfs, Command: command})
+	return runtime.Run(runtime.Config{Rootfs: *rootfs, Command: command, UsernsUser: *usernsUser})
 }
 
 func usage() {
 	fmt.Fprintln(os.Stderr, "usage:")
 	fmt.Fprintln(os.Stderr, "  runt hello")
-	fmt.Fprintln(os.Stderr, "  runt run --rootfs PATH -- COMMAND [ARG ...]")
+	fmt.Fprintln(os.Stderr, "  runt run --rootfs PATH [--userns-user NAME] -- COMMAND [ARG ...]")
 }
