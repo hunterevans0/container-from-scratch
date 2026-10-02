@@ -38,6 +38,7 @@ func run(args []string) error {
 	flags := flag.NewFlagSet("run", flag.ContinueOnError)
 	rootfs := flags.String("rootfs", "", "path to an unpacked Linux root filesystem")
 	usernsUser := flags.String("userns-user", "", "user whose /etc/subuid and /etc/subgid ranges to map the container onto (default: the invoking user)")
+	apparmorProfile := flags.String("apparmor-profile", "", "loaded AppArmor profile to confine the command with (default: none)")
 	if err := flags.Parse(args); err != nil {
 		return err
 	}
@@ -48,11 +49,16 @@ func run(args []string) error {
 	if len(command) == 0 {
 		return errors.New("a command is required after the run options")
 	}
-	return runtime.Run(runtime.Config{Rootfs: *rootfs, Command: command, UsernsUser: *usernsUser})
+	return runtime.Run(runtime.Config{
+		Rootfs:          *rootfs,
+		Command:         command,
+		UsernsUser:      *usernsUser,
+		AppArmorProfile: *apparmorProfile,
+	})
 }
 
 func usage() {
 	fmt.Fprintln(os.Stderr, "usage:")
 	fmt.Fprintln(os.Stderr, "  runt hello")
-	fmt.Fprintln(os.Stderr, "  runt run --rootfs PATH [--userns-user NAME] -- COMMAND [ARG ...]")
+	fmt.Fprintln(os.Stderr, "  runt run --rootfs PATH [--userns-user NAME] [--apparmor-profile NAME] -- COMMAND [ARG ...]")
 }

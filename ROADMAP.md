@@ -16,13 +16,13 @@ The steps between `runt` and a Docker-like container runtime. Each stage builds 
 - [x] Mount `/dev/mqueue` for POSIX message queues in the IPC namespace.
 - [x] User namespace ID range read from `/etc/subuid` and `/etc/subgid` (`--userns-user` picks whose entry), instead of fixed at 100000.
 - [x] Drop Linux capabilities down to Docker's default set of 14.
+- [x] seccomp filter that blocks about 60 dangerous syscalls, following Docker's default profile.
+- [x] Mount sensitive paths read-only (`/proc/sys`, etc.) and hide others (`/proc/kcore`, etc.).
+- [x] Set `no_new_privs` so programs can't gain privileges, for example through setuid binaries.
 
 ## Stage 2: Security
 
-- [ ] seccomp filter to block dangerous syscalls (Docker blocks about 50 by default).
-- [ ] Mount sensitive paths read-only (`/proc/sys`, etc.) and hide others (`/proc/kcore`, etc.).
-- [ ] Set `no_new_privs` so programs can't gain privileges, for example through setuid binaries.
-- [ ] Optional: AppArmor or SELinux profiles.
+- [ ] Optional: AppArmor or SELinux profiles. An AppArmor profile (`apparmor/runt-default`) and the `--apparmor-profile` flag are written, but have not been run on a kernel with AppArmor enabled (WSL2 boots with it off). SELinux is not started.
 
 ## Stage 3: Resource limits
 
@@ -84,4 +84,4 @@ The steps between `runt` and a Docker-like container runtime. Each stage builds 
 
 ## Suggested next steps
 
-`no_new_privs`, cgroups v2 memory/PID limits, and a state directory with an ID per container give the biggest improvement for the least work. The bridge network (Stage 6) is what gives containers internet access again. After OCI support is in, existing tools can fill gaps: `skopeo` to pull images, `buildah` to build them.
+cgroups v2 memory/PID limits and a state directory with an ID per container give the biggest improvement for the least work. The bridge network (Stage 6) is what gives containers internet access again. After OCI support is in, existing tools can fill gaps: `skopeo` to pull images, `buildah` to build them.

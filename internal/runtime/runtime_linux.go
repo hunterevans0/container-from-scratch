@@ -7,6 +7,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	goruntime "runtime"
 	"syscall"
 	"unsafe"
 )
@@ -33,7 +34,7 @@ func Run(config Config) error {
 		return err
 	}
 
-	args := []string{"--init", config.Rootfs}
+	args := []string{"--init", config.Rootfs, config.AppArmorProfile}
 	args = append(args, config.Command...)
 	command := exec.Command("/proc/self/exe", args...)
 	command.Stdin = os.Stdin
@@ -73,12 +74,14 @@ func checkRootfsOwner(rootfs string, uids, gids IDRange) error {
 }
 
 func Init() error {
-	if len(os.Args) < 4 {
+	// Arguments, as built by Run: --init ROOTFS APPARMOR_PROFILE COMMAND...
+	if len(os.Args) < 5 {
 		return fmt.Errorf("internal init arguments are incomplete")
 	}
 
 	rootfs := os.Args[2]
-	command := os.Args[3:]
+	apparmorProfile := os.Args[3]
+	command := os.Args[4:]
 	if err := syscall.Sethostname([]byte("runt")); err != nil {
 		return fmt.Errorf("set hostname: %w", err)
 	}
@@ -113,9 +116,30 @@ func Init() error {
 	if err := pivotRoot(rootfs); err != nil {
 		return err
 	}
+	if err := protectPaths(); err != nil {
+		return err
+	}
+
 	// Everything above needed full privileges in the user namespace; the
-	// command itself does not.
+	// command itself does not. The order of the steps below matters.
+	if apparmorProfile != "" {
+		// The profile request is tied to this thread, so stay on it until
+		// the command has been forked from it.
+		goruntime.LockOSThread()
+		if err := applyAppArmorProfile(apparmorProfile); err != nil {
+			return err
+		}
+	}
+	// no_new_privs comes before the seccomp filter, which an unprivileged
+	// process may not install without it.
+	if err := setNoNewPrivs(); err != nil {
+		return err
+	}
 	if err := dropCapabilities(); err != nil {
+		return err
+	}
+	// The filter goes last so it does not have to allow the calls above.
+	if err := installSeccomp(); err != nil {
 		return err
 	}
 

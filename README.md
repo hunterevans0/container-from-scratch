@@ -14,6 +14,9 @@
 - a read-only `/sys` that shows only the container's own network interfaces
 - a minimal `/dev` on tmpfs with `null`, `zero`, `full`, `random`, `urandom`, `tty`, a private `/dev/pts`, `/dev/shm`, and `/dev/mqueue`
 - Linux capabilities dropped to Docker's default set, so container root can't mount filesystems, change the hostname, or reconfigure the network
+- a seccomp filter that blocks about 60 dangerous syscalls
+- `no_new_privs`, so setuid programs can't raise privileges
+- sensitive `/proc` and `/sys` paths hidden or made read-only
 
 This is educational code, not a production container runtime. It currently requires Linux and root privileges for `run`.
 
@@ -80,5 +83,49 @@ Before starting the command, `runt` drops every capability outside Docker's defa
 `CHOWN`, `DAC_OVERRIDE`, `FOWNER`, `FSETID`, `KILL`, `SETGID`, `SETUID`, `SETPCAP`, `NET_BIND_SERVICE`, `NET_RAW`, `SYS_CHROOT`, `MKNOD`, `AUDIT_WRITE`, `SETFCAP`
 
 Inside the container, `grep Cap /proc/self/status` shows `00000000a80425fb` for the permitted, effective, and bounding sets, the same value as a default Docker container.
+
+## Seccomp filter
+
+Capabilities don't cover everything. `unshare(CLONE_NEWUSER)`, for example, needs no privilege at all and hands back a full set of capabilities inside the new namespace. So the last thing `runt` does before starting the command is install a seccomp filter: a small BPF program the kernel runs on every syscall.
+
+The filter is a deny list that follows Docker's default profile. Everything is allowed except:
+
+- about 60 syscalls that fail with `EPERM`: mounting (`mount`, `umount2`, `pivot_root`, `fsopen`, ...), namespaces (`unshare`, `setns`), kernel modules and `kexec`, `reboot`, setting the clock or hostname, the kernel keyring, `bpf`, `perf_event_open`, `io_uring`, `userfaultfd`, and others
+- `clone` when it asks for a new namespace
+- `clone3`, which fails with `ENOSYS` so glibc falls back to `clone` (a filter can't read `clone3`'s flags)
+- `personality`, apart from the handful of values Docker allows; this stops `setarch -R` from switching off ASLR
+- any syscall made through another ABI (x32, or 32-bit `int 0x80`), where the numbers differ
+
+The lists live in [seccomp_linux_amd64.go](internal/runtime/seccomp_linux_amd64.go) and [seccomp_linux_arm64.go](internal/runtime/seccomp_linux_arm64.go); other architectures aren't supported. The filter is written by hand rather than with libseccomp, to keep the project free of dependencies and cgo.
+
+Docker's real profile is an allow list, which also blocks syscalls added to the kernel in the future. A deny list is shorter and easier to read, but each new dangerous syscall has to be added to it.
+
+Inside the container, `grep Seccomp /proc/self/status` shows mode `2` (filter), and `unshare -U true` fails with "Operation not permitted".
+
+## no_new_privs
+
+`runt` sets the `no_new_privs` flag, which makes the kernel ignore setuid and setgid bits and file capabilities when a program is executed. A process in the container can never have more privileges than its parent. Root can still switch to another user, but a non-root user can't get back to root with `su` or `sudo`. Docker leaves this off unless you pass `--security-opt no-new-privileges`.
+
+Inside the container, `grep NoNewPrivs /proc/self/status` shows `1`.
+
+## Hidden and read-only paths
+
+Some files in `/proc` and `/sys` describe the host or control the kernel, and they aren't namespaced. `runt` uses Docker's default lists:
+
+- Hidden: `/proc/asound`, `/proc/acpi`, `/proc/interrupts`, `/proc/kcore`, `/proc/keys`, `/proc/latency_stats`, `/proc/timer_list`, `/proc/timer_stats`, `/proc/sched_debug`, `/proc/scsi`, `/sys/firmware`, `/sys/devices/virtual/powercap`. Files are covered with `/dev/null` and directories with an empty read-only tmpfs.
+- Read-only: `/proc/bus`, `/proc/fs`, `/proc/irq`, `/proc/sys`, `/proc/sysrq-trigger`.
+
+The container can't undo these mounts, because unmounting needs `CAP_SYS_ADMIN`.
+
+## AppArmor (optional, untested)
+
+`apparmor/runt-default` is an AppArmor profile modelled on Docker's `docker-default`. To use it:
+
+```bash
+make apparmor   # loads the profile into the kernel
+sudo ./runt run --rootfs /var/lib/runt/rootfs --apparmor-profile runt-default -- /bin/bash
+```
+
+This has not been run on a kernel with AppArmor enabled. WSL2's kernel boots with AppArmor off, so there `runt` only reports "AppArmor is not enabled on this kernel"; the profile itself passes `apparmor_parser`'s syntax check. Without the flag, no profile is applied. SELinux isn't supported.
 
 See [ROADMAP.md](ROADMAP.md) for the remaining steps toward a Docker-like runtime.
