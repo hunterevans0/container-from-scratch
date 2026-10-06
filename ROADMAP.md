@@ -22,15 +22,15 @@ The steps between `runt` and a Docker-like container runtime. Each stage builds 
 
 ## Stage 2: Security
 
-- [ ] Optional: AppArmor or SELinux profiles. An AppArmor profile (`apparmor/runt-default`) and the `--apparmor-profile` flag are written, but have not been run on a kernel with AppArmor enabled (WSL2 boots with it off). SELinux is not started.
+- [x] Optional: AppArmor or SELinux profiles. The AppArmor profile (`apparmor/runt-default`) and `--apparmor-profile` flag are tested on WSL2 with AppArmor turned on (`scripts/enable-apparmor-wsl.sh`). SELinux is not supported.
 
 ## Stage 3: Resource limits
 
-- [ ] cgroups v2 limits for CPU, memory, number of processes, and disk I/O (`--memory`, `--cpus`, `--pids-limit`).
+- [x] cgroups v2 limits for CPU, memory, number of processes, and disk I/O (`--memory`, `--cpus`, `--pids-limit`, `--device-{read,write}-{bps,iops}`).
 
 ## Stage 4: Lifecycle
 
-- [ ] Give each container an ID and save its state under `/run/runt/<id>/`.
+- [x] Give each container an ID and save its state under `/run/runt/<id>/`.
 - [ ] Commands: `create`, `start`, `ps`, `stop`, `kill`, `rm`.
 - [ ] Detached mode (`-d`) to run containers in the background.
 - [ ] `exec` to run a command in a running container (using `setns`).
@@ -84,4 +84,4 @@ The steps between `runt` and a Docker-like container runtime. Each stage builds 
 
 ## Suggested next steps
 
-cgroups v2 memory/PID limits and a state directory with an ID per container give the biggest improvement for the least work. The bridge network (Stage 6) is what gives containers internet access again. After OCI support is in, existing tools can fill gaps: `skopeo` to pull images, `buildah` to build them.
+With container IDs and state in place, the rest of Stage 4 (`ps`, `stop`, `rm`, detached mode) builds directly on `/run/runt/<id>/state.json`. The bridge network (Stage 6) is what gives containers internet access again. After OCI support is in, existing tools can fill gaps: `skopeo` to pull images, `buildah` to build them.

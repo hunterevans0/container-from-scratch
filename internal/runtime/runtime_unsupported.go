@@ -11,3 +11,7 @@ func Run(Config) error {
 func Init() error {
 	return errors.New("container initialization requires Linux; use WSL2 on Windows")
 }
+
+func ExitCode(error) (int, bool) {
+	return 0, false
+}

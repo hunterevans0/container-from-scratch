@@ -20,7 +20,7 @@ import (
 func applyAppArmorProfile(profile string) error {
 	enabled, err := os.ReadFile("/sys/module/apparmor/parameters/enabled")
 	if err != nil || strings.TrimSpace(string(enabled)) != "Y" {
-		return errors.New("AppArmor is not enabled on this kernel")
+		return errors.New("AppArmor is not enabled on this kernel; on WSL2, see scripts/enable-apparmor-wsl.sh")
 	}
 
 	// Older kernels only have the attribute file that all security modules

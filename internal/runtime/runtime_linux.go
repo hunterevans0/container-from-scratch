@@ -3,9 +3,11 @@
 package runtime
 
 import (
+	"errors"
 	"fmt"
 	"os"
 	"os/exec"
+	"os/signal"
 	"path/filepath"
 	goruntime "runtime"
 	"strings"
@@ -35,6 +37,55 @@ func Run(config Config) error {
 	if err := checkRootfsOwner(config.Rootfs, uids, gids); err != nil {
 		return err
 	}
+	useCgroup := cgroupV2()
+	if !useCgroup && !config.Resources.IsZero() {
+		return errors.New("resource limits need cgroup v2 mounted at /sys/fs/cgroup")
+	}
+
+	id, err := newID()
+	if err != nil {
+		return err
+	}
+	if err := createStateDir(StateRoot, id); err != nil {
+		return err
+	}
+	// A container that never starts leaves no state behind.
+	started := false
+	defer func() {
+		if !started {
+			os.RemoveAll(stateDir(StateRoot, id))
+		}
+	}()
+	state := &State{
+		ID:        id,
+		Status:    StatusCreated,
+		Rootfs:    config.Rootfs,
+		Command:   config.Command,
+		Resources: config.Resources,
+		Created:   time.Now(),
+	}
+
+	cgroupFD := -1
+	if useCgroup {
+		dir, err := createCgroup(id, config.Resources)
+		if err != nil {
+			return err
+		}
+		defer func() {
+			if err := removeCgroup(dir); err != nil {
+				fmt.Fprintln(os.Stderr, "runt: warning:", err)
+			}
+		}()
+		state.Cgroup = dir
+		cgroupFD, err = syscall.Open(dir, syscall.O_RDONLY|syscall.O_DIRECTORY|syscall.O_CLOEXEC, 0)
+		if err != nil {
+			return fmt.Errorf("open cgroup %q: %w", dir, err)
+		}
+		defer syscall.Close(cgroupFD)
+	}
+	if err := saveState(StateRoot, state); err != nil {
+		return err
+	}
 
 	args := []string{"--init", config.Rootfs, config.AppArmorProfile}
 	args = append(args, config.Command...)
@@ -59,17 +110,78 @@ func Run(config Config) error {
 		// would have no capabilities inside the container.
 		Credential: &syscall.Credential{Uid: 0, Gid: 0},
 	}
-	if !config.DebugInit {
-		return command.Run()
+	if useCgroup {
+		// Clone straight into the container's cgroup (clone3's
+		// CLONE_INTO_CGROUP), so the limits apply from the start and the
+		// new cgroup namespace is rooted at that cgroup.
+		command.SysProcAttr.UseCgroupFD = true
+		command.SysProcAttr.CgroupFD = cgroupFD
 	}
-	command.Env = append(os.Environ(), debugInitEnv+"=1")
+	if config.DebugInit {
+		command.Env = append(os.Environ(), debugInitEnv+"=1")
+	}
+
+	// Signals such as SIGTERM would otherwise kill runt before it records
+	// that the container stopped and removes its cgroup. Pass them on to the
+	// container's init instead.
+	signals := make(chan os.Signal, 1)
+	signal.Notify(signals, syscall.SIGINT, syscall.SIGTERM, syscall.SIGHUP, syscall.SIGQUIT)
+	defer func() {
+		signal.Stop(signals)
+		close(signals)
+	}()
+
 	if err := command.Start(); err != nil {
 		return err
 	}
-	// Inside its PID namespace init sees itself as PID 1, so only the parent
-	// can report the PID a host debugger needs.
-	fmt.Fprintf(os.Stderr, "runt: container init is host PID %d, waiting for a debugger to attach\n", command.Process.Pid)
-	return command.Wait()
+	started = true
+	go func() {
+		for sig := range signals {
+			command.Process.Signal(sig)
+		}
+	}()
+
+	state.Status = StatusRunning
+	state.Pid = command.Process.Pid
+	state.Started = time.Now()
+	if err := saveState(StateRoot, state); err != nil {
+		fmt.Fprintln(os.Stderr, "runt: warning:", err)
+	}
+	if config.DebugInit {
+		// Inside its PID namespace init sees itself as PID 1, so only the
+		// parent can report the PID a host debugger needs.
+		fmt.Fprintf(os.Stderr, "runt: container init is host PID %d, waiting for a debugger to attach\n", command.Process.Pid)
+	}
+
+	waitErr := command.Wait()
+	exitCode := exitStatus(command.ProcessState)
+	state.Status = StatusStopped
+	state.Pid = 0
+	state.ExitCode = &exitCode
+	state.Finished = time.Now()
+	if err := saveState(StateRoot, state); err != nil {
+		fmt.Fprintln(os.Stderr, "runt: warning:", err)
+	}
+	return waitErr
+}
+
+// ExitCode returns the exit code to pass on when err is a process exiting
+// unsuccessfully: the container's command for Init, or init for Run.
+func ExitCode(err error) (int, bool) {
+	var exitErr *exec.ExitError
+	if !errors.As(err, &exitErr) {
+		return 0, false
+	}
+	return exitStatus(exitErr.ProcessState), true
+}
+
+// exitStatus returns a process's exit code, or 128 plus the signal number if
+// a signal killed it, as shells report it.
+func exitStatus(process *os.ProcessState) int {
+	if status, ok := process.Sys().(syscall.WaitStatus); ok && status.Signaled() {
+		return 128 + int(status.Signal())
+	}
+	return process.ExitCode()
 }
 
 // debugInitEnv tells the init process to wait for a debugger. It is set only
@@ -148,6 +260,9 @@ func Init() error {
 		return err
 	}
 	if err := mountSys(rootfs); err != nil {
+		return err
+	}
+	if err := mountCgroup(rootfs); err != nil {
 		return err
 	}
 	if err := setupDev(rootfs); err != nil {

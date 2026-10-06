@@ -12,4 +12,6 @@ type Config struct {
 	// DebugInit makes the container's init process wait for a debugger to
 	// attach before it sets anything up, and prints its host PID.
 	DebugInit bool
+	// Resources are the container's cgroup limits.
+	Resources Resources
 }
