@@ -8,7 +8,9 @@ import (
 	"os/exec"
 	"path/filepath"
 	goruntime "runtime"
+	"strings"
 	"syscall"
+	"time"
 	"unsafe"
 )
 
@@ -57,7 +59,38 @@ func Run(config Config) error {
 		// would have no capabilities inside the container.
 		Credential: &syscall.Credential{Uid: 0, Gid: 0},
 	}
-	return command.Run()
+	if !config.DebugInit {
+		return command.Run()
+	}
+	command.Env = append(os.Environ(), debugInitEnv+"=1")
+	if err := command.Start(); err != nil {
+		return err
+	}
+	// Inside its PID namespace init sees itself as PID 1, so only the parent
+	// can report the PID a host debugger needs.
+	fmt.Fprintf(os.Stderr, "runt: container init is host PID %d, waiting for a debugger to attach\n", command.Process.Pid)
+	return command.Wait()
+}
+
+// debugInitEnv tells the init process to wait for a debugger. It is set only
+// on the init process and removed before the command runs.
+const debugInitEnv = "RUNT_DEBUG_INIT"
+
+// waitForDebugger blocks until a tracer such as Delve attaches to this
+// process.
+func waitForDebugger() error {
+	for {
+		status, err := os.ReadFile("/proc/self/status")
+		if err != nil {
+			return fmt.Errorf("read process status: %w", err)
+		}
+		for _, line := range strings.Split(string(status), "\n") {
+			if pid, ok := strings.CutPrefix(line, "TracerPid:"); ok && strings.TrimSpace(pid) != "0" {
+				return nil
+			}
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
 }
 
 // checkRootfsOwner fails early with a helpful message if the rootfs has not
@@ -82,6 +115,13 @@ func Init() error {
 	rootfs := os.Args[2]
 	apparmorProfile := os.Args[3]
 	command := os.Args[4:]
+	// This runs before /proc is replaced, so it still reads the host's.
+	if os.Getenv(debugInitEnv) != "" {
+		os.Unsetenv(debugInitEnv)
+		if err := waitForDebugger(); err != nil {
+			return err
+		}
+	}
 	if err := syscall.Sethostname([]byte("runt")); err != nil {
 		return fmt.Errorf("set hostname: %w", err)
 	}

@@ -9,4 +9,7 @@ type Config struct {
 	// AppArmorProfile is the name of a loaded AppArmor profile to confine
 	// the command with. Empty means none.
 	AppArmorProfile string
+	// DebugInit makes the container's init process wait for a debugger to
+	// attach before it sets anything up, and prints its host PID.
+	DebugInit bool
 }

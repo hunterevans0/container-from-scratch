@@ -1,0 +1,48 @@
+{
+    // The container runs in WSL, so VS Code attaches to a Delve server there.
+    // substitutePath maps this Windows checkout to its WSL path, which is the
+    // path recorded in the binary.
+    "version": "0.2.0",
+    "configurations": [
+        {
+            "name": "runt: debug parent (Run)",
+            "type": "go",
+            "request": "attach",
+            "mode": "remote",
+            "host": "127.0.0.1",
+            "port": 2345,
+            "stopOnEntry": false,
+            "substitutePath": [
+                { "from": "${workspaceFolder}", "to": "/mnt/c/Users/moab/GitRepos/container-from-scratch" }
+            ],
+            "preLaunchTask": "runt: debug parent"
+        },
+        {
+            "name": "runt: debug container init (Init)",
+            "type": "go",
+            "request": "attach",
+            "mode": "remote",
+            "host": "127.0.0.1",
+            "port": 2346,
+            "stopOnEntry": false,
+            "substitutePath": [
+                { "from": "${workspaceFolder}", "to": "/mnt/c/Users/moab/GitRepos/container-from-scratch" }
+            ],
+            "preLaunchTask": "runt: debug init"
+        },
+        {
+            // Reconnect to a Delve server that is already running (make
+            // debug-attach-init), without starting the tasks again.
+            "name": "runt: reattach to container init",
+            "type": "go",
+            "request": "attach",
+            "mode": "remote",
+            "host": "127.0.0.1",
+            "port": 2346,
+            "stopOnEntry": false,
+            "substitutePath": [
+                { "from": "${workspaceFolder}", "to": "/mnt/c/Users/moab/GitRepos/container-from-scratch" }
+            ]
+        }
+    ]
+}

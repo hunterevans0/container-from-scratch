@@ -1,0 +1,62 @@
+{
+    // These tasks start Delve inside WSL for the configurations in launch.json.
+    // Each runs in its own terminal, which is where the container's shell and
+    // the sudo password prompt appear.
+    "version": "2.0.0",
+    "tasks": [
+        {
+            "label": "runt: debug parent",
+            "type": "process",
+            "command": "wsl",
+            "args": ["--cd", "${workspaceFolder}", "--", "make", "debug"],
+            "isBackground": true,
+            "problemMatcher": {
+                "owner": "runt",
+                "pattern": { "regexp": "^__never__$" },
+                "background": {
+                    "activeBegins": true,
+                    "beginsPattern": "^__never__$",
+                    "endsPattern": "API server listening at"
+                }
+            }
+        },
+        {
+            "label": "runt: start container (debug-init)",
+            "type": "process",
+            "command": "wsl",
+            "args": ["--cd", "${workspaceFolder}", "--", "make", "debug-init"],
+            "isBackground": true,
+            "problemMatcher": {
+                "owner": "runt",
+                "pattern": { "regexp": "^__never__$" },
+                "background": {
+                    "activeBegins": true,
+                    "beginsPattern": "^__never__$",
+                    // Ready at once: the attach task waits for init itself.
+                    "endsPattern": "."
+                }
+            }
+        },
+        {
+            "label": "runt: attach to container init",
+            "type": "process",
+            "command": "wsl",
+            "args": ["--cd", "${workspaceFolder}", "--", "make", "debug-attach-init"],
+            "isBackground": true,
+            "problemMatcher": {
+                "owner": "runt",
+                "pattern": { "regexp": "^__never__$" },
+                "background": {
+                    "activeBegins": true,
+                    "beginsPattern": "^__never__$",
+                    "endsPattern": "API server listening at"
+                }
+            }
+        },
+        {
+            "label": "runt: debug init",
+            "dependsOn": ["runt: start container (debug-init)", "runt: attach to container init"],
+            "dependsOrder": "parallel"
+        }
+    ]
+}

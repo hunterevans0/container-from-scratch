@@ -62,6 +62,18 @@ make build
 sudo ./runt run --rootfs /var/lib/runt/rootfs -- /bin/hostname   # prints "runt"
 ```
 
+## Debugging with breakpoints
+
+`runt run` starts two processes: the parent (`Run`) and the container's init (`Init`), which is the same binary run again inside the new namespaces. A debugger attached to one doesn't stop in the other, so there are two VS Code debug configurations. Each runs Delve as root in WSL, and VS Code on Windows connects to it on localhost.
+
+1. Install Delve in WSL: `go install github.com/go-delve/delve/cmd/dlv@latest`.
+2. Set breakpoints, then pick a configuration in the Run and Debug view:
+   - **runt: debug parent (Run)** runs `make debug` (port 2345).
+   - **runt: debug container init (Init)** runs `make debug-init`, which starts the container with `--debug-init`. Init prints its host PID and waits before doing any setup. At the same time, `make debug-attach-init` waits for that process and attaches Delve to it (port 2346).
+3. Enter your sudo password in the task terminal. The container's shell also runs in that terminal.
+
+Without VS Code, run the same make targets and connect any Delve client, for example `dlv connect 127.0.0.1:2345`. The debug binary, `runt-debug`, is built without optimizations or inlining so all variables can be inspected. Delve listens only on localhost, but with `--only-same-user=false`, because connections forwarded from Windows don't come from root. That means any local user can connect to the root debugger while it runs.
+
 ## User namespace ID range
 
 Container IDs map onto a block of unprivileged host IDs read from `/etc/subuid` and `/etc/subgid`, where each line is `name:start:count`. `runt` uses the entry for the user who ran `sudo`, so with the usual Ubuntu entry `youruser:100000:65536`, container uid 0 is host uid 100000 and container uid 1000 is host uid 101000. If that user has no entry, it falls back to `100000:65536`.

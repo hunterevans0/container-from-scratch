@@ -39,6 +39,7 @@ func run(args []string) error {
 	rootfs := flags.String("rootfs", "", "path to an unpacked Linux root filesystem")
 	usernsUser := flags.String("userns-user", "", "user whose /etc/subuid and /etc/subgid ranges to map the container onto (default: the invoking user)")
 	apparmorProfile := flags.String("apparmor-profile", "", "loaded AppArmor profile to confine the command with (default: none)")
+	debugInit := flags.Bool("debug-init", false, "pause the container's init process until a debugger attaches, and print its host PID")
 	if err := flags.Parse(args); err != nil {
 		return err
 	}
@@ -54,11 +55,12 @@ func run(args []string) error {
 		Command:         command,
 		UsernsUser:      *usernsUser,
 		AppArmorProfile: *apparmorProfile,
+		DebugInit:       *debugInit,
 	})
 }
 
 func usage() {
 	fmt.Fprintln(os.Stderr, "usage:")
 	fmt.Fprintln(os.Stderr, "  runt hello")
-	fmt.Fprintln(os.Stderr, "  runt run --rootfs PATH [--userns-user NAME] [--apparmor-profile NAME] -- COMMAND [ARG ...]")
+	fmt.Fprintln(os.Stderr, "  runt run --rootfs PATH [--userns-user NAME] [--apparmor-profile NAME] [--debug-init] -- COMMAND [ARG ...]")
 }
