@@ -4,9 +4,13 @@ import (
 	"crypto/rand"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
+	"regexp"
+	"sort"
+	"strings"
 	"time"
 )
 
@@ -24,19 +28,23 @@ const (
 // State is what runt records about a container, in StateRoot/<id>/state.json.
 type State struct {
 	ID      string   `json:"id"`
+	Name    string   `json:"name,omitempty"`
 	Status  string   `json:"status"`
 	Rootfs  string   `json:"rootfs"`
 	Command []string `json:"command"`
-	// Pid is the host PID of the container's init process, while it runs.
+	// Pid is the host PID of the container's init process, while it is
+	// created or running.
 	Pid int `json:"pid,omitempty"`
 	// ExitCode is set once the container has stopped.
 	ExitCode *int `json:"exitCode,omitempty"`
 	// Cgroup is the container's cgroup directory, if it has one.
-	Cgroup    string    `json:"cgroup,omitempty"`
-	Resources Resources `json:"resources"`
-	Created   time.Time `json:"created"`
-	Started   time.Time `json:"started,omitzero"`
-	Finished  time.Time `json:"finished,omitzero"`
+	Cgroup string `json:"cgroup,omitempty"`
+	// AppArmorProfile confines the command and anything run with exec.
+	AppArmorProfile string    `json:"apparmorProfile,omitempty"`
+	Resources       Resources `json:"resources"`
+	Created         time.Time `json:"created"`
+	Started         time.Time `json:"started,omitzero"`
+	Finished        time.Time `json:"finished,omitzero"`
 }
 
 // newID returns a random 12-character hex ID, the length Docker shows.
@@ -94,4 +102,82 @@ func loadState(root, id string) (*State, error) {
 		return nil, fmt.Errorf("parse container state %q: %w", id, err)
 	}
 	return &state, nil
+}
+
+// listStates returns the state of every container, newest first.
+// Directories without a readable state.json, such as one being created or
+// removed at that moment, are skipped.
+func listStates(root string) ([]*State, error) {
+	entries, err := os.ReadDir(root)
+	if errors.Is(err, os.ErrNotExist) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, fmt.Errorf("list containers: %w", err)
+	}
+	var states []*State
+	for _, entry := range entries {
+		if !entry.IsDir() {
+			continue
+		}
+		state, err := loadState(root, entry.Name())
+		if err != nil {
+			continue
+		}
+		states = append(states, state)
+	}
+	sort.Slice(states, func(i, j int) bool { return states[i].Created.After(states[j].Created) })
+	return states, nil
+}
+
+// findContainer looks a container up by name, full ID, or the start of an
+// ID, as Docker does. An ID prefix must match only one container.
+func findContainer(root, ref string) (*State, error) {
+	if ref == "" {
+		return nil, errors.New("container name or ID is empty")
+	}
+	states, err := listStates(root)
+	if err != nil {
+		return nil, err
+	}
+	var matches []*State
+	for _, state := range states {
+		if state.ID == ref || state.Name == ref {
+			return state, nil
+		}
+		if strings.HasPrefix(state.ID, ref) {
+			matches = append(matches, state)
+		}
+	}
+	switch len(matches) {
+	case 0:
+		return nil, fmt.Errorf("no such container: %s", ref)
+	case 1:
+		return matches[0], nil
+	default:
+		return nil, fmt.Errorf("%q matches more than one container; use more of the ID", ref)
+	}
+}
+
+var validName = regexp.MustCompile(`^[a-zA-Z0-9][a-zA-Z0-9_.-]*$`)
+
+// checkName rejects a name that is malformed, looks like an ID, or is
+// already taken.
+func checkName(root, name string) error {
+	if !validName.MatchString(name) {
+		return fmt.Errorf("invalid container name %q: use letters, digits, and _.- and start with a letter or digit", name)
+	}
+	if regexp.MustCompile(`^[0-9a-f]{12}$`).MatchString(name) {
+		return fmt.Errorf("invalid container name %q: it looks like a container ID", name)
+	}
+	states, err := listStates(root)
+	if err != nil {
+		return err
+	}
+	for _, state := range states {
+		if state.Name == name {
+			return fmt.Errorf("the name %q is already used by container %s; remove it with runt rm", name, state.ID)
+		}
+	}
+	return nil
 }

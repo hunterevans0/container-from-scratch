@@ -20,6 +20,47 @@ func TestNewID(t *testing.T) {
 	}
 }
 
+func TestFindContainerAndCheckName(t *testing.T) {
+	root := t.TempDir()
+	now := time.Now()
+	for i, state := range []*State{
+		{ID: "abc111111111", Name: "web", Created: now},
+		{ID: "abc222222222", Created: now.Add(time.Second)},
+		{ID: "def333333333", Created: now.Add(2 * time.Second)},
+	} {
+		if err := createStateDir(root, state.ID); err != nil {
+			t.Fatal(err)
+		}
+		if err := saveState(root, state); err != nil {
+			t.Fatalf("state %d: %v", i, err)
+		}
+	}
+
+	states, err := listStates(root)
+	if err != nil || len(states) != 3 || states[0].ID != "def333333333" {
+		t.Fatalf("listStates = %v, %v; want 3, newest first", states, err)
+	}
+	for ref, want := range map[string]string{"web": "abc111111111", "abc222222222": "abc222222222", "d": "def333333333"} {
+		if state, err := findContainer(root, ref); err != nil || state.ID != want {
+			t.Errorf("findContainer(%q) = %v, %v; want %s", ref, state, err, want)
+		}
+	}
+	for _, ref := range []string{"abc", "zzz", ""} {
+		if _, err := findContainer(root, ref); err == nil {
+			t.Errorf("findContainer(%q) succeeded; want an error", ref)
+		}
+	}
+
+	if err := checkName(root, "db"); err != nil {
+		t.Errorf("checkName(db) = %v", err)
+	}
+	for _, name := range []string{"web", "-x", "a b", "0123456789ab"} {
+		if err := checkName(root, name); err == nil {
+			t.Errorf("checkName(%q) succeeded; want an error", name)
+		}
+	}
+}
+
 func TestStateRoundTrip(t *testing.T) {
 	root := t.TempDir()
 	exitCode := 3

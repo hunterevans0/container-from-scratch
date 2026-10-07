@@ -18,7 +18,8 @@
 - `no_new_privs`, so setuid programs can't raise privileges
 - sensitive `/proc` and `/sys` paths hidden or made read-only
 - a cgroup v2 cgroup per container, with optional memory, CPU, process, and disk I/O limits
-- an ID per container, with its state saved under `/run/runt/<id>/`
+- an ID per container, with its state and output saved under `/run/runt/<id>/`
+- `create`, `start`, `ps`, `stop`, `kill`, `rm`, `exec`, and `logs` commands, and detached containers (`run -d`)
 
 This is educational code, not a production container runtime. It currently requires Linux and root privileges for `run`.
 
@@ -155,18 +156,59 @@ sudo ./runt run --rootfs /var/lib/runt/rootfs --memory 64m --cpus 0.5 --pids-lim
 
 Inside the container, its cgroup is mounted read-only at `/sys/fs/cgroup`, so `cat /sys/fs/cgroup/memory.max` shows the limit and `memory.current` the usage. Read-only stops the container from raising its own limits. When the container exits, runt kills anything left in the cgroup and removes it.
 
-## Container state
+## Managing containers
 
-Each container gets a random 12-character hex ID and a directory `/run/runt/<id>/` holding `state.json`:
+Besides running a container in the foreground, `runt` can run containers in the background and manage them with Docker-like commands. Run them all with `sudo`.
 
 ```bash
-sudo ls /run/runt
-sudo cat /run/runt/<id>/state.json
+sudo ./runt run -d --name web --rootfs /var/lib/runt/rootfs -- /bin/sh -c 'while :; do date; sleep 1; done'
+sudo ./runt ps                 # running containers; -a includes stopped ones
+sudo ./runt logs -f web        # follow its output; -t adds timestamps, --tail N shows the last N lines
+sudo ./runt exec web ps -e     # run another command inside it
+sudo ./runt stop web           # SIGTERM, then SIGKILL after 10 seconds (-t to change)
+sudo ./runt rm web
 ```
 
-The state records the rootfs, command, limits, cgroup, and timestamps, and moves through three statuses: `created` before the container starts, `running` with the host PID of its init, and `stopped` with its exit code. `/run` is a tmpfs, so the state is gone after a reboot. Stopped containers stay listed until then, because there is no `rm` command yet.
+| Command | What it does |
+| --- | --- |
+| `run [-d] [OPTIONS] -- CMD` | Create a container and run `CMD`. With `-d` it runs in the background and `runt` prints its ID. |
+| `create [OPTIONS] -- CMD` | Set a container up (namespaces, mounts, cgroup, security) without running `CMD` yet. |
+| `start CONTAINER...` | Run the command of a created container. |
+| `ps [-a]` | List running and created containers, or all with `-a`. |
+| `stop [-t SECONDS] CONTAINER...` | Send SIGTERM, then SIGKILL if it hasn't exited after the timeout. |
+| `kill [-s SIGNAL] CONTAINER...` | Send a signal, SIGKILL by default. |
+| `rm [-f] CONTAINER...` | Remove a stopped container's state and log. `-f` kills it first if it's running. |
+| `exec CONTAINER CMD [ARG...]` | Run a command inside a running container. |
+| `logs [-f] [-t] [--tail N] CONTAINER` | Show what the container wrote to stdout and stderr. |
 
-`runt run` exits with the container command's exit code, like `docker run`, or 128 plus the signal number if a signal killed it. It passes SIGINT, SIGTERM, SIGHUP, and SIGQUIT on to the container, so it can record the exit and clean up the cgroup.
+`CONTAINER` is the name given with `--name`, the full ID, or enough of the start of the ID to be unique. Options go before the other arguments, as in `logs -f web`.
+
+### Container IDs and state
+
+Each container gets a random 12-character hex ID and a directory `/run/runt/<id>/`:
+
+- `state.json`: the rootfs, command, limits, cgroup, timestamps, and status. The status moves from `created` (set up, with the host PID of its init) to `running` and then `stopped` (with the exit code).
+- `container.log`: the container's output, one JSON object per line, in the format of Docker's `json-file` log driver.
+- `start.fifo`: what a created container's init waits on (see below).
+- `monitor.log`: problems the background monitor ran into, if any.
+
+`/run` is a tmpfs, so all of this is gone after a reboot.
+
+### How it works
+
+**A monitor per container.** Something has to wait for a container to exit, record its exit code, save its output, and remove its cgroup. In the foreground that's `runt run` itself. For `run -d` and `create`, `runt` starts a copy of itself with `--monitor`, in a session of its own so it isn't tied to the terminal, and returns once the container is set up. This is the job `containerd-shim` does for Docker and `conmon` does for Podman. If a monitor is killed, the container dies with it (through `PR_SET_PDEATHSIG`), rather than running on with nothing to record its exit.
+
+**Create, then start.** Init does all of its setup, then reads one byte from a FIFO before running the command. `runt start` writes that byte, which is how runc implements the same split. `runt run` writes it up front.
+
+**Signals.** `stop` and `kill` signal the container's init (PID 1 inside), which passes the signal on to the command. A container that was killed reports 128 plus the signal number, so `stop` usually gives 143 (SIGTERM) and `kill` gives 137 (SIGKILL). In the foreground, `runt run` passes SIGINT, SIGTERM, SIGHUP, and SIGQUIT on the same way. When a terminal is attached, the command gets the terminal's foreground process group, so Ctrl+C reaches it directly and shells inside get job control.
+
+**Output.** Background containers' output only goes to the log. A foreground container's output also goes to the log, unless it is going to a terminal: copying it would mean the program no longer sees a terminal. That changes with a pseudo-terminal per container (TTY support, on the roadmap).
+
+**Exit codes.** `runt run` exits with the container command's exit code, like `docker run`. If the command can't be run it exits with 127 when it isn't found and 126 otherwise, as shells do, and `runt exec` does the same.
+
+**exec and setns.** `exec` joins the container's namespaces with the `setns` system call, but a Go program can't make that call for a user or mount namespace. The kernel only allows it in a single-threaded process, and the Go runtime has already started several threads before `main` runs. runc gets around this with C code that runs before the Go runtime starts. `runt` uses `nsenter` from util-linux, started in the container's cgroup, to make the `setns` calls. `nsenter` then runs `runt` again inside the container, passed in as an open file (`/proc/self/fd/3`) because the binary isn't in the container's filesystem. That copy applies the same AppArmor profile, `no_new_privs`, capabilities, and seccomp filter as the container's own command, then runs the command. Exec'd processes are root inside the container, see only its processes and files, and count against its limits.
+
+**Inherited files.** Init and `exec` close every file descriptor above 2 before the command runs, as runc does, so files open in whatever started `runt` don't leak into the container. In WSL, for example, `/dev/ptmx` descriptors are open in every shell.
 
 ## AppArmor (optional)
 

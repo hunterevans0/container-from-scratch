@@ -10,160 +10,12 @@ import (
 	"os/signal"
 	"path/filepath"
 	goruntime "runtime"
+	"strconv"
 	"strings"
 	"syscall"
 	"time"
 	"unsafe"
 )
-
-func Run(config Config) error {
-	if len(config.Command) == 0 {
-		return fmt.Errorf("command cannot be empty")
-	}
-	// Container UIDs/GIDs 0..Size-1 map to host IDs Base..Base+Size-1, so root
-	// inside the container is an unprivileged user on the host. The ranges
-	// come from /etc/subuid and /etc/subgid; scripts/make-rootfs.sh reads the
-	// same files to shift the rootfs ownership to match.
-	user := usernsUser(config.UsernsUser)
-	explicit := config.UsernsUser != ""
-	uids, err := subIDRange("/etc/subuid", user, explicit)
-	if err != nil {
-		return fmt.Errorf("read subordinate UIDs: %w", err)
-	}
-	gids, err := subIDRange("/etc/subgid", user, explicit)
-	if err != nil {
-		return fmt.Errorf("read subordinate GIDs: %w", err)
-	}
-	if err := checkRootfsOwner(config.Rootfs, uids, gids); err != nil {
-		return err
-	}
-	useCgroup := cgroupV2()
-	if !useCgroup && !config.Resources.IsZero() {
-		return errors.New("resource limits need cgroup v2 mounted at /sys/fs/cgroup")
-	}
-
-	id, err := newID()
-	if err != nil {
-		return err
-	}
-	if err := createStateDir(StateRoot, id); err != nil {
-		return err
-	}
-	// A container that never starts leaves no state behind.
-	started := false
-	defer func() {
-		if !started {
-			os.RemoveAll(stateDir(StateRoot, id))
-		}
-	}()
-	state := &State{
-		ID:        id,
-		Status:    StatusCreated,
-		Rootfs:    config.Rootfs,
-		Command:   config.Command,
-		Resources: config.Resources,
-		Created:   time.Now(),
-	}
-
-	cgroupFD := -1
-	if useCgroup {
-		dir, err := createCgroup(id, config.Resources)
-		if err != nil {
-			return err
-		}
-		defer func() {
-			if err := removeCgroup(dir); err != nil {
-				fmt.Fprintln(os.Stderr, "runt: warning:", err)
-			}
-		}()
-		state.Cgroup = dir
-		cgroupFD, err = syscall.Open(dir, syscall.O_RDONLY|syscall.O_DIRECTORY|syscall.O_CLOEXEC, 0)
-		if err != nil {
-			return fmt.Errorf("open cgroup %q: %w", dir, err)
-		}
-		defer syscall.Close(cgroupFD)
-	}
-	if err := saveState(StateRoot, state); err != nil {
-		return err
-	}
-
-	args := []string{"--init", config.Rootfs, config.AppArmorProfile}
-	args = append(args, config.Command...)
-	command := exec.Command("/proc/self/exe", args...)
-	command.Stdin = os.Stdin
-	command.Stdout = os.Stdout
-	command.Stderr = os.Stderr
-	command.SysProcAttr = &syscall.SysProcAttr{
-		Cloneflags: syscall.CLONE_NEWUSER |
-			syscall.CLONE_NEWUTS |
-			syscall.CLONE_NEWPID |
-			syscall.CLONE_NEWNS |
-			syscall.CLONE_NEWNET |
-			syscall.CLONE_NEWIPC |
-			syscall.CLONE_NEWCGROUP,
-		UidMappings: []syscall.SysProcIDMap{{ContainerID: 0, HostID: uids.Base, Size: uids.Size}},
-		GidMappings: []syscall.SysProcIDMap{{ContainerID: 0, HostID: gids.Base, Size: gids.Size}},
-		// Allow setgroups inside the container so tools like apt and su work.
-		GidMappingsEnableSetgroups: true,
-		// Become root of the new user namespace (host uid uids.Base). Without
-		// this the child stays host uid 0, which is unmapped there, so it
-		// would have no capabilities inside the container.
-		Credential: &syscall.Credential{Uid: 0, Gid: 0},
-	}
-	if useCgroup {
-		// Clone straight into the container's cgroup (clone3's
-		// CLONE_INTO_CGROUP), so the limits apply from the start and the
-		// new cgroup namespace is rooted at that cgroup.
-		command.SysProcAttr.UseCgroupFD = true
-		command.SysProcAttr.CgroupFD = cgroupFD
-	}
-	if config.DebugInit {
-		command.Env = append(os.Environ(), debugInitEnv+"=1")
-	}
-
-	// Signals such as SIGTERM would otherwise kill runt before it records
-	// that the container stopped and removes its cgroup. Pass them on to the
-	// container's init instead.
-	signals := make(chan os.Signal, 1)
-	signal.Notify(signals, syscall.SIGINT, syscall.SIGTERM, syscall.SIGHUP, syscall.SIGQUIT)
-	defer func() {
-		signal.Stop(signals)
-		close(signals)
-	}()
-
-	if err := command.Start(); err != nil {
-		return err
-	}
-	started = true
-	go func() {
-		for sig := range signals {
-			command.Process.Signal(sig)
-		}
-	}()
-
-	state.Status = StatusRunning
-	state.Pid = command.Process.Pid
-	state.Started = time.Now()
-	if err := saveState(StateRoot, state); err != nil {
-		fmt.Fprintln(os.Stderr, "runt: warning:", err)
-	}
-	if config.DebugInit {
-		// Inside its PID namespace init sees itself as PID 1, so only the
-		// parent can report the PID a host debugger needs.
-		fmt.Fprintf(os.Stderr, "runt: container init is host PID %d, waiting for a debugger to attach\n", command.Process.Pid)
-	}
-
-	waitErr := command.Wait()
-	exitCode := exitStatus(command.ProcessState)
-	state.Status = StatusStopped
-	state.Pid = 0
-	state.ExitCode = &exitCode
-	state.Finished = time.Now()
-	if err := saveState(StateRoot, state); err != nil {
-		fmt.Fprintln(os.Stderr, "runt: warning:", err)
-	}
-	return waitErr
-}
 
 // ExitCode returns the exit code to pass on when err is a process exiting
 // unsuccessfully: the container's command for Init, or init for Run.
@@ -182,6 +34,55 @@ func exitStatus(process *os.ProcessState) int {
 		return 128 + int(status.Signal())
 	}
 	return process.ExitCode()
+}
+
+// commandError means the container's command could not be run at all.
+type commandError struct{ err error }
+
+func (e *commandError) Error() string { return e.err.Error() }
+func (e *commandError) Unwrap() error { return e.err }
+
+// FailureCode is the exit code for an error runt reports itself. When the
+// command could not be run it is 127 if the command was not found and 126
+// otherwise, as shells and Docker use; for anything else it is 1.
+func FailureCode(err error) int {
+	var codeErr *exitCodeError
+	if errors.As(err, &codeErr) {
+		return codeErr.code
+	}
+	var cmdErr *commandError
+	if !errors.As(err, &cmdErr) {
+		return 1
+	}
+	if errors.Is(err, exec.ErrNotFound) || errors.Is(err, os.ErrNotExist) {
+		return 127
+	}
+	return 126
+}
+
+// closeExtraFiles makes sure the command inherits only stdin, stdout, and
+// stderr, as runc does. Go opens its own files close-on-exec, but runt can
+// inherit open descriptors from whatever started it (WSL leaves some
+// terminal descriptors open, for example), and those would otherwise pass
+// into the container.
+func closeExtraFiles() error {
+	entries, err := os.ReadDir("/proc/self/fd")
+	if err != nil {
+		return fmt.Errorf("list open files: %w", err)
+	}
+	for _, entry := range entries {
+		if fd, err := strconv.Atoi(entry.Name()); err == nil && fd > 2 {
+			syscall.CloseOnExec(fd)
+		}
+	}
+	return nil
+}
+
+// isTerminal reports whether file is a terminal.
+func isTerminal(file *os.File) bool {
+	var termios syscall.Termios
+	_, _, errno := syscall.Syscall(syscall.SYS_IOCTL, file.Fd(), syscall.TCGETS, uintptr(unsafe.Pointer(&termios)))
+	return errno == 0
 }
 
 // debugInitEnv tells the init process to wait for a debugger. It is set only
@@ -218,15 +119,86 @@ func checkRootfsOwner(rootfs string, uids, gids IDRange) error {
 	return nil
 }
 
+// Init is the container's init process: runt run (or create) clones it into
+// the new namespaces, it sets the container up, waits to be started, and then
+// runs the command as its child.
+//
+// File descriptors from the supervisor (see supervise):
+//   - 3, the start FIFO: init reads one byte from it before running the
+//     command. runt run writes the byte up front; runt start writes it later.
+//   - 4, a status pipe: init writes "ready" once the container is set up,
+//     then "started" once the command is running, or "error MESSAGE".
 func Init() error {
-	// Arguments, as built by Run: --init ROOTFS APPARMOR_PROFILE COMMAND...
+	// Arguments, as built by supervise: --init ROOTFS APPARMOR_PROFILE COMMAND...
 	if len(os.Args) < 5 {
 		return fmt.Errorf("internal init arguments are incomplete")
 	}
-
 	rootfs := os.Args[2]
 	apparmorProfile := os.Args[3]
 	command := os.Args[4:]
+
+	// Neither pipe should leak into the command.
+	syscall.CloseOnExec(3)
+	syscall.CloseOnExec(4)
+	start := os.NewFile(3, "start")
+	status := os.NewFile(4, "status")
+
+	if err := setupContainer(rootfs, apparmorProfile); err != nil {
+		fmt.Fprintf(status, "error %v\n", err)
+		return err
+	}
+	fmt.Fprintln(status, "ready")
+	if _, err := start.Read(make([]byte, 1)); err != nil {
+		return fmt.Errorf("wait for start: %w", err)
+	}
+	start.Close()
+
+	if err := closeExtraFiles(); err != nil {
+		fmt.Fprintf(status, "error %v\n", err)
+		return err
+	}
+	// Catch signals from here on, so runt stop and runt kill reach the
+	// command instead of only init.
+	signals := make(chan os.Signal, 16)
+	signal.Notify(signals)
+
+	child := exec.Command(command[0], command[1:]...)
+	child.Stdin = os.Stdin
+	child.Stdout = os.Stdout
+	child.Stderr = os.Stderr
+	// The command gets a process group of its own. If it is attached to a
+	// terminal, that group becomes the terminal's foreground group, so
+	// Ctrl+C reaches the command directly and only once, and shells inside
+	// the container can use job control. Otherwise signals reach it only
+	// through init.
+	child.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+	if isTerminal(os.Stdin) {
+		child.SysProcAttr = &syscall.SysProcAttr{Foreground: true, Ctty: 0}
+	}
+	if err := child.Start(); err != nil {
+		err = &commandError{err}
+		fmt.Fprintf(status, "error %v\n", err)
+		return err
+	}
+	fmt.Fprintln(status, "started")
+	status.Close()
+
+	go func() {
+		for sig := range signals {
+			// SIGCHLD is init's own business, and the Go runtime sends
+			// itself SIGURG to preempt goroutines.
+			if sig == syscall.SIGCHLD || sig == syscall.SIGURG {
+				continue
+			}
+			child.Process.Signal(sig)
+		}
+	}()
+	return child.Wait()
+}
+
+// setupContainer builds the container's view of the system and then locks
+// init down, all before the command is started.
+func setupContainer(rootfs, apparmorProfile string) error {
 	// This runs before /proc is replaced, so it still reads the host's.
 	if os.Getenv(debugInitEnv) != "" {
 		os.Unsetenv(debugInitEnv)
@@ -298,11 +270,7 @@ func Init() error {
 		return err
 	}
 
-	child := exec.Command(command[0], command[1:]...)
-	child.Stdin = os.Stdin
-	child.Stdout = os.Stdout
-	child.Stderr = os.Stderr
-	return child.Run()
+	return nil
 }
 
 // pivotRoot makes rootfs the new "/" and detaches the host's root filesystem,

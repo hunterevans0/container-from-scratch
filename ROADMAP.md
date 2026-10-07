@@ -31,11 +31,11 @@ The steps between `runt` and a Docker-like container runtime. Each stage builds 
 ## Stage 4: Lifecycle
 
 - [x] Give each container an ID and save its state under `/run/runt/<id>/`.
-- [ ] Commands: `create`, `start`, `ps`, `stop`, `kill`, `rm`.
-- [ ] Detached mode (`-d`) to run containers in the background.
-- [ ] `exec` to run a command in a running container (using `setns`).
-- [ ] Capture container output so `logs` can show it later.
-- [ ] Proper PID 1: forward signals and reap zombie processes.
+- [x] Commands: `create`, `start`, `ps`, `stop`, `kill`, `rm`.
+- [x] Detached mode (`-d`) to run containers in the background, with a monitor process per container.
+- [x] `exec` to run a command in a running container (using `setns`, through util-linux's `nsenter`, because Go can't join a user namespace).
+- [x] Capture container output so `logs` can show it later.
+- [ ] Proper PID 1: forward signals and reap zombie processes. Init forwards signals to the command (needed for `stop` and `kill`), but doesn't yet reap orphaned processes.
 - [ ] TTY support (`-it`) so `vim`, Ctrl+C, and similar work properly.
 
 ## Stage 5: Images
@@ -84,4 +84,4 @@ The steps between `runt` and a Docker-like container runtime. Each stage builds 
 
 ## Suggested next steps
 
-With container IDs and state in place, the rest of Stage 4 (`ps`, `stop`, `rm`, detached mode) builds directly on `/run/runt/<id>/state.json`. The bridge network (Stage 6) is what gives containers internet access again. After OCI support is in, existing tools can fill gaps: `skopeo` to pull images, `buildah` to build them.
+Two items remain in Stage 4: TTY support (a pseudo-terminal per container, so interactive programs work in detached containers and with `exec`, and terminal sessions can be logged) and reaping orphaned processes in init. The bridge network (Stage 6) is what gives containers internet access again. After OCI support is in, existing tools can fill gaps: `skopeo` to pull images, `buildah` to build them.
