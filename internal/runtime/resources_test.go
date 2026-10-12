@@ -2,6 +2,9 @@ package runtime
 
 import "testing"
 
+// TestParseBytes checks that ParseBytes accepts plain numbers and b/k/m/g/t
+// suffixes (in either case, with an optional trailing B), and rejects empty,
+// zero, negative, fractional, unknown-unit, and overflowing sizes.
 func TestParseBytes(t *testing.T) {
 	tests := []struct {
 		in   string
@@ -28,6 +31,9 @@ func TestParseBytes(t *testing.T) {
 	}
 }
 
+// TestParseDeviceLimit checks that ParseDeviceLimit parses PATH:RATE for both
+// byte-rate and IOPS limits, rejects a missing separator, path, or rate, a zero
+// rate, and a unit suffix on an IOPS limit.
 func TestParseDeviceLimit(t *testing.T) {
 	limit, err := ParseDeviceLimit("/dev/sda:1mb", true)
 	if err != nil || limit != (DeviceLimit{Path: "/dev/sda", Rate: 1 << 20}) {

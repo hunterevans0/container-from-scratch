@@ -31,6 +31,19 @@
             "preLaunchTask": "runt: debug init"
         },
         {
+            "name": "runt: debug integration tests",
+            "type": "go",
+            "request": "attach",
+            "mode": "remote",
+            "host": "127.0.0.1",
+            "port": 2347,
+            "stopOnEntry": false,
+            "substitutePath": [
+                { "from": "${workspaceFolder}", "to": "/mnt/c/Users/moab/GitRepos/container-from-scratch" }
+            ],
+            "preLaunchTask": "runt: debug integration tests"
+        },
+        {
             // Reconnect to a Delve server that is already running (make
             // debug-attach-init), without starting the tasks again.
             "name": "runt: reattach to container init",

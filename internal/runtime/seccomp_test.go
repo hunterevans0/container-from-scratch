@@ -44,6 +44,10 @@ func runFilter(t *testing.T, program []bpfInstruction, arch, nr uint32, arg0 uin
 	return 0
 }
 
+// TestSeccompFilter checks the verdict the generated BPF program gives each
+// kind of syscall: allowed, denied, foreign-architecture, x32, clone3, clone
+// with namespace flags, and personality flags. It also checks that x32-numbered
+// syscalls get no special treatment when the policy has x32 turned off.
 func TestSeccompFilter(t *testing.T) {
 	const (
 		arch        = 0xc000003e

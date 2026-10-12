@@ -9,6 +9,7 @@ import (
 	"strings"
 	"text/tabwriter"
 	"time"
+	goruntime "runtime"
 
 	"container-from-scratch/internal/runtime"
 )
@@ -22,6 +23,9 @@ func main() {
 	switch os.Args[1] {
 	case "hello":
 		fmt.Println("hello from runt, a container runtime built from scratch")
+	case "version":
+		fmt.Println("runt 0.1.0")
+		fmt.Println(goruntime.Version())
 	case "run":
 		exit("runt", run(args))
 	case "create":

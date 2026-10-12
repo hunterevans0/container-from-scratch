@@ -7,6 +7,9 @@ import (
 	"testing"
 )
 
+// TestParseSubID checks that parseSubID finds a user's range in a subuid-style
+// file by name or numeric ID, uses the first entry when a user is listed twice,
+// skips comments and blank lines, and reports an unlisted user as not found.
 func TestParseSubID(t *testing.T) {
 	const file = `# comment
 alice:100000:65536
@@ -15,6 +18,7 @@ bob:165536:1000
 1001:300000:65536
 alice:500000:65536
 `
+
 	tests := []struct {
 		user  string
 		want  IDRange
@@ -36,6 +40,30 @@ alice:500000:65536
 	}
 }
 
+func TestUsernsUser(t *testing.T) {
+
+	tests := []struct {
+		requestedName string
+		sudoUser      string
+		user          string
+		want          string
+	}{
+		{"alice", "joe", "danny", "alice"},
+		{"", "joe", "danny", "joe"},
+		{"", "", "danny", "danny"},
+	}
+	for _, test := range tests {
+		t.Setenv("SUDO_USER", test.sudoUser)
+		t.Setenv("USER", test.user)
+		got := usernsUser(test.requestedName)
+		if got != test.want {
+			t.Errorf("usernsUser(%q) = %q; want %q", test.requestedName, got, test.want)
+		}
+	}
+}
+
+// TestParseSubIDInvalid checks that parseSubID rejects entries whose start or
+// count is non-numeric, negative, or zero.
 func TestParseSubIDInvalid(t *testing.T) {
 	for _, line := range []string{"alice:abc:65536", "alice:100000:0", "alice:-1:65536", "alice:100000:x"} {
 		if _, _, err := parseSubID(strings.NewReader(line), "alice"); err == nil {
@@ -44,6 +72,9 @@ func TestParseSubIDInvalid(t *testing.T) {
 	}
 }
 
+// TestSubIDRangeFallback checks that subIDRange returns a listed user's range,
+// falls back to defaultIDRange for an unlisted user or a missing file, and
+// errors for an unlisted user who was named explicitly.
 func TestSubIDRangeFallback(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "subuid")
 	if err := os.WriteFile(path, []byte("alice:200000:65536\n"), 0o644); err != nil {

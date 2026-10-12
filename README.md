@@ -65,6 +65,10 @@ make build
 sudo ./runt run --rootfs /var/lib/runt/rootfs -- /bin/hostname   # prints "runt"
 ```
 
+## Integration tests
+
+`make test` only runs tests that don't start containers. `make integration` builds `runt` and runs the tests in [integration/](integration/), which start real containers with `sudo` and check that they can't reach each other: one container tries to see the other's processes, kill it by its host PID, and move itself into its cgroup. They need the rootfs from `make rootfs`.
+
 ## Debugging with breakpoints
 
 `runt run` starts two processes: the parent (`Run`) and the container's init (`Init`), which is the same binary run again inside the new namespaces. A debugger attached to one doesn't stop in the other, so there are two VS Code debug configurations. Each runs Delve as root in WSL, and VS Code on Windows connects to it on localhost.
@@ -73,6 +77,7 @@ sudo ./runt run --rootfs /var/lib/runt/rootfs -- /bin/hostname   # prints "runt"
 2. Set breakpoints, then pick a configuration in the Run and Debug view:
    - **runt: debug parent (Run)** runs `make debug` (port 2345).
    - **runt: debug container init (Init)** runs `make debug-init`, which starts the container with `--debug-init`. Init prints its host PID and waits before doing any setup. At the same time, `make debug-attach-init` waits for that process and attaches Delve to it (port 2346).
+   - **runt: debug integration tests** runs `make debug-integration` (port 2347), which runs the tests in [integration/](integration/) under Delve. Breakpoints hit in the test code, not in the `runt` it starts.
 3. Enter your sudo password in the task terminal. The container's shell also runs in that terminal.
 
 Without VS Code, run the same make targets and connect any Delve client, for example `dlv connect 127.0.0.1:2345`. The debug binary, `runt-debug`, is built without optimizations or inlining so all variables can be inspected. Delve listens only on localhost, but with `--only-same-user=false`, because connections forwarded from Windows don't come from root. That means any local user can connect to the root debugger while it runs.

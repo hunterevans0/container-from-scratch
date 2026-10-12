@@ -8,11 +8,43 @@
             "label": "runt: debug parent",
             "type": "process",
             "command": "wsl",
-            "args": ["--cd", "${workspaceFolder}", "--", "make", "debug"],
+            "args": [
+                "--cd",
+                "${workspaceFolder}",
+                "--",
+                "make",
+                "debug"
+            ],
             "isBackground": true,
             "problemMatcher": {
                 "owner": "runt",
-                "pattern": { "regexp": "^__never__$" },
+                "pattern": {
+                    "regexp": "^__never__$"
+                },
+                "background": {
+                    "activeBegins": true,
+                    "beginsPattern": "^__never__$",
+                    "endsPattern": "API server listening at"
+                }
+            }
+        },
+        {
+            "label": "runt: debug integration tests",
+            "type": "process",
+            "command": "wsl",
+            "args": [
+                "--cd",
+                "${workspaceFolder}",
+                "--",
+                "make",
+                "debug-integration"
+            ],
+            "isBackground": true,
+            "problemMatcher": {
+                "owner": "runt",
+                "pattern": {
+                    "regexp": "^__never__$"
+                },
                 "background": {
                     "activeBegins": true,
                     "beginsPattern": "^__never__$",
@@ -24,15 +56,22 @@
             "label": "runt: start container (debug-init)",
             "type": "process",
             "command": "wsl",
-            "args": ["--cd", "${workspaceFolder}", "--", "make", "debug-init"],
+            "args": [
+                "--cd",
+                "${workspaceFolder}",
+                "--",
+                "make",
+                "debug-init"
+            ],
             "isBackground": true,
             "problemMatcher": {
                 "owner": "runt",
-                "pattern": { "regexp": "^__never__$" },
+                "pattern": {
+                    "regexp": "^__never__$"
+                },
                 "background": {
                     "activeBegins": true,
                     "beginsPattern": "^__never__$",
-                    // Ready at once: the attach task waits for init itself.
                     "endsPattern": "."
                 }
             }
@@ -41,11 +80,19 @@
             "label": "runt: attach to container init",
             "type": "process",
             "command": "wsl",
-            "args": ["--cd", "${workspaceFolder}", "--", "make", "debug-attach-init"],
+            "args": [
+                "--cd",
+                "${workspaceFolder}",
+                "--",
+                "make",
+                "debug-attach-init"
+            ],
             "isBackground": true,
             "problemMatcher": {
                 "owner": "runt",
-                "pattern": { "regexp": "^__never__$" },
+                "pattern": {
+                    "regexp": "^__never__$"
+                },
                 "background": {
                     "activeBegins": true,
                     "beginsPattern": "^__never__$",
@@ -55,8 +102,24 @@
         },
         {
             "label": "runt: debug init",
-            "dependsOn": ["runt: start container (debug-init)", "runt: attach to container init"],
+            "dependsOn": [
+                "runt: start container (debug-init)",
+                "runt: attach to container init"
+            ],
             "dependsOrder": "parallel"
+        },
+        {
+            "type": "go",
+            "label": "go: build package",
+            "command": "build",
+            "args": [
+                "${fileDirname}"
+            ],
+            "problemMatcher": [
+                "$go"
+            ],
+            "group": "build",
+            "detail": "cd c:\\Users\\moab\\GitRepos\\container-from-scratch; go build ${fileDirname}"
         }
     ]
 }

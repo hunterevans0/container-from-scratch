@@ -8,6 +8,10 @@ import (
 	"testing/iotest"
 )
 
+// TestCopyOutput checks that copyOutput passes output through unchanged while
+// writing it to the log as JSON entries, one per line, rejoining lines split
+// across reads, splitting lines longer than maxLogLine, and keeping a final
+// line that has no newline.
 func TestCopyOutput(t *testing.T) {
 	var file, passthrough bytes.Buffer
 	log := &logWriter{file: &file}

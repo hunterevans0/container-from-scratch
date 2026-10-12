@@ -2,6 +2,8 @@
     "gopls": {
         "build.env": {
             "GOOS": "linux"
-        }
+        },
+        // Lets the editor understand integration/*_test.go.
+        "build.buildFlags": ["-tags=integration"]
     }
 }

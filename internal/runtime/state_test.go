@@ -7,6 +7,8 @@ import (
 	"time"
 )
 
+// TestNewID checks that newID returns 12 lowercase hex characters and does not
+// repeat itself.
 func TestNewID(t *testing.T) {
 	id, err := newID()
 	if err != nil {
@@ -20,6 +22,10 @@ func TestNewID(t *testing.T) {
 	}
 }
 
+// TestFindContainerAndCheckName checks that listStates orders containers newest
+// first, that findContainer resolves a name, a full ID, or a unique ID prefix
+// and rejects ambiguous, unknown, and empty references, and that checkName
+// rejects names that are taken, malformed, or look like a container ID.
 func TestFindContainerAndCheckName(t *testing.T) {
 	root := t.TempDir()
 	now := time.Now()
@@ -61,6 +67,8 @@ func TestFindContainerAndCheckName(t *testing.T) {
 	}
 }
 
+// TestStateRoundTrip checks that a state saved with saveState comes back
+// unchanged from loadState, and that a state directory cannot be created twice.
 func TestStateRoundTrip(t *testing.T) {
 	root := t.TempDir()
 	exitCode := 3
