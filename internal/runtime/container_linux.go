@@ -48,13 +48,15 @@ func Run(config Config) error {
 // process (like containerd-shim or conmon): runt again, with --monitor, in a
 // session of its own so it is not tied to this terminal.
 func Create(config Config, start bool) (string, error) {
-	if config.Rootfs != "" {
-		// The monitor runs in "/", so a relative path would change meaning.
-		rootfs, err := filepath.Abs(config.Rootfs)
-		if err != nil {
-			return "", err
+	// The monitor runs in "/", so a relative path would change meaning.
+	for _, path := range []*string{&config.Rootfs, &config.Image} {
+		if *path != "" {
+			absolute, err := filepath.Abs(*path)
+			if err != nil {
+				return "", err
+			}
+			*path = absolute
 		}
-		config.Rootfs = rootfs
 	}
 	requestR, requestW, err := os.Pipe()
 	if err != nil {
@@ -152,10 +154,11 @@ func Monitor() error {
 // init, records the container's state as it changes, copies its output into
 // the log, and cleans up afterwards.
 //
-// In the foreground the container uses runt's own input and output. Output
-// is also logged, unless it goes to a terminal, which the container then
-// writes to directly. Otherwise input is empty and output only goes to the
-// log.
+// Output always goes to the log, and in the foreground to runt's own output
+// too. In the foreground with config.Interactive, the command reads runt's
+// input; otherwise its input is empty. With config.Tty the command runs on a
+// pseudo-terminal of its own, which runt's terminal is connected to in the
+// foreground.
 //
 // ready, if set, is called once: when the container has been created (and,
 // with autoStart, when its command is running), or with the reason it
@@ -164,22 +167,30 @@ func supervise(config Config, foreground, autoStart bool, ready func(id string, 
 	if len(config.Command) == 0 {
 		return errors.New("command cannot be empty")
 	}
-	// Container UIDs/GIDs 0..Size-1 map to host IDs Base..Base+Size-1, so root
-	// inside the container is an unprivileged user on the host. The ranges
-	// come from /etc/subuid and /etc/subgid; scripts/make-rootfs.sh reads the
-	// same files to shift the rootfs ownership to match.
-	user := usernsUser(config.UsernsUser)
-	explicit := config.UsernsUser != ""
-	uids, err := subIDRange("/etc/subuid", user, explicit)
-	if err != nil {
-		return fmt.Errorf("read subordinate UIDs: %w", err)
+	if foreground && config.Interactive && config.Tty && !isTerminal(os.Stdin) {
+		return errors.New("the input device is not a terminal; use -t without -i, or run from a terminal")
 	}
-	gids, err := subIDRange("/etc/subgid", user, explicit)
+	uids, gids, err := idRanges(config)
 	if err != nil {
-		return fmt.Errorf("read subordinate GIDs: %w", err)
-	}
-	if err := checkRootfsOwner(config.Rootfs, uids, gids); err != nil {
 		return err
+	}
+	// The layers to mount an overlay of, top first. Nil means the container
+	// uses the rootfs directly.
+	var layers []string
+	if config.Image != "" {
+		if layers, err = unpackImage(config.Image, uids, gids); err != nil {
+			return err
+		}
+	} else {
+		if config.Rootfs, err = filepath.Abs(config.Rootfs); err != nil {
+			return err
+		}
+		if err := checkRootfsOwner(config.Rootfs, uids, gids); err != nil {
+			return err
+		}
+		if !config.DirectRootfs {
+			layers = []string{config.Rootfs}
+		}
 	}
 	useCgroup := cgroupV2()
 	if !useCgroup && !config.Resources.IsZero() {
@@ -218,10 +229,39 @@ func supervise(config Config, foreground, autoStart bool, ready func(id string, 
 		Name:            config.Name,
 		Status:          StatusCreated,
 		Rootfs:          config.Rootfs,
+		Image:           config.Image,
+		Bundle:          config.Bundle,
 		Command:         config.Command,
+		Tty:             config.Tty,
 		AppArmorProfile: config.AppArmorProfile,
 		Resources:       config.Resources,
 		Created:         time.Now(),
+	}
+	if config.Image != "" {
+		state.Rootfs = ""
+	}
+
+	rootfs := config.Rootfs
+	if layers != nil {
+		pruneContainerFS()
+		rootfs, err = mountContainerFS(id, layers, uids, gids)
+		if err != nil {
+			return err
+		}
+		// The container's own namespace has its own copy of the mount, so
+		// the host's can go once init is gone. The writable layer stays
+		// for runt rm, unless the container never got going.
+		defer func() {
+			var err error
+			if keepState {
+				err = unmountContainerFS(id)
+			} else {
+				err = removeContainerFS(id)
+			}
+			if err != nil {
+				warn(err)
+			}
+		}()
 	}
 
 	cgroupFD := -1
@@ -255,33 +295,46 @@ func supervise(config Config, foreground, autoStart bool, ready func(id string, 
 	if err != nil {
 		return fmt.Errorf("open start FIFO: %w", err)
 	}
-	if autoStart {
-		// Init reads this once it is set up.
-		if _, err := fifo.Write([]byte{0}); err != nil {
-			fifo.Close()
-			return fmt.Errorf("write start FIFO: %w", err)
-		}
-	}
+	defer fifo.Close()
 	statusR, statusW, err := os.Pipe()
 	if err != nil {
-		fifo.Close()
 		return err
 	}
 	defer statusR.Close()
+	// Files only init should hold once it has started.
+	childEnds := []*os.File{statusW}
+	defer func() {
+		for _, file := range childEnds {
+			file.Close()
+		}
+	}()
+	configR, configW, err := os.Pipe()
+	if err != nil {
+		return err
+	}
+	defer configW.Close()
+	childEnds = append(childEnds, configR)
+	extraFiles := []*os.File{fifo, statusW, configR}
+	consoleSocket := -1
+	if config.Tty {
+		var child *os.File
+		if consoleSocket, child, err = consoleSocketPair(); err != nil {
+			return err
+		}
+		defer syscall.Close(consoleSocket)
+		childEnds = append(childEnds, child)
+		extraFiles = append(extraFiles, child)
+	}
 
 	logFile, err := os.OpenFile(filepath.Join(dir, logFileName), os.O_WRONLY|os.O_CREATE|os.O_APPEND, 0o600)
 	if err != nil {
-		fifo.Close()
-		statusW.Close()
 		return fmt.Errorf("create container log: %w", err)
 	}
 	defer logFile.Close()
 	log := &logWriter{file: logFile}
 
-	args := []string{"--init", config.Rootfs, config.AppArmorProfile}
-	args = append(args, config.Command...)
-	command := exec.Command("/proc/self/exe", args...)
-	command.ExtraFiles = []*os.File{fifo, statusW}
+	command := exec.Command("/proc/self/exe", "--init")
+	command.ExtraFiles = extraFiles
 	command.SysProcAttr = &syscall.SysProcAttr{
 		Cloneflags: syscall.CLONE_NEWUSER |
 			syscall.CLONE_NEWUTS |
@@ -298,9 +351,12 @@ func supervise(config Config, foreground, autoStart bool, ready func(id string, 
 		// this the child stays host uid 0, which is unmapped there, so it
 		// would have no capabilities inside the container.
 		Credential: &syscall.Credential{Uid: 0, Gid: 0},
-		// A process group of its own keeps terminal signals such as Ctrl+C
-		// from reaching init directly; they arrive once, through runt.
-		Setpgid: true,
+		// A session of its own, with no controlling terminal. Terminal
+		// signals such as Ctrl+C don't reach init directly; they arrive
+		// once, through runt. And no process in the container can reach
+		// runt's terminal through /dev/tty, to change its settings or push
+		// keystrokes into it with TIOCSTI.
+		Setsid: true,
 		// If runt dies without cleaning up, the container dies too, rather
 		// than running on with nothing to record its exit.
 		Pdeathsig: syscall.SIGKILL,
@@ -316,19 +372,18 @@ func supervise(config Config, foreground, autoStart bool, ready func(id string, 
 		command.Env = append(os.Environ(), debugInitEnv+"=1")
 	}
 
-	// Connect the container's input and output, and copy output into the
-	// log.
+	// Connect the container's input and output. Output always goes through
+	// pipes into the log, and in the foreground on to runt's own output as
+	// well; with a terminal, that is the command's pseudo-terminal, below,
+	// and these pipes only carry what init itself prints. Input is runt's
+	// own with -i, and empty otherwise.
 	var copies sync.WaitGroup
-	childEnds := []*os.File{statusW}
-	if foreground {
+	if foreground && config.Interactive && !config.Tty {
 		command.Stdin = os.Stdin
 	}
 	names := []string{"stdout", "stderr"}
 	outputs := []*os.File{os.Stdout, os.Stderr}
 	for i, ours := range outputs {
-		if foreground && isTerminal(ours) {
-			continue
-		}
 		r, w, err := os.Pipe()
 		if err != nil {
 			return err
@@ -363,12 +418,12 @@ func supervise(config Config, foreground, autoStart bool, ready func(id string, 
 
 	err = command.Start()
 	// Only init holds these now. Closing ours means the log copies end when
-	// the container's processes are gone, and runt start fails cleanly once
-	// init is.
+	// the container's processes are gone, and init sees end-of-file on its
+	// configuration.
 	for _, file := range childEnds {
 		file.Close()
 	}
-	fifo.Close()
+	childEnds = nil
 	if err != nil {
 		copies.Wait()
 		return err
@@ -378,6 +433,22 @@ func supervise(config Config, foreground, autoStart bool, ready func(id string, 
 			command.Process.Signal(sig)
 		}
 	}()
+	err = json.NewEncoder(configW).Encode(initConfig{
+		Rootfs:          rootfs,
+		ReadonlyRootfs:  config.ReadonlyRootfs,
+		Hostname:        config.Hostname,
+		AppArmorProfile: config.AppArmorProfile,
+		Command:         config.Command,
+		Env:             config.Env,
+		Cwd:             config.Cwd,
+		User:            config.User,
+		Tty:             config.Tty,
+	})
+	configW.Close()
+	if err != nil {
+		// Init has exited; its status says why.
+		warn(fmt.Errorf("send configuration to init: %w", err))
+	}
 
 	state.Pid = command.Process.Pid
 	if err := saveState(StateRoot, state); err != nil {
@@ -387,6 +458,37 @@ func supervise(config Config, foreground, autoStart bool, ready func(id string, 
 		// Inside its PID namespace init sees itself as PID 1, so only the
 		// parent can report the PID a host debugger needs.
 		fmt.Fprintf(warnOutput, "runt: container init is host PID %d, waiting for a debugger to attach\n", command.Process.Pid)
+	}
+
+	// With a terminal, init sends the master end of the container's
+	// pseudo-terminal once it has made it, or closes the socket if setting
+	// up fails, which the status line below then explains.
+	if config.Tty {
+		if console, err := receiveFile(consoleSocket, "console"); err == nil {
+			defer console.Close()
+			var passthrough io.Writer
+			if foreground {
+				disconnect, err := connectTerminal(console, config.Interactive)
+				if err != nil {
+					warn(err)
+				} else {
+					defer disconnect()
+				}
+				passthrough = os.Stdout
+			} else {
+				setWinsize(console, defaultWinsize)
+			}
+			// A terminal has a single stream, which Docker logs as stdout.
+			copies.Add(1)
+			go func() {
+				defer copies.Done()
+				if err := copyOutput(consoleReader{console}, log, "stdout", passthrough); err != nil {
+					warn(fmt.Errorf("container terminal log: %w", err))
+				}
+			}()
+		} else if !errors.Is(err, io.EOF) {
+			warn(err)
+		}
 	}
 
 	// finish waits for init and the last of its output, then records the
@@ -422,6 +524,17 @@ func supervise(config Config, foreground, autoStart bool, ready func(id string, 
 		return setupErr
 	}
 	keepState = true
+	if autoStart {
+		// Init reads this, and then runs the command. Writing it only now,
+		// rather than up front, means a terminal has its size by the time
+		// the command starts.
+		if _, err := fifo.Write([]byte{0}); err != nil {
+			warn(fmt.Errorf("write start FIFO: %w", err))
+		}
+	}
+	// Only init holds the FIFO now, so runt start fails cleanly once init
+	// has gone.
+	fifo.Close()
 	if !autoStart && ready != nil {
 		ready(id, nil)
 	}
@@ -447,6 +560,27 @@ func supervise(config Config, foreground, autoStart bool, ready func(id string, 
 		ready(id, nil)
 	}
 	return finish()
+}
+
+// idRanges returns the host ID ranges the container's user namespace maps
+// onto. Container UIDs/GIDs 0..Size-1 map to host IDs Base..Base+Size-1, so
+// root inside the container is an unprivileged user on the host. The ranges
+// come from the bundle's config.json, or else from /etc/subuid and
+// /etc/subgid; scripts/make-rootfs.sh reads the same files to shift the
+// rootfs ownership to match.
+func idRanges(config Config) (uids, gids IDRange, err error) {
+	if config.UIDs.Size > 0 && config.GIDs.Size > 0 {
+		return config.UIDs, config.GIDs, nil
+	}
+	user := usernsUser(config.UsernsUser)
+	explicit := config.UsernsUser != ""
+	if uids, err = subIDRange("/etc/subuid", user, explicit); err != nil {
+		return uids, gids, fmt.Errorf("read subordinate UIDs: %w", err)
+	}
+	if gids, err = subIDRange("/etc/subgid", user, explicit); err != nil {
+		return uids, gids, fmt.Errorf("read subordinate GIDs: %w", err)
+	}
+	return uids, gids, nil
 }
 
 // exitCodeError is an error that runt reports with a particular exit code.
@@ -615,6 +749,11 @@ func Remove(ref string, force bool) error {
 			return fmt.Errorf("container %s did not stop", state.ID)
 		}
 		waitForStopped(state.ID, 5*time.Second)
+	}
+	// The writable layer goes before the state directory; see
+	// pruneContainerFS.
+	if err := removeContainerFS(state.ID); err != nil {
+		return fmt.Errorf("remove container %s: %w", state.ID, err)
 	}
 	if err := os.RemoveAll(stateDir(StateRoot, state.ID)); err != nil {
 		return fmt.Errorf("remove container %s: %w", state.ID, err)

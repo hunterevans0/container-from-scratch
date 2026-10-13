@@ -4,9 +4,10 @@
 // needs root and the rootfs from make rootfs, so it only builds with the
 // integration tag: run it with make integration.
 //
-// Not tested yet: containers started from the same rootfs share its files and
-// its user-ID range, so a file one writes to /tmp is visible to the other.
-// That needs a writable layer per container (overlayfs, ROADMAP Stage 5).
+// Not tested yet: containers started from the same rootfs share its user-ID
+// range, so a process in one is the same host user as a process in the
+// other. Their own files are kept apart by a writable layer each
+// (filesystem_test.go), but a shared bind mount would be open to both.
 package integration
 
 import (
@@ -74,18 +75,19 @@ func (r *runtTester) runt(args ...string) (string, error) {
 // its ID once it is running. The container is removed when the test ends.
 func (r *runtTester) start(name string, command ...string) string {
 	r.t.Helper()
-	// Clear out a container left behind by an earlier run that crashed.
-	r.runt("rm", "-f", name)
-	args := append([]string{"run", "-d", "--name", name, "--rootfs", r.rootfs, "--"}, command...)
+	return r.startWith(name, []string{"--rootfs", r.rootfs}, command...)
+}
+
+// startWith is start with other options for runt run -d, such as -t.
+func (r *runtTester) startWith(name string, options []string, command ...string) string {
+	r.t.Helper()
+	r.removeAtEnd(name)
+	args := append([]string{"run", "-d", "--name", name}, options...)
+	args = append(append(args, "--"), command...)
 	output, err := r.runt(args...)
 	if err != nil {
 		r.t.Fatalf("runt %s: %v\n%s", strings.Join(args, " "), err, output)
 	}
-	r.t.Cleanup(func() {
-		if output, err := r.runt("rm", "-f", name); err != nil {
-			r.t.Errorf("runt rm -f %s: %v\n%s", name, err, output)
-		}
-	})
 	id := strings.TrimSpace(output)
 	deadline := time.Now().Add(5 * time.Second)
 	for readState(r.t, id).Status != "running" {
@@ -95,6 +97,19 @@ func (r *runtTester) start(name string, command ...string) string {
 		time.Sleep(50 * time.Millisecond)
 	}
 	return id
+}
+
+// removeAtEnd removes container name, if there is one, now and when the
+// test ends: one left behind by an earlier run that crashed, and the one the
+// test is about to make.
+func (r *runtTester) removeAtEnd(name string) {
+	r.t.Helper()
+	r.runt("rm", "-f", name)
+	r.t.Cleanup(func() {
+		if output, err := r.runt("rm", "-f", name); err != nil && !strings.Contains(output, "no such container") {
+			r.t.Errorf("runt rm -f %s: %v\n%s", name, err, output)
+		}
+	})
 }
 
 // exec runs a shell script inside container and returns its output.

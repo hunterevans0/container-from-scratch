@@ -35,13 +35,14 @@ The steps between `runt` and a Docker-like container runtime. Each stage builds 
 - [x] Detached mode (`-d`) to run containers in the background, with a monitor process per container.
 - [x] `exec` to run a command in a running container (using `setns`, through util-linux's `nsenter`, because Go can't join a user namespace).
 - [x] Capture container output so `logs` can show it later.
-- [ ] Proper PID 1: forward signals and reap zombie processes. Init forwards signals to the command (needed for `stop` and `kill`), but doesn't yet reap orphaned processes.
-- [ ] TTY support (`-it`) so `vim`, Ctrl+C, and similar work properly.
+- [x] Proper PID 1: forward signals and reap zombie processes. Init forwards every signal to the command and waits for every orphan the kernel hands it.
+- [x] TTY support (`-it`) so `vim`, Ctrl+C, and similar work properly. Works for `run`, `run -dt` (logged), `create -t`, and `exec -it`. The pseudo-terminal is made inside the container, as in runc.
+- [ ] `attach`, to connect to a background container's terminal (and so `run -dit` and `start -ai`). The monitor would need a socket to accept connections on.
 
 ## Stage 5: Images
 
-- [ ] Layered filesystem with overlayfs: shared read-only image layers plus a writable layer per container.
-- [ ] OCI image and runtime-config formats.
+- [x] Layered filesystem with overlayfs: shared read-only image layers plus a writable layer per container. `--rootfs` is a single shared layer, too.
+- [x] OCI image and runtime-config formats. `--image` runs an image from an OCI image layout (gzip or uncompressed layers), and `--bundle` runs an OCI runtime bundle's `config.json` (the subset in the README). `runt spec` writes one.
 - [ ] Pull images from a registry (Docker Hub, etc.): manifests, layers, authentication.
 - [ ] Local image store with `images` and `rmi` commands.
 - [ ] Apply image config: default command, environment variables, working directory, user.
@@ -84,4 +85,4 @@ The steps between `runt` and a Docker-like container runtime. Each stage builds 
 
 ## Suggested next steps
 
-Two items remain in Stage 4: TTY support (a pseudo-terminal per container, so interactive programs work in detached containers and with `exec`, and terminal sessions can be logged) and reaping orphaned processes in init. The bridge network (Stage 6) is what gives containers internet access again. After OCI support is in, existing tools can fill gaps: `skopeo` to pull images, `buildah` to build them.
+With OCI layouts supported, existing tools can fill gaps now: `skopeo` to pull images, `buildah` to build them. Applying the image configuration (Stage 5) is small and makes `--image` usable without spelling out the command and environment. A local image store would go with it, so images can be referred to by name and their unpacked layers removed with `rmi`. The bridge network (Stage 6) is what gives containers internet access again.

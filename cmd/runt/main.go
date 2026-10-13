@@ -44,6 +44,8 @@ func main() {
 		exit("runt", execCommand(args))
 	case "logs":
 		exit("runt", logs(args))
+	case "spec":
+		exit("runt", spec(args))
 	// Internal commands: runt runs itself with these.
 	case "--init":
 		exit("runt init", runtime.Init())
@@ -80,7 +82,10 @@ func exit(prefix string, err error) {
 func containerFlags(name string) (*flag.FlagSet, *runtime.Config) {
 	flags := flag.NewFlagSet(name, flag.ContinueOnError)
 	config := &runtime.Config{}
-	flags.StringVar(&config.Rootfs, "rootfs", "", "path to an unpacked Linux root filesystem")
+	flags.StringVar(&config.Rootfs, "rootfs", "", "path to an unpacked Linux root filesystem, shared read-only under the container's own writable layer")
+	flags.StringVar(&config.Image, "image", "", "OCI image layout directory to run, optionally with :TAG")
+	flags.StringVar(&config.Bundle, "bundle", "", "OCI runtime bundle directory: config.json and the root filesystem it names")
+	flags.BoolVar(&config.Tty, "t", false, "run the command on a pseudo-terminal of its own")
 	flags.StringVar(&config.Name, "name", "", "a name to refer to the container by, besides its ID")
 	flags.StringVar(&config.UsernsUser, "userns-user", "", "user whose /etc/subuid and /etc/subgid ranges to map the container onto (default: the invoking user)")
 	flags.StringVar(&config.AppArmorProfile, "apparmor-profile", "", "loaded AppArmor profile to confine the command with (default: none)")
@@ -124,12 +129,24 @@ func containerFlags(name string) (*flag.FlagSet, *runtime.Config) {
 }
 
 func parseContainerFlags(flags *flag.FlagSet, config *runtime.Config, args []string) error {
-	if err := flags.Parse(args); err != nil {
+	if err := flags.Parse(expandCombinedFlags(flags, args)); err != nil {
 		return err
 	}
 	config.Command = flags.Args()
-	if config.Rootfs == "" {
-		return errors.New("--rootfs is required")
+	sources := 0
+	for _, source := range []string{config.Rootfs, config.Image, config.Bundle} {
+		if source != "" {
+			sources++
+		}
+	}
+	if sources != 1 {
+		return errors.New("give one of --rootfs, --image, or --bundle")
+	}
+	if config.Bundle != "" {
+		if len(config.Command) > 0 {
+			return errors.New("a bundle's command comes from its config.json; don't give one after the options")
+		}
+		return runtime.LoadBundle(config)
 	}
 	if len(config.Command) == 0 {
 		return errors.New("a command is required after the options")
@@ -137,11 +154,59 @@ func parseContainerFlags(flags *flag.FlagSet, config *runtime.Config, args []str
 	return nil
 }
 
+// expandCombinedFlags splits combined single-letter flags, such as -it into
+// -i -t, as docker accepts them; the flag package doesn't. It stops at the
+// first argument that isn't a flag, so the container's command is left
+// alone.
+func expandCombinedFlags(flags *flag.FlagSet, args []string) []string {
+	isBool := func(f *flag.Flag) bool {
+		b, ok := f.Value.(interface{ IsBoolFlag() bool })
+		return ok && b.IsBoolFlag()
+	}
+	var expanded []string
+	for i := 0; i < len(args); i++ {
+		arg := args[i]
+		if arg == "--" || arg == "-" || !strings.HasPrefix(arg, "-") {
+			return append(expanded, args[i:]...)
+		}
+		name, _, hasValue := strings.Cut(strings.TrimLeft(arg, "-"), "=")
+		if f := flags.Lookup(name); f != nil {
+			expanded = append(expanded, arg)
+			// A flag's value is the next argument unless given with =.
+			if !hasValue && !isBool(f) && i+1 < len(args) {
+				i++
+				expanded = append(expanded, args[i])
+			}
+			continue
+		}
+		var letters []string
+		if !strings.HasPrefix(arg, "--") && !hasValue {
+			for _, letter := range name {
+				if f := flags.Lookup(string(letter)); f == nil || !isBool(f) {
+					letters = nil
+					break
+				}
+				letters = append(letters, "-"+string(letter))
+			}
+		}
+		if letters == nil {
+			// Unknown: leave it for the flag package to report.
+			letters = []string{arg}
+		}
+		expanded = append(expanded, letters...)
+	}
+	return expanded
+}
+
 func run(args []string) error {
 	flags, config := containerFlags("run")
 	flags.BoolVar(&config.Detach, "d", false, "run the container in the background and print its ID; see its output with runt logs")
+	flags.BoolVar(&config.Interactive, "i", false, "connect runt's standard input to the command")
 	if err := parseContainerFlags(flags, config, args); err != nil {
 		return err
+	}
+	if config.Detach && config.Interactive {
+		return errors.New("-i needs runt's input, so it can't be used with -d (runt has no attach command yet); use -dt to keep a shell running")
 	}
 	if !config.Detach {
 		return runtime.Run(*config)
@@ -235,18 +300,34 @@ func eachContainer(refs []string, action func(ref string) error) error {
 
 func execCommand(args []string) error {
 	flags := flag.NewFlagSet("exec", flag.ContinueOnError)
-	if err := flags.Parse(args); err != nil {
+	var options runtime.ExecOptions
+	flags.BoolVar(&options.Interactive, "i", false, "connect runt's standard input to the command")
+	flags.BoolVar(&options.Tty, "t", false, "run the command on a pseudo-terminal of its own")
+	if err := flags.Parse(expandCombinedFlags(flags, args)); err != nil {
 		return err
 	}
 	args = flags.Args()
 	if len(args) == 0 {
-		return errors.New("usage: runt exec CONTAINER COMMAND [ARG ...]")
+		return errors.New("usage: runt exec [-i] [-t] CONTAINER COMMAND [ARG ...]")
 	}
 	command := args[1:]
 	if len(command) > 0 && command[0] == "--" {
 		command = command[1:]
 	}
-	return runtime.Exec(args[0], command)
+	return runtime.Exec(args[0], command, options)
+}
+
+func spec(args []string) error {
+	flags := flag.NewFlagSet("spec", flag.ContinueOnError)
+	bundle := flags.String("bundle", ".", "directory to write config.json in")
+	rootfs := flags.String("rootfs", "rootfs", "root filesystem for config.json to name, relative to the bundle or absolute")
+	if err := flags.Parse(args); err != nil {
+		return err
+	}
+	if flags.NArg() != 0 {
+		return errors.New("usage: runt spec [--bundle DIR] [--rootfs PATH]")
+	}
+	return runtime.WriteSpec(*bundle, *rootfs)
 }
 
 func logs(args []string) error {
@@ -334,21 +415,29 @@ func usage() {
 	fmt.Fprint(os.Stderr, `usage: runt COMMAND [OPTIONS]
 
 Containers:
-  run [-d] [OPTIONS] -- COMMAND [ARG ...]   create a container and run COMMAND in it
-  create [OPTIONS] -- COMMAND [ARG ...]     set a container up without starting COMMAND
-  start CONTAINER ...                       run the command of created containers
-  ps [-a]                                   list running (with -a, all) containers
-  stop [-t SECONDS] CONTAINER ...           SIGTERM, then SIGKILL after a timeout (default 10)
-  kill [-s SIGNAL] CONTAINER ...            send a signal (default KILL)
-  rm [-f] CONTAINER ...                     remove stopped (with -f, any) containers
-  exec CONTAINER COMMAND [ARG ...]          run a command in a running container
-  logs [-f] [-t] [--tail N] CONTAINER       show a container's output
-  hello                                     print a greeting
+  run [-d] [-i] [-t] [OPTIONS] [-- COMMAND [ARG ...]]
+                                              create a container and run COMMAND in it
+  create [-t] [OPTIONS] [-- COMMAND [ARG ...]]
+                                              set a container up without starting COMMAND
+  start CONTAINER ...                         run the command of created containers
+  ps [-a]                                     list running (with -a, all) containers
+  stop [-t SECONDS] CONTAINER ...             SIGTERM, then SIGKILL after a timeout (default 10)
+  kill [-s SIGNAL] CONTAINER ...              send a signal (default KILL)
+  rm [-f] CONTAINER ...                       remove stopped (with -f, any) containers
+  exec [-i] [-t] CONTAINER COMMAND [ARG ...]  run a command in a running container
+  logs [-f] [-t] [--tail N] CONTAINER         show a container's output
+  spec [--bundle DIR] [--rootfs PATH]         write a starting OCI config.json
+  hello                                       print a greeting
 
-OPTIONS for run and create:
-  --rootfs PATH (required)  --name NAME  --userns-user NAME  --apparmor-profile NAME
+OPTIONS for run and create: one of
+  --rootfs PATH  --image LAYOUT[:TAG]  --bundle DIR (whose config.json gives the command)
+and any of
+  --name NAME  --userns-user NAME  --apparmor-profile NAME
   --memory SIZE  --cpus N  --pids-limit N  --device-{read,write}-{bps,iops} PATH:RATE
   --debug-init
+
+-i connects runt's input to the command, and -t gives the command a
+pseudo-terminal; use both, as -it, for an interactive shell.
 
 CONTAINER is a name, an ID, or the start of an ID. Options go before other
 arguments. Run "runt COMMAND -h" for details.

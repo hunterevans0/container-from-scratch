@@ -33,7 +33,7 @@ apparmor:
 	sudo apparmor_parser --replace apparmor/runt-default
 
 shell: build
-	sudo ./runt run --rootfs $(ROOTFS) $(if $(USERNS_USER),--userns-user $(USERNS_USER)) -- /bin/bash
+	sudo ./runt run -it --rootfs $(ROOTFS) $(if $(USERNS_USER),--userns-user $(USERNS_USER)) -- /bin/bash
 
 clean:
 	rm -f runt runt-debug integration.test integration-debug.test
@@ -57,12 +57,12 @@ build-debug:
 # Debug the runt parent process (Run). Breakpoints in Init won't hit here,
 # because init is a separate process; use debug-init for that.
 debug: build-debug
-	sudo $(DLV) exec $(DLV_SERVER) --listen=127.0.0.1:$(DEBUG_PORT) ./runt-debug -- run $(RUN_ARGS) -- /bin/bash
+	sudo $(DLV) exec $(DLV_SERVER) --listen=127.0.0.1:$(DEBUG_PORT) ./runt-debug -- run -it $(RUN_ARGS) -- /bin/bash
 
 # Start a container whose init process waits for a debugger, then attach with
 # debug-attach-init from a second terminal.
 debug-init: build-debug
-	sudo ./runt-debug run --debug-init $(RUN_ARGS) -- /bin/bash
+	sudo ./runt-debug run -it --debug-init $(RUN_ARGS) -- /bin/bash
 
 debug-attach-init:
 	@echo "waiting for a container started with make debug-init..."; \

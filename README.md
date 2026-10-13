@@ -20,6 +20,10 @@
 - a cgroup v2 cgroup per container, with optional memory, CPU, process, and disk I/O limits
 - an ID per container, with its state and output saved under `/run/runt/<id>/`
 - `create`, `start`, `ps`, `stop`, `kill`, `rm`, `exec`, and `logs` commands, and detached containers (`run -d`)
+- an init process that, as PID 1 should, passes signals on to the command and reaps orphaned processes
+- a pseudo-terminal of the container's own for interactive programs (`run -it`, `exec -it`)
+- an overlay filesystem per container: shared read-only layers underneath, and a writable layer of its own on top
+- OCI image layouts (`--image`) and OCI runtime bundles (`--bundle`, with `runt spec` to write a `config.json`)
 
 This is educational code, not a production container runtime. It currently requires Linux and root privileges for `run`.
 
@@ -55,7 +59,7 @@ make hello
 Run as root inside WSL:
 
 ```bash
-make shell   # builds runt, then: sudo ./runt run --rootfs /var/lib/runt/rootfs -- /bin/bash
+make shell   # builds runt, then: sudo ./runt run -it --rootfs /var/lib/runt/rootfs -- /bin/bash
 ```
 
 Or with any command:
@@ -65,9 +69,11 @@ make build
 sudo ./runt run --rootfs /var/lib/runt/rootfs -- /bin/hostname   # prints "runt"
 ```
 
+The rootfs itself never changes: whatever the shell writes or deletes goes to a writable layer of the container's own (see [Filesystem layers](#filesystem-layers)), and is gone after `runt rm`.
+
 ## Integration tests
 
-`make test` only runs tests that don't start containers. `make integration` builds `runt` and runs the tests in [integration/](integration/), which start real containers with `sudo` and check that they can't reach each other: one container tries to see the other's processes, kill it by its host PID, and move itself into its cgroup. They need the rootfs from `make rootfs`.
+`make test` only runs tests that don't start containers (the layer-unpacking tests also skip themselves unless run as root). `make integration` builds `runt` and runs the tests in [integration/](integration/), which start real containers with `sudo`. They check that containers can't reach each other (one tries to see the other's processes, kill it by its host PID, and move itself into its cgroup) and don't see each other's files. They also cover init reaping orphans, terminals for `run -it`, `run -dt`, and `exec -it`, signals reaching `exec`'d commands, an OCI image built from the rootfs, and a bundle made with `runt spec`. They need the rootfs from `make rootfs`.
 
 ## Debugging with breakpoints
 
@@ -91,7 +97,7 @@ To use another user's range, pass `--userns-user` and shift the rootfs to match:
 ```bash
 make rootfs USERNS_USER=alice
 make shell USERNS_USER=alice
-# or: sudo ./runt run --rootfs /var/lib/runt/rootfs --userns-user alice -- /bin/bash
+# or: sudo ./runt run -it --rootfs /var/lib/runt/rootfs --userns-user alice -- /bin/bash
 ```
 
 With `--userns-user`, a missing entry is an error rather than a fallback. Inside the container, `cat /proc/self/uid_map` shows the range in use.
@@ -154,7 +160,7 @@ Each container gets its own cgroup, `/sys/fs/cgroup/runt/<id>`. The container is
 Sizes take `k`, `m`, `g`, or `t` (powers of 1024), with an optional `b`. The device flags can be repeated, and take whole disks rather than partitions. `lsblk -d` lists them; in WSL the root filesystem is usually on `/dev/sdd`. The disk I/O limits only slow I/O that reaches the disk, so test them with direct I/O, for example `dd if=/dev/zero of=/root/test bs=1M count=8 oflag=direct`.
 
 ```bash
-sudo ./runt run --rootfs /var/lib/runt/rootfs --memory 64m --cpus 0.5 --pids-limit 50 -- /bin/bash
+sudo ./runt run -it --rootfs /var/lib/runt/rootfs --memory 64m --cpus 0.5 --pids-limit 50 -- /bin/bash
 ```
 
 `pids.max` counts threads as well as processes, and runt's own init uses several, so very small limits stop the container from starting.
@@ -170,50 +176,133 @@ sudo ./runt run -d --name web --rootfs /var/lib/runt/rootfs -- /bin/sh -c 'while
 sudo ./runt ps                 # running containers; -a includes stopped ones
 sudo ./runt logs -f web        # follow its output; -t adds timestamps, --tail N shows the last N lines
 sudo ./runt exec web ps -e     # run another command inside it
+sudo ./runt exec -it web bash  # or an interactive shell
 sudo ./runt stop web           # SIGTERM, then SIGKILL after 10 seconds (-t to change)
 sudo ./runt rm web
 ```
 
 | Command | What it does |
 | --- | --- |
-| `run [-d] [OPTIONS] -- CMD` | Create a container and run `CMD`. With `-d` it runs in the background and `runt` prints its ID. |
-| `create [OPTIONS] -- CMD` | Set a container up (namespaces, mounts, cgroup, security) without running `CMD` yet. |
+| `run [-d] [-i] [-t] [OPTIONS] -- CMD` | Create a container and run `CMD`. With `-d` it runs in the background and `runt` prints its ID. `-i` and `-t` are as in Docker (see [Terminals](#terminals)). |
+| `create [-t] [OPTIONS] -- CMD` | Set a container up (namespaces, mounts, cgroup, security) without running `CMD` yet. |
 | `start CONTAINER...` | Run the command of a created container. |
 | `ps [-a]` | List running and created containers, or all with `-a`. |
 | `stop [-t SECONDS] CONTAINER...` | Send SIGTERM, then SIGKILL if it hasn't exited after the timeout. |
 | `kill [-s SIGNAL] CONTAINER...` | Send a signal, SIGKILL by default. |
-| `rm [-f] CONTAINER...` | Remove a stopped container's state and log. `-f` kills it first if it's running. |
-| `exec CONTAINER CMD [ARG...]` | Run a command inside a running container. |
+| `rm [-f] CONTAINER...` | Remove a stopped container's state, log, and writable layer. `-f` kills it first if it's running. |
+| `exec [-i] [-t] CONTAINER CMD [ARG...]` | Run a command inside a running container. |
 | `logs [-f] [-t] [--tail N] CONTAINER` | Show what the container wrote to stdout and stderr. |
+| `spec [--bundle DIR] [--rootfs PATH]` | Write a starting `config.json` for an OCI runtime bundle. |
 
-`CONTAINER` is the name given with `--name`, the full ID, or enough of the start of the ID to be unique. Options go before the other arguments, as in `logs -f web`.
+`run` and `create` take the container's filesystem from one of `--rootfs PATH` (a root filesystem directory), `--image LAYOUT[:TAG]` (an [OCI image](#oci-images)), or `--bundle DIR` (an [OCI runtime bundle](#oci-runtime-bundles), whose `config.json` also gives the command).
+
+`CONTAINER` is the name given with `--name`, the full ID, or enough of the start of the ID to be unique. Options go before the other arguments, as in `logs -f web`. Single-letter options combine, as in `-it` or `-dt`.
 
 ### Container IDs and state
 
 Each container gets a random 12-character hex ID and a directory `/run/runt/<id>/`:
 
-- `state.json`: the rootfs, command, limits, cgroup, timestamps, and status. The status moves from `created` (set up, with the host PID of its init) to `running` and then `stopped` (with the exit code).
+- `state.json`: the rootfs or image, command, limits, cgroup, timestamps, and status. The status moves from `created` (set up, with the host PID of its init) to `running` and then `stopped` (with the exit code).
 - `container.log`: the container's output, one JSON object per line, in the format of Docker's `json-file` log driver.
 - `start.fifo`: what a created container's init waits on (see below).
 - `monitor.log`: problems the background monitor ran into, if any.
 
-`/run` is a tmpfs, so all of this is gone after a reboot.
+`/run` is a tmpfs, so all of this is gone after a reboot. The container's writable layer is in `/var/lib/runt/containers/<id>/` (see [Filesystem layers](#filesystem-layers)), which does survive a reboot. The next container `runt` starts removes layers whose state has gone.
 
 ### How it works
 
 **A monitor per container.** Something has to wait for a container to exit, record its exit code, save its output, and remove its cgroup. In the foreground that's `runt run` itself. For `run -d` and `create`, `runt` starts a copy of itself with `--monitor`, in a session of its own so it isn't tied to the terminal, and returns once the container is set up. This is the job `containerd-shim` does for Docker and `conmon` does for Podman. If a monitor is killed, the container dies with it (through `PR_SET_PDEATHSIG`), rather than running on with nothing to record its exit.
 
-**Create, then start.** Init does all of its setup, then reads one byte from a FIFO before running the command. `runt start` writes that byte, which is how runc implements the same split. `runt run` writes it up front.
+**Create, then start.** Init does all of its setup, then reads one byte from a FIFO before running the command. `runt start` writes that byte, which is how runc implements the same split. `runt run` writes it as soon as init reports that it's set up, which is also when the container's terminal has its size.
 
-**Signals.** `stop` and `kill` signal the container's init (PID 1 inside), which passes the signal on to the command. A container that was killed reports 128 plus the signal number, so `stop` usually gives 143 (SIGTERM) and `kill` gives 137 (SIGKILL). In the foreground, `runt run` passes SIGINT, SIGTERM, SIGHUP, and SIGQUIT on the same way. When a terminal is attached, the command gets the terminal's foreground process group, so Ctrl+C reaches it directly and shells inside get job control.
+**Init as PID 1.** The command isn't PID 1 of the container; runt's init is, and the command is its child. The kernel gives PID 1 two jobs that a program like `bash` or `nginx` doesn't expect. First, signals: PID 1 only gets the signals it has a handler for, so a plain `kill` or `docker stop` would do nothing to a command running as PID 1 without one. Init handles every signal and passes it on to the command. Second, orphans: when a process exits, the kernel hands its children to PID 1. Each one stays a zombie when it exits, holding on to its PID, until PID 1 waits for it. Init waits for every child it gets, not only the command, as [tini](https://github.com/krallin/tini) (`docker run --init`) does. When the command exits, init exits with its status, and the kernel kills whatever is left in the container.
 
-**Output.** Background containers' output only goes to the log. A foreground container's output also goes to the log, unless it is going to a terminal: copying it would mean the program no longer sees a terminal. That changes with a pseudo-terminal per container (TTY support, on the roadmap).
+**Signals.** `stop` and `kill` signal the container's init, which passes the signal on to the command. A container that was killed reports 128 plus the signal number, so `stop` usually gives 143 (SIGTERM) and `kill` gives 137 (SIGKILL). In the foreground, `runt run` passes SIGINT, SIGTERM, SIGHUP, and SIGQUIT on the same way, and `runt exec` passes them on to its command.
+
+**No controlling terminal.** Init, and every `exec`'d command, starts in a session of its own, without a controlling terminal, as in runc. Otherwise a process in the container could open `/dev/tty` and reach the terminal `runt` was started from. It could then change the terminal's settings, or push keystrokes into its input with the `TIOCSTI` ioctl, which the shell would run on the host once `runt` exits. Terminal signals such as Ctrl+C reach the container through `runt`. For interactive programs, the container gets a terminal of its own (see [Terminals](#terminals)).
+
+**Output.** A container's output always goes to its log. In the foreground it goes to `runt`'s own output as well.
 
 **Exit codes.** `runt run` exits with the container command's exit code, like `docker run`. If the command can't be run it exits with 127 when it isn't found and 126 otherwise, as shells do, and `runt exec` does the same.
 
 **exec and setns.** `exec` joins the container's namespaces with the `setns` system call, but a Go program can't make that call for a user or mount namespace. The kernel only allows it in a single-threaded process, and the Go runtime has already started several threads before `main` runs. runc gets around this with C code that runs before the Go runtime starts. `runt` uses `nsenter` from util-linux, started in the container's cgroup, to make the `setns` calls. `nsenter` then runs `runt` again inside the container, passed in as an open file (`/proc/self/fd/3`) because the binary isn't in the container's filesystem. That copy applies the same AppArmor profile, `no_new_privs`, capabilities, and seccomp filter as the container's own command, then runs the command. Exec'd processes are root inside the container, see only its processes and files, and count against its limits.
 
 **Inherited files.** Init and `exec` close every file descriptor above 2 before the command runs, as runc does, so files open in whatever started `runt` don't leak into the container. In WSL, for example, `/dev/ptmx` descriptors are open in every shell.
+
+## Terminals
+
+`-i` and `-t` work as in Docker:
+
+- `-i` connects `runt`'s standard input to the command. Without it, the command's input is empty.
+- `-t` runs the command on a pseudo-terminal of its own, so it sees a terminal: `bash` prompts, `vim` draws the screen, `ls` uses colours.
+
+Use both, as `-it`, for an interactive program:
+
+```bash
+sudo ./runt run -it --rootfs /var/lib/runt/rootfs -- /bin/bash
+sudo ./runt exec -it web /bin/bash
+```
+
+With `-it`, `runt` puts its own terminal in raw mode, so every key goes straight to the container. Ctrl+C is a byte the container's terminal turns into SIGINT for whatever is running there, rather than a signal for `runt`. Shells get job control. The container's terminal starts at the size of `runt`'s, and `runt` passes on window resizes (SIGWINCH). `runt` gives the error "the input device is not a terminal" if `-it` is used without one, as Docker does.
+
+A pseudo-terminal is a pair of devices: whatever the command writes to one end, the "slave", can be read from the other, the "master", and the other way round. As in runc, init makes the pair inside the container from the container's own `devpts` (`/dev/ptmx`), so the command sees `/dev/pts/0`, owned by container root, rather than one of the host's terminals. The slave also appears as `/dev/console`. Init sends the master out to `runt` over a Unix socket, passing the open file descriptor itself (`SCM_RIGHTS`). `exec -t` works the same way, with its own terminal.
+
+`-t` works in the background too: `run -dt` (or `create -t`) gives the command a terminal of 80 by 24 characters, and its output goes to the log. A shell started that way keeps running, waiting for input that never comes, so `exec -it` can join it. `-i` can't be used with `-d`, because there is no `attach` command yet to supply the input.
+
+Terminal output is logged as `stdout`, carriage returns and escape sequences included, as Docker logs it.
+
+## Filesystem layers
+
+Each container's root filesystem is an [overlayfs](https://docs.kernel.org/filesystems/overlayfs.html) mount: one or more read-only layers underneath, shared with every other container that uses them, and an empty writable layer on top that belongs to this container. Reading a file finds it in the topmost layer that has it. Changing a file copies it up into the writable layer first, and deleting one leaves a "whiteout" there that hides it. The layers underneath never change, so containers started from the same rootfs don't see each other's changes, and the rootfs stays as `make rootfs` left it.
+
+With `--rootfs`, the rootfs directory is the only layer underneath. With `--image`, it's the image's layers. Each container has a directory `/var/lib/runt/containers/<id>/` with:
+
+- `upper/`: the writable layer.
+- `work/`: scratch space overlayfs needs.
+- `rootfs/`: where the overlay is mounted while the container runs. Init uses this as the root filesystem.
+
+`runt` mounts the overlay as host root before it starts init, so the mount is visible on the host while the container runs (`mount | grep runt`). It's mounted `nodev`, so a device file in an image can't be used to reach the host's disks. After the container stops, `runt` unmounts it. The writable layer stays until `runt rm`, as Docker keeps a stopped container's changes. Inspect it in `upper/`, where deleted files show up as character devices with device number 0/0.
+
+The container's directory is mode `0710` with group container root (host gid 100000, usually), because init runs as container root and has to reach `rootfs/`. Other host users can't look in.
+
+## OCI images
+
+`--image LAYOUT[:TAG]` runs an image from an [OCI image layout](https://github.com/opencontainers/image-spec/blob/main/image-layout.md): a directory with an `oci-layout` file, an `index.json` listing the images in it, and every manifest, configuration, and layer stored under `blobs/sha256/` by the digest of its content. `skopeo` and `buildah` write them (`skopeo copy docker://alpine:3.20 oci:alpine:3.20`), and so does `docker save` from Docker 25 on, once untarred.
+
+```bash
+sudo ./runt run -it --image ./alpine:3.20 -- /bin/sh
+```
+
+`runt` picks the image tagged `TAG` (the `org.opencontainers.image.ref.name` annotation), or the only image, or the one tagged `latest`. If it comes in several architectures, `runt` picks the Linux one for the machine it runs on. The first time an image is run, `runt` unpacks each layer into `/var/lib/runt/layers/<uid base>-<gid base>/<digest>/`, where every container using that layer shares it. Unpacking:
+
+- checks every blob against its digest, and each layer's uncompressed content against the image configuration's `diff_ids`;
+- takes uncompressed or gzipped layers (`zstd` isn't supported, since Go's standard library has no decompressor for it);
+- shifts file ownership into the user-namespace range, as `make rootfs` does for the rootfs, which is why the store is per range;
+- turns OCI whiteouts into overlayfs ones: `.wh.NAME` becomes a 0/0 character device `NAME`, and `.wh..wh..opq` marks its directory opaque with the `trusted.overlay.opaque` attribute;
+- treats the archive as untrusted: names are cleaned of `..`, no entry may be written through a symbolic link, and hard links must point inside the layer;
+- skips device files and extended attributes. The one extended attribute images use, `security.capability`, has no effect under `no_new_privs`.
+
+The image's own configuration (default command, environment, working directory, user) isn't applied yet, so give the command after `--`. Nothing removes unpacked layers yet; `sudo rm -rf /var/lib/runt/layers` is safe while no container uses them.
+
+## OCI runtime bundles
+
+`--bundle DIR` runs an [OCI runtime bundle](https://github.com/opencontainers/runtime-spec/blob/main/bundle.md), the format runc runs: a directory with a `config.json` describing the container, and usually its root filesystem. `runt spec` writes a starting `config.json`, like `runc spec`:
+
+```bash
+mkdir mybundle
+sudo ./runt spec --bundle mybundle --rootfs /var/lib/runt/rootfs
+sudo ./runt run -i --bundle mybundle        # config.json says terminal: true, so this is like -it
+```
+
+As with runc, the container uses the bundle's root filesystem directory itself, not an overlay on top of it, so `runt spec` makes it read-only (`root.readonly`). `runt` reads these parts of `config.json`:
+
+- `root.path` (relative to the bundle, or absolute) and `root.readonly`
+- `process.args`, `env` (which replaces the environment instead of inheriting `runt`'s), `cwd`, `user` (`uid`, `gid`, `additionalGids`), `terminal` (as `-t`), and `apparmorProfile`
+- `hostname`
+- `linux.uidMappings` and `linux.gidMappings`, each a single range starting at container ID 0. Without them, `runt` uses `/etc/subuid` and `/etc/subgid` as usual, and `runt spec` writes yours in.
+- `linux.resources`: `memory.limit`, `cpu.quota` and `cpu.period`, and `pids.limit`
+
+Options on the command line, such as `--memory`, win over the file's. `runt` always creates every namespace and applies its own security settings (capabilities, seccomp, masked paths, `no_new_privs`), so it ignores the fields for those. It refuses a `config.json` that asks for something it can't do, rather than quietly running the container differently. That includes mounts other than its standard ones (`/proc`, `/dev`, `/sys`, and those under them), and namespaces given by path to join.
 
 ## AppArmor (optional)
 
@@ -234,7 +323,7 @@ After a restart, Ubuntu's `apparmor` service loads the system's profiles again, 
 
 ```bash
 make apparmor   # loads apparmor/runt-default into the kernel
-sudo ./runt run --rootfs /var/lib/runt/rootfs --apparmor-profile runt-default -- /bin/bash
+sudo ./runt run -it --rootfs /var/lib/runt/rootfs --apparmor-profile runt-default -- /bin/bash
 ```
 
 Inside, `cat /proc/self/attr/current` shows `runt-default (enforce)`. Most of what the profile denies is already blocked by dropped capabilities and read-only mounts, so it is a second layer. One thing only it blocks: confined processes can't inspect unconfined ones, so `cat /proc/1/maps` (runt's init) fails with "Permission denied", while it works without the profile. Without the flag, no profile is applied.

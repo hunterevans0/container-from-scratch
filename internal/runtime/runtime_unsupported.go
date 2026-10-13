@@ -17,7 +17,7 @@ func Stop(string, time.Duration) error           { return errUnsupported }
 func Kill(string, syscall.Signal) error          { return errUnsupported }
 func Remove(string, bool) error                  { return errUnsupported }
 func ListContainers(bool) ([]*State, error)      { return nil, errUnsupported }
-func Exec(string, []string) error                { return errUnsupported }
+func Exec(string, []string, ExecOptions) error   { return errUnsupported }
 func ParseSignal(string) (syscall.Signal, error) { return 0, errUnsupported }
 func Init() error                                { return errUnsupported }
 func Monitor() error                             { return errUnsupported }

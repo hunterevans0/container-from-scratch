@@ -3,14 +3,19 @@
 package runtime
 
 import (
+	"bytes"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"os/exec"
 	"os/signal"
+	"path/filepath"
 	goruntime "runtime"
 	"strconv"
 	"syscall"
+	"time"
+	"unsafe"
 )
 
 // Exec runs command inside a running container, in all of its namespaces
@@ -23,9 +28,12 @@ import (
 // runtime starts. runt uses nsenter from util-linux instead, which makes the
 // setns calls and then runs runt again, now inside the container, to drop
 // privileges before the command runs (see ExecInit).
-func Exec(ref string, command []string) error {
+func Exec(ref string, command []string, options ExecOptions) error {
 	if len(command) == 0 {
 		return errors.New("a command is required")
+	}
+	if options.Interactive && options.Tty && !isTerminal(os.Stdin) {
+		return errors.New("the input device is not a terminal; use -t without -i, or run from a terminal")
 	}
 	state, err := findContainer(StateRoot, ref)
 	if err != nil {
@@ -47,6 +55,22 @@ func Exec(ref string, command []string) error {
 		return err
 	}
 	defer self.Close()
+	extraFiles := []*os.File{self}
+	tty := ""
+	consoleSocket := -1
+	if options.Tty {
+		// ExecInit makes the pseudo-terminal inside the container and sends
+		// its master back on descriptor 4, as init does for the container's
+		// own terminal.
+		tty = "tty"
+		var child *os.File
+		if consoleSocket, child, err = consoleSocketPair(); err != nil {
+			return err
+		}
+		defer syscall.Close(consoleSocket)
+		defer child.Close()
+		extraFiles = append(extraFiles, child)
+	}
 
 	args := []string{
 		"--target", strconv.Itoa(state.Pid),
@@ -55,14 +79,19 @@ func Exec(ref string, command []string) error {
 		// container, as the container's own command is.
 		"--all",
 		"--wdns=/",
-		"--", "/proc/self/fd/3", "--exec-init", state.AppArmorProfile,
+		"--", "/proc/self/fd/3", "--exec-init", state.AppArmorProfile, tty,
 	}
 	args = append(args, command...)
 	nsenterCommand := exec.Command(nsenter, args...)
-	nsenterCommand.Stdin = os.Stdin
+	if options.Interactive && !options.Tty {
+		nsenterCommand.Stdin = os.Stdin
+	}
 	nsenterCommand.Stdout = os.Stdout
 	nsenterCommand.Stderr = os.Stderr
-	nsenterCommand.ExtraFiles = []*os.File{self}
+	nsenterCommand.ExtraFiles = extraFiles
+	// A session of its own, with no controlling terminal, so the command
+	// can't reach runt's terminal through /dev/tty (see supervise).
+	nsenterCommand.SysProcAttr = &syscall.SysProcAttr{Setsid: true}
 	if state.Cgroup != "" {
 		// Start nsenter, and so the command, in the container's cgroup, so
 		// its limits apply. (nsenter's own --join-cgroup leaves stray file
@@ -72,12 +101,13 @@ func Exec(ref string, command []string) error {
 			return fmt.Errorf("open cgroup of container %s: %w", state.ID, err)
 		}
 		defer cgroup.Close()
-		nsenterCommand.SysProcAttr = &syscall.SysProcAttr{UseCgroupFD: true, CgroupFD: int(cgroup.Fd())}
+		nsenterCommand.SysProcAttr.UseCgroupFD = true
+		nsenterCommand.SysProcAttr.CgroupFD = int(cgroup.Fd())
 	}
 
-	// The terminal sends Ctrl+C to the command as well as to runt, so runt
-	// only has to stay alive to report the exit code. SIGTERM and SIGHUP come
-	// to runt alone, so pass them on.
+	// In its own session the command doesn't get the terminal's signals,
+	// such as Ctrl+C, so runt passes them on. They go to the command itself:
+	// nsenter would only die of them, since it doesn't pass them on.
 	signals := make(chan os.Signal, 1)
 	signal.Notify(signals, syscall.SIGINT, syscall.SIGQUIT, syscall.SIGTERM, syscall.SIGHUP)
 	defer func() {
@@ -87,14 +117,74 @@ func Exec(ref string, command []string) error {
 	if err := nsenterCommand.Start(); err != nil {
 		return err
 	}
+	if options.Tty {
+		extraFiles[1].Close()
+	}
 	go func() {
 		for sig := range signals {
-			if sig == syscall.SIGTERM || sig == syscall.SIGHUP {
-				nsenterCommand.Process.Signal(sig)
+			if pid := childOf(nsenterCommand.Process.Pid); pid > 0 {
+				syscall.Kill(pid, sig.(syscall.Signal))
 			}
 		}
 	}()
-	return nsenterCommand.Wait()
+
+	var output chan struct{}
+	var console *os.File
+	if options.Tty {
+		// If ExecInit fails before making the terminal, it closes the
+		// socket, and nsenter's exit status says what happened.
+		if console, err = receiveFile(consoleSocket, "console"); err == nil {
+			defer console.Close()
+			disconnect, err := connectTerminal(console, options.Interactive)
+			if err != nil {
+				warn(err)
+			} else {
+				defer disconnect()
+			}
+			output = make(chan struct{})
+			go func() {
+				io.Copy(os.Stdout, consoleReader{console})
+				close(output)
+			}()
+			// The terminal has its size now; let the command start.
+			syscall.Write(consoleSocket, []byte{0})
+		}
+	}
+	err = nsenterCommand.Wait()
+	if output != nil {
+		// The command's last output is already waiting in the terminal.
+		// Reading ends when every process using the terminal is gone, but
+		// one could have been left running in the background; don't wait
+		// long for it.
+		console.SetReadDeadline(time.Now().Add(time.Second))
+		<-output
+	}
+	return err
+}
+
+// childOf returns the PID of a child of process parent, or 0 if it has none.
+// nsenter has a single child, which ExecInit replaces with the command.
+func childOf(parent int) int {
+	stats, _ := filepath.Glob("/proc/[0-9]*/stat")
+	for _, path := range stats {
+		data, err := os.ReadFile(path)
+		if err != nil {
+			continue
+		}
+		// The fields after the command name, which is in parentheses and
+		// may contain anything, start with the state and then the parent.
+		end := bytes.LastIndexByte(data, ')')
+		if end < 0 {
+			continue
+		}
+		var state byte
+		var ppid int
+		if _, err := fmt.Sscanf(string(data[end+1:]), " %c %d", &state, &ppid); err == nil && ppid == parent {
+			pid, _ := strconv.Atoi(filepath.Base(filepath.Dir(path)))
+			return pid
+		}
+	}
+	return 0
 }
 
 // ExecInit runs inside the container, started by nsenter on behalf of Exec,
@@ -102,14 +192,27 @@ func Exec(ref string, command []string) error {
 // Init applies to the container's command, then replaces itself with the
 // command.
 func ExecInit() error {
-	// Arguments, as built by Exec: --exec-init APPARMOR_PROFILE COMMAND...
-	if len(os.Args) < 4 {
+	// Arguments, as built by Exec: --exec-init APPARMOR_PROFILE TTY COMMAND...
+	if len(os.Args) < 5 {
 		return errors.New("internal exec arguments are incomplete")
 	}
 	apparmorProfile := os.Args[2]
-	command := os.Args[3:]
+	tty := os.Args[3] == "tty"
+	command := os.Args[4:]
 	// Descriptor 3 is this binary; the command shouldn't inherit it.
 	syscall.CloseOnExec(3)
+	// Look the command up first, so an error about it still goes to runt
+	// exec's own stderr rather than the terminal.
+	path, err := exec.LookPath(command[0])
+	if err != nil {
+		return &commandError{err}
+	}
+	if tty {
+		syscall.CloseOnExec(4)
+		if err := useNewTerminal(os.NewFile(4, "console socket")); err != nil {
+			return err
+		}
+	}
 
 	if apparmorProfile != "" {
 		// The profile request belongs to this thread, which must also be
@@ -131,12 +234,46 @@ func ExecInit() error {
 	if err := closeExtraFiles(); err != nil {
 		return err
 	}
-	path, err := exec.LookPath(command[0])
-	if err != nil {
-		return &commandError{err}
-	}
 	if err := syscall.Exec(path, command, os.Environ()); err != nil {
 		return &commandError{fmt.Errorf("exec %s: %w", command[0], err)}
+	}
+	return nil
+}
+
+// useNewTerminal makes a pseudo-terminal in the container, sends its master
+// to runt exec over socket, and makes the slave this process's controlling
+// terminal and its standard input, output, and error.
+func useNewTerminal(socket *os.File) error {
+	master, slave, err := openPTY()
+	if err != nil {
+		return err
+	}
+	err = sendFile(socket, master)
+	master.Close()
+	if err != nil {
+		slave.Close()
+		return err
+	}
+	// runt exec sends a byte once it has sized the terminal.
+	if _, err := socket.Read(make([]byte, 1)); err != nil {
+		slave.Close()
+		return fmt.Errorf("wait for terminal: %w", err)
+	}
+	socket.Close()
+
+	// A controlling terminal belongs to a session, so start one. This
+	// process isn't a process group leader (nsenter is), so it may.
+	if _, err := syscall.Setsid(); err != nil {
+		return fmt.Errorf("start session: %w", err)
+	}
+	for fd := 0; fd <= 2; fd++ {
+		if err := syscall.Dup3(int(slave.Fd()), fd, 0); err != nil {
+			return fmt.Errorf("use terminal: %w", err)
+		}
+	}
+	slave.Close()
+	if err := ioctl(os.Stdin, syscall.TIOCSCTTY, unsafe.Pointer(nil)); err != nil {
+		return fmt.Errorf("set controlling terminal: %w", err)
 	}
 	return nil
 }

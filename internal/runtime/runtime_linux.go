@@ -3,6 +3,7 @@
 package runtime
 
 import (
+	"encoding/json"
 	"errors"
 	"fmt"
 	"os"
@@ -20,6 +21,10 @@ import (
 // ExitCode returns the exit code to pass on when err is a process exiting
 // unsuccessfully: the container's command for Init, or init for Run.
 func ExitCode(err error) (int, bool) {
+	var commandExit *commandExitError
+	if errors.As(err, &commandExit) {
+		return waitStatusCode(commandExit.status), true
+	}
 	var exitErr *exec.ExitError
 	if !errors.As(err, &exitErr) {
 		return 0, false
@@ -30,10 +35,28 @@ func ExitCode(err error) (int, bool) {
 // exitStatus returns a process's exit code, or 128 plus the signal number if
 // a signal killed it, as shells report it.
 func exitStatus(process *os.ProcessState) int {
-	if status, ok := process.Sys().(syscall.WaitStatus); ok && status.Signaled() {
-		return 128 + int(status.Signal())
+	if status, ok := process.Sys().(syscall.WaitStatus); ok {
+		return waitStatusCode(status)
 	}
 	return process.ExitCode()
+}
+
+func waitStatusCode(status syscall.WaitStatus) int {
+	if status.Signaled() {
+		return 128 + int(status.Signal())
+	}
+	return status.ExitStatus()
+}
+
+// commandExitError is the container's command exiting unsuccessfully, as
+// init saw it.
+type commandExitError struct{ status syscall.WaitStatus }
+
+func (e *commandExitError) Error() string {
+	if e.status.Signaled() {
+		return "command killed by " + e.status.Signal().String()
+	}
+	return fmt.Sprintf("command exited with code %d", e.status.ExitStatus())
 }
 
 // commandError means the container's command could not be run at all.
@@ -78,13 +101,6 @@ func closeExtraFiles() error {
 	return nil
 }
 
-// isTerminal reports whether file is a terminal.
-func isTerminal(file *os.File) bool {
-	var termios syscall.Termios
-	_, _, errno := syscall.Syscall(syscall.SYS_IOCTL, file.Fd(), syscall.TCGETS, uintptr(unsafe.Pointer(&termios)))
-	return errno == 0
-}
-
 // debugInitEnv tells the init process to wait for a debugger. It is set only
 // on the init process and removed before the command runs.
 const debugInitEnv = "RUNT_DEBUG_INIT"
@@ -119,31 +135,69 @@ func checkRootfsOwner(rootfs string, uids, gids IDRange) error {
 	return nil
 }
 
+// initConfig is what init needs to know about the container. The supervisor
+// sends it as JSON on file descriptor 5.
+type initConfig struct {
+	// Rootfs is the directory to make the container's root: the overlay
+	// mount, or the rootfs itself.
+	Rootfs          string   `json:"rootfs"`
+	ReadonlyRootfs  bool     `json:"readonlyRootfs,omitempty"`
+	Hostname        string   `json:"hostname"`
+	AppArmorProfile string   `json:"apparmorProfile,omitempty"`
+	Command         []string `json:"command"`
+	// Env replaces the command's environment if it is not nil.
+	Env  []string `json:"env"`
+	Cwd  string   `json:"cwd,omitempty"`
+	User *User    `json:"user,omitempty"`
+	// Tty gives the command a pseudo-terminal, whose master end init sends
+	// back on file descriptor 6.
+	Tty bool `json:"tty,omitempty"`
+}
+
 // Init is the container's init process: runt run (or create) clones it into
 // the new namespaces, it sets the container up, waits to be started, and then
-// runs the command as its child.
+// runs the command as its child. As PID 1 of the container it then forwards
+// signals to the command and reaps orphaned processes until the command
+// exits.
 //
 // File descriptors from the supervisor (see supervise):
 //   - 3, the start FIFO: init reads one byte from it before running the
-//     command. runt run writes the byte up front; runt start writes it later.
+//     command. The supervisor writes it once init is ready (runt run), or
+//     runt start writes it later.
 //   - 4, a status pipe: init writes "ready" once the container is set up,
 //     then "started" once the command is running, or "error MESSAGE".
+//   - 5, the configuration pipe, with an initConfig.
+//   - 6, with Tty, a Unix socket to send the pseudo-terminal's master on.
 func Init() error {
-	// Arguments, as built by supervise: --init ROOTFS APPARMOR_PROFILE COMMAND...
-	if len(os.Args) < 5 {
-		return fmt.Errorf("internal init arguments are incomplete")
+	// None of these should leak into the command.
+	for fd := 3; fd <= 5; fd++ {
+		syscall.CloseOnExec(fd)
 	}
-	rootfs := os.Args[2]
-	apparmorProfile := os.Args[3]
-	command := os.Args[4:]
-
-	// Neither pipe should leak into the command.
-	syscall.CloseOnExec(3)
-	syscall.CloseOnExec(4)
 	start := os.NewFile(3, "start")
 	status := os.NewFile(4, "status")
+	configFile := os.NewFile(5, "config")
+	var config initConfig
+	err := json.NewDecoder(configFile).Decode(&config)
+	configFile.Close()
+	if err == nil && len(config.Command) == 0 {
+		err = errors.New("no command")
+	}
+	if err != nil {
+		err = fmt.Errorf("read init configuration: %w", err)
+		fmt.Fprintf(status, "error %v\n", err)
+		return err
+	}
+	var consoleSocket *os.File
+	if config.Tty {
+		syscall.CloseOnExec(6)
+		consoleSocket = os.NewFile(6, "console socket")
+	}
 
-	if err := setupContainer(rootfs, apparmorProfile); err != nil {
+	tty, err := setupContainer(config, consoleSocket)
+	if consoleSocket != nil {
+		consoleSocket.Close()
+	}
+	if err != nil {
 		fmt.Fprintf(status, "error %v\n", err)
 		return err
 	}
@@ -157,119 +211,238 @@ func Init() error {
 		fmt.Fprintf(status, "error %v\n", err)
 		return err
 	}
+	// The command's PATH decides where exec.Command looks for it, so the
+	// environment is replaced here rather than only in the child.
+	if config.Env != nil {
+		os.Clearenv()
+		for _, variable := range config.Env {
+			if name, value, ok := strings.Cut(variable, "="); ok {
+				os.Setenv(name, value)
+			}
+		}
+	}
 	// Catch signals from here on, so runt stop and runt kill reach the
-	// command instead of only init.
+	// command instead of only init. SIGCHLD gets a channel of its own, so a
+	// burst of other signals can't crowd it out; one pending notification
+	// is enough, since each one reaps every child that has exited.
+	children := make(chan os.Signal, 1)
+	signal.Notify(children, syscall.SIGCHLD)
 	signals := make(chan os.Signal, 16)
 	signal.Notify(signals)
 
-	child := exec.Command(command[0], command[1:]...)
-	child.Stdin = os.Stdin
-	child.Stdout = os.Stdout
-	child.Stderr = os.Stderr
-	// The command gets a process group of its own. If it is attached to a
-	// terminal, that group becomes the terminal's foreground group, so
-	// Ctrl+C reaches the command directly and only once, and shells inside
-	// the container can use job control. Otherwise signals reach it only
-	// through init.
-	child.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
-	if isTerminal(os.Stdin) {
-		child.SysProcAttr = &syscall.SysProcAttr{Foreground: true, Ctty: 0}
+	child := exec.Command(config.Command[0], config.Command[1:]...)
+	child.Dir = config.Cwd
+	child.SysProcAttr = &syscall.SysProcAttr{}
+	if tty != nil {
+		// The pseudo-terminal becomes the command's controlling terminal,
+		// in a session of its own, so Ctrl+C and job control work.
+		child.Stdin, child.Stdout, child.Stderr = tty, tty, tty
+		child.SysProcAttr.Setsid = true
+		child.SysProcAttr.Setctty = true
+		child.SysProcAttr.Ctty = 0
+	} else {
+		// Init has no controlling terminal (the supervisor started it in a
+		// session of its own), so signals reach the command only through
+		// init.
+		child.Stdin, child.Stdout, child.Stderr = os.Stdin, os.Stdout, os.Stderr
+		child.SysProcAttr.Setpgid = true
+	}
+	if config.User != nil {
+		groups := make([]uint32, len(config.User.AdditionalGIDs))
+		copy(groups, config.User.AdditionalGIDs)
+		child.SysProcAttr.Credential = &syscall.Credential{Uid: config.User.UID, Gid: config.User.GID, Groups: groups}
 	}
 	if err := child.Start(); err != nil {
 		err = &commandError{err}
 		fmt.Fprintf(status, "error %v\n", err)
 		return err
 	}
+	if tty != nil {
+		tty.Close()
+	}
 	fmt.Fprintln(status, "started")
 	status.Close()
 
-	go func() {
-		for sig := range signals {
-			// SIGCHLD is init's own business, and the Go runtime sends
-			// itself SIGURG to preempt goroutines.
+	for {
+		select {
+		case <-children:
+			if result, exited := reapChildren(child.Process.Pid); exited {
+				if result.Exited() && result.ExitStatus() == 0 {
+					return nil
+				}
+				return &commandExitError{result}
+			}
+		case sig := <-signals:
+			// SIGCHLD is handled above, and the Go runtime sends itself
+			// SIGURG to preempt goroutines.
 			if sig == syscall.SIGCHLD || sig == syscall.SIGURG {
 				continue
 			}
 			child.Process.Signal(sig)
 		}
-	}()
-	return child.Wait()
+	}
+}
+
+// reapChildren collects the exit status of every child of init that has
+// exited. Besides the command, these are orphans: when a process exits, the
+// kernel hands its children to PID 1 of the namespace, and each one stays a
+// zombie, holding its PID, until init waits for it. It returns the command's
+// status if the command was among them.
+func reapChildren(command int) (status syscall.WaitStatus, exited bool) {
+	for {
+		var current syscall.WaitStatus
+		pid, err := syscall.Wait4(-1, &current, syscall.WNOHANG, nil)
+		if errors.Is(err, syscall.EINTR) {
+			continue
+		}
+		// 0 means children remain but none has exited; ECHILD means there
+		// are none.
+		if err != nil || pid <= 0 {
+			return status, exited
+		}
+		if pid == command {
+			status, exited = current, true
+		}
+	}
 }
 
 // setupContainer builds the container's view of the system and then locks
-// init down, all before the command is started.
-func setupContainer(rootfs, apparmorProfile string) error {
+// init down, all before the command is started. With config.Tty it returns
+// the slave end of the container's pseudo-terminal, having sent the master
+// on consoleSocket.
+func setupContainer(config initConfig, consoleSocket *os.File) (*os.File, error) {
+	rootfs := config.Rootfs
 	// This runs before /proc is replaced, so it still reads the host's.
 	if os.Getenv(debugInitEnv) != "" {
 		os.Unsetenv(debugInitEnv)
 		if err := waitForDebugger(); err != nil {
-			return err
+			return nil, err
 		}
 	}
-	if err := syscall.Sethostname([]byte("runt")); err != nil {
-		return fmt.Errorf("set hostname: %w", err)
+	hostname := config.Hostname
+	if hostname == "" {
+		hostname = "runt"
+	}
+	if err := syscall.Sethostname([]byte(hostname)); err != nil {
+		return nil, fmt.Errorf("set hostname: %w", err)
 	}
 	// The new network namespace starts with only a loopback interface, and
 	// it is down.
 	if err := bringUpLoopback(); err != nil {
-		return err
+		return nil, err
 	}
 	// Stop mount events from propagating back to the host. Without this, a
 	// shared root mount (the systemd default) would leak our mounts out.
 	if err := syscall.Mount("", "/", "", syscall.MS_PRIVATE|syscall.MS_REC, ""); err != nil {
-		return fmt.Errorf("make mounts private: %w", err)
+		return nil, fmt.Errorf("make mounts private: %w", err)
 	}
 	// pivot_root requires the new root to be a mount point, so bind-mount
 	// rootfs onto itself.
 	if err := syscall.Mount(rootfs, rootfs, "", syscall.MS_BIND|syscall.MS_REC, ""); err != nil {
-		return fmt.Errorf("bind mount rootfs %q: %w", rootfs, err)
+		return nil, fmt.Errorf("bind mount rootfs %q: %w", rootfs, err)
 	}
 	// /proc, /sys, and /dev are set up before pivot_root: inside a user
 	// namespace the kernel only allows mounting proc and sysfs while the
 	// host's copies are still visible, and /dev borrows device files from
 	// the host's /dev.
 	if err := mountProc(rootfs); err != nil {
-		return err
+		return nil, err
 	}
 	if err := mountSys(rootfs); err != nil {
-		return err
+		return nil, err
 	}
 	if err := mountCgroup(rootfs); err != nil {
-		return err
+		return nil, err
 	}
 	if err := setupDev(rootfs); err != nil {
-		return err
+		return nil, err
 	}
 	if err := pivotRoot(rootfs); err != nil {
-		return err
+		return nil, err
 	}
 	if err := protectPaths(); err != nil {
-		return err
+		return nil, err
+	}
+	var tty *os.File
+	if consoleSocket != nil {
+		var err error
+		if tty, err = setupConsole(consoleSocket); err != nil {
+			return nil, err
+		}
+	}
+	if config.ReadonlyRootfs {
+		if err := remountRootReadonly(); err != nil {
+			return nil, err
+		}
 	}
 
 	// Everything above needed full privileges in the user namespace; the
 	// command itself does not. The order of the steps below matters.
-	if apparmorProfile != "" {
+	if config.AppArmorProfile != "" {
 		// The profile request is tied to this thread, so stay on it until
 		// the command has been forked from it.
 		goruntime.LockOSThread()
-		if err := applyAppArmorProfile(apparmorProfile); err != nil {
-			return err
+		if err := applyAppArmorProfile(config.AppArmorProfile); err != nil {
+			return nil, err
 		}
 	}
 	// no_new_privs comes before the seccomp filter, which an unprivileged
 	// process may not install without it.
 	if err := setNoNewPrivs(); err != nil {
-		return err
+		return nil, err
 	}
 	if err := dropCapabilities(); err != nil {
-		return err
+		return nil, err
 	}
 	// The filter goes last so it does not have to allow the calls above.
 	if err := installSeccomp(); err != nil {
-		return err
+		return nil, err
 	}
 
+	return tty, nil
+}
+
+// setupConsole makes the container's pseudo-terminal, from its own /dev/ptmx,
+// and sends the master end to the supervisor. The slave also appears as
+// /dev/console, which is where programs write messages meant for the
+// system's operator, as with runc.
+func setupConsole(socket *os.File) (*os.File, error) {
+	master, slave, err := openPTY()
+	if err != nil {
+		return nil, err
+	}
+	defer master.Close()
+	// A bind mount needs an existing file to mount over.
+	if err := os.WriteFile("/dev/console", nil, 0o600); err != nil {
+		slave.Close()
+		return nil, fmt.Errorf("create /dev/console: %w", err)
+	}
+	if err := syscall.Mount(slave.Name(), "/dev/console", "", syscall.MS_BIND, ""); err != nil {
+		slave.Close()
+		return nil, fmt.Errorf("bind mount %s to /dev/console: %w", slave.Name(), err)
+	}
+	if err := sendFile(socket, master); err != nil {
+		slave.Close()
+		return nil, err
+	}
+	return slave, nil
+}
+
+// remountRootReadonly makes "/" read-only. A remount has to repeat the
+// nosuid, nodev, and noexec flags the mount already has: the kernel locks
+// them on mounts that came from a more privileged user namespace, and
+// refuses a remount that would clear them.
+func remountRootReadonly() error {
+	var stat syscall.Statfs_t
+	if err := syscall.Statfs("/", &stat); err != nil {
+		return fmt.Errorf("read root mount flags: %w", err)
+	}
+	// ST_NOSUID, ST_NODEV, and ST_NOEXEC have the same values as the MS_
+	// flags.
+	locked := uintptr(stat.Flags) & (syscall.MS_NOSUID | syscall.MS_NODEV | syscall.MS_NOEXEC)
+	if err := syscall.Mount("", "/", "", syscall.MS_BIND|syscall.MS_REMOUNT|syscall.MS_RDONLY|locked, ""); err != nil {
+		return fmt.Errorf("make root read-only: %w", err)
+	}
 	return nil
 }
 

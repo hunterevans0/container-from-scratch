@@ -27,11 +27,17 @@ const (
 
 // State is what runt records about a container, in StateRoot/<id>/state.json.
 type State struct {
-	ID      string   `json:"id"`
-	Name    string   `json:"name,omitempty"`
-	Status  string   `json:"status"`
-	Rootfs  string   `json:"rootfs"`
+	ID     string `json:"id"`
+	Name   string `json:"name,omitempty"`
+	Status string `json:"status"`
+	// The container's filesystem comes from one of these: a root filesystem
+	// directory (on its own, or from a bundle), or an OCI image.
+	Rootfs  string   `json:"rootfs,omitempty"`
+	Image   string   `json:"image,omitempty"`
+	Bundle  string   `json:"bundle,omitempty"`
 	Command []string `json:"command"`
+	// Tty is set if the command runs on a pseudo-terminal.
+	Tty bool `json:"tty,omitempty"`
 	// Pid is the host PID of the container's init process, while it is
 	// created or running.
 	Pid int `json:"pid,omitempty"`
