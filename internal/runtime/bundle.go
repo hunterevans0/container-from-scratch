@@ -151,7 +151,9 @@ func LoadBundle(config *Config) error {
 	if config.Env == nil {
 		config.Env = []string{}
 	}
-	config.Cwd = spec.Process.Cwd
+	if config.Cwd == "" {
+		config.Cwd = spec.Process.Cwd
+	}
 	if spec.Process.User.UID != 0 || spec.Process.User.GID != 0 || len(spec.Process.User.AdditionalGIDs) > 0 {
 		user := spec.Process.User
 		config.User = &user

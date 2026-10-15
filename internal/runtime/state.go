@@ -32,12 +32,19 @@ type State struct {
 	Status string `json:"status"`
 	// The container's filesystem comes from one of these: a root filesystem
 	// directory (on its own, or from a bundle), or an OCI image.
-	Rootfs  string   `json:"rootfs,omitempty"`
-	Image   string   `json:"image,omitempty"`
+	Rootfs string `json:"rootfs,omitempty"`
+	Image  string `json:"image,omitempty"`
+	// ImageID is the ID of the image, the digest of its configuration, and
+	// Layers are the unpacked layer directories the container's filesystem
+	// is made of. runt rmi keeps them while the container exists.
+	ImageID string   `json:"imageId,omitempty"`
+	Layers  []string `json:"layers,omitempty"`
 	Bundle  string   `json:"bundle,omitempty"`
 	Command []string `json:"command"`
-	// Tty is set if the command runs on a pseudo-terminal.
-	Tty bool `json:"tty,omitempty"`
+	// Tty is set if the command runs on a pseudo-terminal, and Interactive
+	// if its input stays open for runt attach to write to.
+	Tty         bool `json:"tty,omitempty"`
+	Interactive bool `json:"interactive,omitempty"`
 	// Pid is the host PID of the container's init process, while it is
 	// created or running.
 	Pid int `json:"pid,omitempty"`

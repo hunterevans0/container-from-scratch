@@ -15,6 +15,7 @@ import (
 	"path/filepath"
 	"runtime"
 	"strings"
+	"sync"
 	"syscall"
 	"testing"
 )
@@ -68,6 +69,101 @@ func TestWritableLayerPerContainer(t *testing.T) {
 type layoutBuilder struct {
 	t   *testing.T
 	dir string
+}
+
+func newLayoutBuilder(t *testing.T) *layoutBuilder {
+	t.Helper()
+	b := &layoutBuilder{t: t, dir: t.TempDir()}
+	if err := os.MkdirAll(filepath.Join(b.dir, "blobs/sha256"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	b.writeJSON("oci-layout", map[string]string{"imageLayoutVersion": "1.0.0"})
+	return b
+}
+
+// baseLayer is the rootfs as an uncompressed layer, plus /srv/old, made once
+// for every test that needs an image, since tarring the rootfs takes a
+// while. TestMain removes it.
+var baseLayer struct {
+	once   sync.Once
+	dir    string
+	path   string
+	digest string // hex
+	size   int64
+}
+
+// addBaseLayer adds the base layer to the layout, returning its descriptor
+// and diff ID.
+func (b *layoutBuilder) addBaseLayer(r *runtTester) (map[string]any, string) {
+	b.t.Helper()
+	baseLayer.once.Do(func() {
+		var rootStat syscall.Stat_t
+		if err := syscall.Stat(r.rootfs, &rootStat); err != nil {
+			b.t.Fatal(err)
+		}
+		dir, err := os.MkdirTemp("", "runt-base-layer-")
+		if err != nil {
+			b.t.Fatal(err)
+		}
+		baseLayer.dir = dir
+		file, err := os.Create(filepath.Join(dir, "base.tar"))
+		if err != nil {
+			b.t.Fatal(err)
+		}
+		defer file.Close()
+		hash := sha256.New()
+		tarRootfs(b.t, r.rootfs, int(rootStat.Uid), int(rootStat.Gid), io.MultiWriter(file, hash), func(archive *tar.Writer) {
+			addFile(b.t, archive, "srv/old", "old")
+		})
+		info, err := file.Stat()
+		if err != nil {
+			b.t.Fatal(err)
+		}
+		baseLayer.path, baseLayer.digest, baseLayer.size = file.Name(), hex.EncodeToString(hash.Sum(nil)), info.Size()
+	})
+	if baseLayer.path == "" {
+		b.t.Fatal("making the base layer failed in an earlier test")
+	}
+	if err := os.Link(baseLayer.path, filepath.Join(b.dir, "blobs/sha256", baseLayer.digest)); err != nil {
+		b.t.Fatal(err)
+	}
+	desc := map[string]any{"mediaType": "application/vnd.oci.image.layer.v1.tar", "digest": "sha256:" + baseLayer.digest, "size": baseLayer.size}
+	return desc, "sha256:" + baseLayer.digest
+}
+
+// writeImage writes an image's configuration and manifest, and an index.json
+// listing it under tag. defaults is the configuration's "config": the
+// command, environment, and so on.
+func (b *layoutBuilder) writeImage(tag string, defaults map[string]any, layers []map[string]any, diffIDs []string) {
+	b.t.Helper()
+	config := b.jsonBlob("application/vnd.oci.image.config.v1+json", map[string]any{
+		"architecture": runtime.GOARCH,
+		"os":           "linux",
+		"config":       defaults,
+		"rootfs":       map[string]any{"type": "layers", "diff_ids": diffIDs},
+	})
+	manifest := b.jsonBlob("application/vnd.oci.image.manifest.v1+json", map[string]any{
+		"schemaVersion": 2,
+		"mediaType":     "application/vnd.oci.image.manifest.v1+json",
+		"config":        config,
+		"layers":        layers,
+	})
+	manifest["annotations"] = map[string]string{"org.opencontainers.image.ref.name": tag}
+	b.writeJSON("index.json", map[string]any{"schemaVersion": 2, "manifests": []any{manifest}})
+}
+
+// TestMain removes the base layer, and what runt unpacked of it, once every
+// test is done with them.
+func TestMain(m *testing.M) {
+	code := m.Run()
+	if baseLayer.dir != "" {
+		os.RemoveAll(baseLayer.dir)
+		unpacked, _ := filepath.Glob(filepath.Join("/var/lib/runt/layers/*", baseLayer.digest))
+		for _, dir := range unpacked {
+			os.RemoveAll(dir)
+		}
+	}
+	os.Exit(code)
 }
 
 // blob stores data under its digest and returns its descriptor.
@@ -177,27 +273,10 @@ func TestImage(t *testing.T) {
 	if err := syscall.Stat(r.rootfs, &rootStat); err != nil {
 		t.Fatal(err)
 	}
-	b := &layoutBuilder{t: t, dir: t.TempDir()}
-	if err := os.MkdirAll(filepath.Join(b.dir, "blobs/sha256"), 0o755); err != nil {
-		t.Fatal(err)
-	}
+	b := newLayoutBuilder(t)
 
 	// The base layer, uncompressed: the rootfs, plus /srv/old.
-	baseFile, err := os.Create(filepath.Join(b.dir, "base.tar"))
-	if err != nil {
-		t.Fatal(err)
-	}
-	baseHash := sha256.New()
-	tarRootfs(t, r.rootfs, int(rootStat.Uid), int(rootStat.Gid), io.MultiWriter(baseFile, baseHash), func(archive *tar.Writer) {
-		addFile(t, archive, "srv/old", "old")
-	})
-	baseFile.Close()
-	baseDigest := hex.EncodeToString(baseHash.Sum(nil))
-	if err := os.Rename(filepath.Join(b.dir, "base.tar"), filepath.Join(b.dir, "blobs/sha256", baseDigest)); err != nil {
-		t.Fatal(err)
-	}
-	baseInfo, _ := os.Stat(filepath.Join(b.dir, "blobs/sha256", baseDigest))
-	base := map[string]any{"mediaType": "application/vnd.oci.image.layer.v1.tar", "digest": "sha256:" + baseDigest, "size": baseInfo.Size()}
+	base, baseDiff := b.addBaseLayer(r)
 
 	// The top layer, gzipped.
 	var topTar strings.Builder
@@ -214,28 +293,14 @@ func TestImage(t *testing.T) {
 	gz.Close()
 	top := b.blob("application/vnd.oci.image.layer.v1.tar+gzip", []byte(topGzip.String()))
 
-	config := b.jsonBlob("application/vnd.oci.image.config.v1+json", map[string]any{
-		"architecture": runtime.GOARCH,
-		"os":           "linux",
-		"rootfs":       map[string]any{"type": "layers", "diff_ids": []string{"sha256:" + baseDigest, "sha256:" + hex.EncodeToString(topDiff[:])}},
-	})
-	manifest := b.jsonBlob("application/vnd.oci.image.manifest.v1+json", map[string]any{
-		"schemaVersion": 2,
-		"mediaType":     "application/vnd.oci.image.manifest.v1+json",
-		"config":        config,
-		"layers":        []any{base, top},
-	})
-	manifest["annotations"] = map[string]string{"org.opencontainers.image.ref.name": "test"}
-	b.writeJSON("oci-layout", map[string]string{"imageLayoutVersion": "1.0.0"})
-	b.writeJSON("index.json", map[string]any{"schemaVersion": 2, "manifests": []any{manifest}})
+	b.writeImage("test", nil, []map[string]any{base, top}, []string{baseDiff, "sha256:" + hex.EncodeToString(topDiff[:])})
 
 	// The unpacked layers are shared by every container from the image;
-	// remove them once this test is done with them.
+	// remove the top one once this test is done with it (TestMain removes
+	// the base).
 	store := fmt.Sprintf("/var/lib/runt/layers/%d-%d", rootStat.Uid, rootStat.Gid)
 	t.Cleanup(func() {
-		for _, layer := range []map[string]any{base, top} {
-			os.RemoveAll(filepath.Join(store, strings.TrimPrefix(layer["digest"].(string), "sha256:")))
-		}
+		os.RemoveAll(filepath.Join(store, strings.TrimPrefix(top["digest"].(string), "sha256:")))
 	})
 
 	r.removeAtEnd("runt-image")

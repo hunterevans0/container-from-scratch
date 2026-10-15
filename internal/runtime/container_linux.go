@@ -49,7 +49,11 @@ func Run(config Config) error {
 // session of its own so it is not tied to this terminal.
 func Create(config Config, start bool) (string, error) {
 	// The monitor runs in "/", so a relative path would change meaning.
-	for _, path := range []*string{&config.Rootfs, &config.Image} {
+	paths := []*string{&config.Rootfs}
+	if config.Image != "" && isLayoutRef(config.Image) {
+		paths = append(paths, &config.Image)
+	}
+	for _, path := range paths {
 		if *path != "" {
 			absolute, err := filepath.Abs(*path)
 			if err != nil {
@@ -154,19 +158,17 @@ func Monitor() error {
 // init, records the container's state as it changes, copies its output into
 // the log, and cleans up afterwards.
 //
-// Output always goes to the log, and in the foreground to runt's own output
-// too. In the foreground with config.Interactive, the command reads runt's
-// input; otherwise its input is empty. With config.Tty the command runs on a
-// pseudo-terminal of its own, which runt's terminal is connected to in the
-// foreground.
+// Output always goes to the log, and to anyone attached (see attachHub), and
+// in the foreground to runt's own output too. With config.Interactive, the
+// command reads runt's input in the foreground, and in the background a pipe
+// that runt attach writes to; otherwise its input is empty. With config.Tty
+// the command runs on a pseudo-terminal of its own, which runt's terminal is
+// connected to in the foreground.
 //
 // ready, if set, is called once: when the container has been created (and,
 // with autoStart, when its command is running), or with the reason it
 // failed.
 func supervise(config Config, foreground, autoStart bool, ready func(id string, err error)) error {
-	if len(config.Command) == 0 {
-		return errors.New("command cannot be empty")
-	}
 	if foreground && config.Interactive && config.Tty && !isTerminal(os.Stdin) {
 		return errors.New("the input device is not a terminal; use -t without -i, or run from a terminal")
 	}
@@ -177,8 +179,23 @@ func supervise(config Config, foreground, autoStart bool, ready func(id string, 
 	// The layers to mount an overlay of, top first. Nil means the container
 	// uses the rootfs directly.
 	var layers []string
+	var image *ociImage
+	// Starting from an image holds the image store's lock until the
+	// container's state, which lists the layers it uses, is saved, so runt
+	// rmi can't remove them in between.
+	unlockImages := func() {}
 	if config.Image != "" {
-		if layers, err = unpackImage(config.Image, uids, gids); err != nil {
+		if unlockImages, err = defaultImageStore().lock(false); err != nil {
+			return err
+		}
+		defer unlockImages()
+		if image, err = openImageRef(config.Image); err != nil {
+			return err
+		}
+		if err := applyImageConfig(&config, image); err != nil {
+			return err
+		}
+		if layers, err = unpackImage(image, uids, gids); err != nil {
 			return err
 		}
 	} else {
@@ -191,6 +208,20 @@ func supervise(config Config, foreground, autoStart bool, ready func(id string, 
 		if !config.DirectRootfs {
 			layers = []string{config.Rootfs}
 		}
+	}
+	if len(config.Command) == 0 {
+		return errors.New("command cannot be empty")
+	}
+	if config.SetEnv != nil {
+		// -e settings on top of the bundle's environment, or runt's own.
+		env := config.Env
+		if env == nil {
+			env = os.Environ()
+		}
+		config.Env = mergeEnv(env, config.SetEnv)
+	}
+	if err := checkCwd(config.Cwd); err != nil {
+		return err
 	}
 	useCgroup := cgroupV2()
 	if !useCgroup && !config.Resources.IsZero() {
@@ -233,12 +264,15 @@ func supervise(config Config, foreground, autoStart bool, ready func(id string, 
 		Bundle:          config.Bundle,
 		Command:         config.Command,
 		Tty:             config.Tty,
+		Interactive:     config.Interactive,
 		AppArmorProfile: config.AppArmorProfile,
 		Resources:       config.Resources,
 		Created:         time.Now(),
 	}
-	if config.Image != "" {
+	if image != nil {
 		state.Rootfs = ""
+		state.ImageID = image.manifest.Config.Digest
+		state.Layers = layers
 	}
 
 	rootfs := config.Rootfs
@@ -372,27 +406,48 @@ func supervise(config Config, foreground, autoStart bool, ready func(id string, 
 		command.Env = append(os.Environ(), debugInitEnv+"=1")
 	}
 
+	// runt attach connects here. Listening before init starts means it
+	// can connect as soon as runt create returns, before runt start.
+	hub, err := listenAttach(filepath.Join(dir, attachSocketName))
+	if err != nil {
+		return err
+	}
+	defer hub.close(-1)
+
 	// Connect the container's input and output. Output always goes through
-	// pipes into the log, and in the foreground on to runt's own output as
-	// well; with a terminal, that is the command's pseudo-terminal, below,
-	// and these pipes only carry what init itself prints. Input is runt's
-	// own with -i, and empty otherwise.
+	// pipes into the log and to anyone attached, and in the foreground on to
+	// runt's own output as well; with a terminal, that is the command's
+	// pseudo-terminal, below, and these pipes only carry what init itself
+	// prints. With -i, input is runt's own in the foreground, and in the
+	// background a pipe held open for runt attach. Otherwise it is empty.
 	var copies sync.WaitGroup
-	if foreground && config.Interactive && !config.Tty {
-		command.Stdin = os.Stdin
+	if config.Interactive && !config.Tty {
+		if foreground {
+			command.Stdin = os.Stdin
+		} else {
+			r, w, err := containerPipe(uids, gids)
+			if err != nil {
+				return err
+			}
+			defer w.Close()
+			childEnds = append(childEnds, r)
+			command.Stdin = r
+			hub.connect(w, nil)
+		}
 	}
 	names := []string{"stdout", "stderr"}
+	kinds := []byte{frameStdout, frameStderr}
 	outputs := []*os.File{os.Stdout, os.Stderr}
 	for i, ours := range outputs {
-		r, w, err := os.Pipe()
+		r, w, err := containerPipe(uids, gids)
 		if err != nil {
 			return err
 		}
 		outputs[i] = w
 		childEnds = append(childEnds, w)
-		var passthrough io.Writer
+		passthrough := hub.output(kinds[i])
 		if foreground {
-			passthrough = ours
+			passthrough = io.MultiWriter(passthrough, ours)
 		}
 		copies.Add(1)
 		go func() {
@@ -442,6 +497,7 @@ func supervise(config Config, foreground, autoStart bool, ready func(id string, 
 		Env:             config.Env,
 		Cwd:             config.Cwd,
 		User:            config.User,
+		UserSpec:        config.UserSpec,
 		Tty:             config.Tty,
 	})
 	configW.Close()
@@ -454,6 +510,7 @@ func supervise(config Config, foreground, autoStart bool, ready func(id string, 
 	if err := saveState(StateRoot, state); err != nil {
 		warn(err)
 	}
+	unlockImages()
 	if config.DebugInit {
 		// Inside its PID namespace init sees itself as PID 1, so only the
 		// parent can report the PID a host debugger needs.
@@ -466,7 +523,7 @@ func supervise(config Config, foreground, autoStart bool, ready func(id string, 
 	if config.Tty {
 		if console, err := receiveFile(consoleSocket, "console"); err == nil {
 			defer console.Close()
-			var passthrough io.Writer
+			passthrough := hub.output(frameStdout)
 			if foreground {
 				disconnect, err := connectTerminal(console, config.Interactive)
 				if err != nil {
@@ -474,10 +531,17 @@ func supervise(config Config, foreground, autoStart bool, ready func(id string, 
 				} else {
 					defer disconnect()
 				}
-				passthrough = os.Stdout
+				passthrough = io.MultiWriter(passthrough, os.Stdout)
 			} else {
 				setWinsize(console, defaultWinsize)
 			}
+			// Attached clients type into the terminal with -i, and
+			// resize it either way.
+			var input io.Writer
+			if config.Interactive {
+				input = console
+			}
+			hub.connect(input, console)
 			// A terminal has a single stream, which Docker logs as stdout.
 			copies.Add(1)
 			go func() {
@@ -504,6 +568,7 @@ func supervise(config Config, foreground, autoStart bool, ready func(id string, 
 		if err := saveState(StateRoot, state); err != nil {
 			warn(err)
 		}
+		hub.close(exitCode)
 		return waitErr
 	}
 
@@ -560,6 +625,25 @@ func supervise(config Config, foreground, autoStart bool, ready func(id string, 
 		ready(id, nil)
 	}
 	return finish()
+}
+
+// containerPipe makes a pipe for the container's input or output, owned by
+// container root, as containerd does. Programs open /dev/stdout and
+// /dev/stderr, which lead through /proc/self/fd to the pipe itself; nginx's
+// logs are links to them, for example. Opening a pipe that way checks its
+// owner and mode (0600), so a pipe owned by host root, as runt makes it,
+// would be closed to the container.
+func containerPipe(uids, gids IDRange) (r, w *os.File, err error) {
+	if r, w, err = os.Pipe(); err != nil {
+		return nil, nil, err
+	}
+	// Both ends share one inode.
+	if err := r.Chown(uids.Base, gids.Base); err != nil {
+		r.Close()
+		w.Close()
+		return nil, nil, fmt.Errorf("set owner of container pipe: %w", err)
+	}
+	return r, w, nil
 }
 
 // idRanges returns the host ID ranges the container's user namespace maps
@@ -658,16 +742,8 @@ func Start(ref string) error {
 	if state.Status != StatusCreated {
 		return fmt.Errorf("container %s is %s; only a created container can be started", state.ID, state.Status)
 	}
-	// O_NONBLOCK makes the open fail with ENXIO, instead of waiting, if no
-	// init has the FIFO open for reading.
-	fifo, err := os.OpenFile(filepath.Join(stateDir(StateRoot, state.ID), startFifoName), os.O_WRONLY|syscall.O_NONBLOCK, 0)
-	if err != nil {
-		return fmt.Errorf("container %s is not waiting to start: %w", state.ID, err)
-	}
-	_, err = fifo.Write([]byte{0})
-	fifo.Close()
-	if err != nil {
-		return fmt.Errorf("start container %s: %w", state.ID, err)
+	if err := writeStartFifo(state.ID); err != nil {
+		return err
 	}
 
 	// The monitor records whether the command started.
@@ -688,6 +764,22 @@ func Start(ref string) error {
 		}
 	}
 	return fmt.Errorf("timed out waiting for container %s to start", state.ID)
+}
+
+// writeStartFifo tells a created container's init to run the command.
+func writeStartFifo(id string) error {
+	// O_NONBLOCK makes the open fail with ENXIO, instead of waiting, if no
+	// init has the FIFO open for reading.
+	fifo, err := os.OpenFile(filepath.Join(stateDir(StateRoot, id), startFifoName), os.O_WRONLY|syscall.O_NONBLOCK, 0)
+	if err != nil {
+		return fmt.Errorf("container %s is not waiting to start: %w", id, err)
+	}
+	_, err = fifo.Write([]byte{0})
+	fifo.Close()
+	if err != nil {
+		return fmt.Errorf("start container %s: %w", id, err)
+	}
+	return nil
 }
 
 // Kill sends sig to a container's init, which passes it on to the command.

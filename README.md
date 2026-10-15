@@ -19,11 +19,12 @@
 - sensitive `/proc` and `/sys` paths hidden or made read-only
 - a cgroup v2 cgroup per container, with optional memory, CPU, process, and disk I/O limits
 - an ID per container, with its state and output saved under `/run/runt/<id>/`
-- `create`, `start`, `ps`, `stop`, `kill`, `rm`, `exec`, and `logs` commands, and detached containers (`run -d`)
+- `create`, `start`, `ps`, `stop`, `kill`, `rm`, `exec`, `logs`, and `attach` commands, and detached containers (`run -d`, `run -dit`)
 - an init process that, as PID 1 should, passes signals on to the command and reaps orphaned processes
 - a pseudo-terminal of the container's own for interactive programs (`run -it`, `exec -it`)
 - an overlay filesystem per container: shared read-only layers underneath, and a writable layer of its own on top
 - OCI image layouts (`--image`) and OCI runtime bundles (`--bundle`, with `runt spec` to write a `config.json`)
+- `pull` from Docker Hub and other registries (with `login`), a local image store with `images` and `rmi`, and each image's default command, environment, working directory, and user
 
 This is educational code, not a production container runtime. It currently requires Linux and root privileges for `run`.
 
@@ -73,7 +74,7 @@ The rootfs itself never changes: whatever the shell writes or deletes goes to a 
 
 ## Integration tests
 
-`make test` only runs tests that don't start containers (the layer-unpacking tests also skip themselves unless run as root). `make integration` builds `runt` and runs the tests in [integration/](integration/), which start real containers with `sudo`. They check that containers can't reach each other (one tries to see the other's processes, kill it by its host PID, and move itself into its cgroup) and don't see each other's files. They also cover init reaping orphans, terminals for `run -it`, `run -dt`, and `exec -it`, signals reaching `exec`'d commands, an OCI image built from the rootfs, and a bundle made with `runt spec`. They need the rootfs from `make rootfs`.
+`make test` only runs tests that don't start containers (the layer-unpacking tests also skip themselves unless run as root). `make integration` builds `runt` and runs the tests in [integration/](integration/), which start real containers with `sudo`. They check that containers can't reach each other (one tries to see the other's processes, kill it by its host PID, and move itself into its cgroup) and don't see each other's files. They also cover init reaping orphans, terminals for `run -it`, `run -dt`, and `exec -it`, signals reaching `exec`'d commands, `attach` (and detaching from it) and `start -ai`, an OCI image built from the rootfs, an image's configuration and the options that override it, and a bundle made with `runt spec`. One test serves an image from a registry of its own on localhost, which wants a password, and logs in, pulls, runs, and removes it. They need the rootfs from `make rootfs`, but not the internet.
 
 ## Debugging with breakpoints
 
@@ -179,13 +180,17 @@ sudo ./runt exec web ps -e     # run another command inside it
 sudo ./runt exec -it web bash  # or an interactive shell
 sudo ./runt stop web           # SIGTERM, then SIGKILL after 10 seconds (-t to change)
 sudo ./runt rm web
+
+sudo ./runt run -dit --name box --rootfs /var/lib/runt/rootfs -- /bin/bash
+sudo ./runt attach box         # its terminal; Ctrl+P, Ctrl+Q detaches and leaves it running
 ```
 
 | Command | What it does |
 | --- | --- |
 | `run [-d] [-i] [-t] [OPTIONS] -- CMD` | Create a container and run `CMD`. With `-d` it runs in the background and `runt` prints its ID. `-i` and `-t` are as in Docker (see [Terminals](#terminals)). |
-| `create [-t] [OPTIONS] -- CMD` | Set a container up (namespaces, mounts, cgroup, security) without running `CMD` yet. |
-| `start CONTAINER...` | Run the command of a created container. |
+| `create [-i] [-t] [OPTIONS] -- CMD` | Set a container up (namespaces, mounts, cgroup, security) without running `CMD` yet. |
+| `start [-a] [-i] CONTAINER...` | Run the command of a created container. `-a` attaches to its output first and waits for it to exit, and `-i` also sends it `runt`'s input. |
+| `attach [--no-stdin] CONTAINER` | Connect `runt`'s input and output to a running container (see [Attach](#attach)). |
 | `ps [-a]` | List running and created containers, or all with `-a`. |
 | `stop [-t SECONDS] CONTAINER...` | Send SIGTERM, then SIGKILL if it hasn't exited after the timeout. |
 | `kill [-s SIGNAL] CONTAINER...` | Send a signal, SIGKILL by default. |
@@ -193,8 +198,12 @@ sudo ./runt rm web
 | `exec [-i] [-t] CONTAINER CMD [ARG...]` | Run a command inside a running container. |
 | `logs [-f] [-t] [--tail N] CONTAINER` | Show what the container wrote to stdout and stderr. |
 | `spec [--bundle DIR] [--rootfs PATH]` | Write a starting `config.json` for an OCI runtime bundle. |
+| `pull IMAGE` | Download an image from a registry into the image store (see [Images](#images)). |
+| `images [-q] [--digests]` | List the images in the store. |
+| `rmi [-f] IMAGE...` | Remove images from the store. |
+| `login [-u USER] [--password-stdin] [REGISTRY]` / `logout [REGISTRY]` | Store or remove credentials for a registry, Docker Hub by default. |
 
-`run` and `create` take the container's filesystem from one of `--rootfs PATH` (a root filesystem directory), `--image LAYOUT[:TAG]` (an [OCI image](#oci-images)), or `--bundle DIR` (an [OCI runtime bundle](#oci-runtime-bundles), whose `config.json` also gives the command).
+`run` and `create` take the container's filesystem from one of `--rootfs PATH` (a root filesystem directory), `--image IMAGE` (an [image](#images) from the store, pulled if need be, or an OCI image layout), or `--bundle DIR` (an [OCI runtime bundle](#oci-runtime-bundles), whose `config.json` also gives the command). They also take `-e NAME=VALUE` (repeatable), `-w DIR`, and `-u USER[:GROUP]`, as `docker run` does, and with an image, `--entrypoint` (see [Image configuration](#image-configuration)).
 
 `CONTAINER` is the name given with `--name`, the full ID, or enough of the start of the ID to be unique. Options go before the other arguments, as in `logs -f web`. Single-letter options combine, as in `-it` or `-dt`.
 
@@ -205,6 +214,7 @@ Each container gets a random 12-character hex ID and a directory `/run/runt/<id>
 - `state.json`: the rootfs or image, command, limits, cgroup, timestamps, and status. The status moves from `created` (set up, with the host PID of its init) to `running` and then `stopped` (with the exit code).
 - `container.log`: the container's output, one JSON object per line, in the format of Docker's `json-file` log driver.
 - `start.fifo`: what a created container's init waits on (see below).
+- `attach.sock`: the Unix socket `runt attach` connects to, while the container runs.
 - `monitor.log`: problems the background monitor ran into, if any.
 
 `/run` is a tmpfs, so all of this is gone after a reboot. The container's writable layer is in `/var/lib/runt/containers/<id>/` (see [Filesystem layers](#filesystem-layers)), which does survive a reboot. The next container `runt` starts removes layers whose state has gone.
@@ -229,6 +239,8 @@ Each container gets a random 12-character hex ID and a directory `/run/runt/<id>
 
 **Inherited files.** Init and `exec` close every file descriptor above 2 before the command runs, as runc does, so files open in whatever started `runt` don't leak into the container. In WSL, for example, `/dev/ptmx` descriptors are open in every shell.
 
+**Output pipes owned by container root.** The pipes for the container's output (and input, with `-i`) are made by `runt`, as host root, and then given to container root, as containerd does. Programs open `/dev/stdout` and `/dev/stderr`, which lead through `/proc/self/fd` to the pipe itself, and opening a pipe that way checks its owner. nginx's log files, for example, are links to them.
+
 ## Terminals
 
 `-i` and `-t` work as in Docker:
@@ -247,9 +259,28 @@ With `-it`, `runt` puts its own terminal in raw mode, so every key goes straight
 
 A pseudo-terminal is a pair of devices: whatever the command writes to one end, the "slave", can be read from the other, the "master", and the other way round. As in runc, init makes the pair inside the container from the container's own `devpts` (`/dev/ptmx`), so the command sees `/dev/pts/0`, owned by container root, rather than one of the host's terminals. The slave also appears as `/dev/console`. Init sends the master out to `runt` over a Unix socket, passing the open file descriptor itself (`SCM_RIGHTS`). `exec -t` works the same way, with its own terminal.
 
-`-t` works in the background too: `run -dt` (or `create -t`) gives the command a terminal of 80 by 24 characters, and its output goes to the log. A shell started that way keeps running, waiting for input that never comes, so `exec -it` can join it. `-i` can't be used with `-d`, because there is no `attach` command yet to supply the input.
+`-t` works in the background too: `run -dt` (or `create -t`) gives the command a terminal of 80 by 24 characters, and its output goes to the log. A shell started that way keeps running, waiting for input that never comes, so `exec -it` can join it. With `-i` as well (`run -dit`), `runt attach` can type into it.
 
 Terminal output is logged as `stdout`, carriage returns and escape sequences included, as Docker logs it.
+
+## Attach
+
+`runt attach CONTAINER` connects to a container running in the background, as `docker attach` does: what the container writes appears in `runt`'s output, and what `runt` reads goes to the container's input, if it was made with `-i`. Whatever supervises the container (its monitor, or `runt run` in the foreground) listens on a Unix socket, `/run/runt/<id>/attach.sock`. It sends the container's output to everyone connected, and passes what they send on to the container's terminal with `-t`, or else to a pipe for its input that it holds open for the purpose. Several `attach`es can connect at once.
+
+```bash
+sudo ./runt run -dit --name box --rootfs /var/lib/runt/rootfs -- /bin/bash
+sudo ./runt attach box            # Ctrl+P, Ctrl+Q to detach
+sudo ./runt create -i --name job --rootfs /var/lib/runt/rootfs -- /bin/sh -c 'read x; echo $x'
+echo hello | sudo ./runt start -ai job
+```
+
+- Like `exec -it`, attaching to a container with a terminal puts `runt`'s terminal in raw mode, and the container's terminal takes its size (the last one to attach or resize wins).
+- **Ctrl+P, Ctrl+Q** detaches and leaves the container running. Ctrl+P followed by anything else is sent on as it is. Without a terminal, Ctrl+C is a signal for `runt`, which passes it on to the container (`--sig-proxy=false` doesn't).
+- `attach` doesn't replay what the container wrote before; `runt logs` has that. So a shell shows no prompt until a key is pressed, as with Docker.
+- When the container exits, `attach` exits with its exit code. When `attach`'s own input ends, the container's input stays open for others, as in Docker.
+- `start -a` attaches first and then starts the container, so none of its output is missed. `-i` (which implies `-a`) sends `runt`'s input too.
+
+The two ends talk in frames: a byte for the type, a 4-byte length, and the data. `runt attach` sends input and terminal sizes, and receives stdout, stderr, and finally the exit code. A client that falls far behind is disconnected rather than slowing the container down.
 
 ## Filesystem layers
 
@@ -265,15 +296,72 @@ With `--rootfs`, the rootfs directory is the only layer underneath. With `--imag
 
 The container's directory is mode `0710` with group container root (host gid 100000, usually), because init runs as container root and has to reach `rootfs/`. Other host users can't look in.
 
-## OCI images
+## Images
 
-`--image LAYOUT[:TAG]` runs an image from an [OCI image layout](https://github.com/opencontainers/image-spec/blob/main/image-layout.md): a directory with an `oci-layout` file, an `index.json` listing the images in it, and every manifest, configuration, and layer stored under `blobs/sha256/` by the digest of its content. `skopeo` and `buildah` write them (`skopeo copy docker://alpine:3.20 oci:alpine:3.20`), and so does `docker save` from Docker 25 on, once untarred.
+```bash
+sudo ./runt pull alpine:3.20
+sudo ./runt images
+sudo ./runt run -it --image alpine:3.20                 # the image's default command, /bin/sh
+sudo ./runt run -d --name web --image nginx:alpine      # pulled first if it isn't in the store
+sudo ./runt rmi alpine:3.20
+```
+
+`--image IMAGE` takes an image from `runt`'s image store, by name or ID, or an OCI image layout directory. A name is written as Docker writes it, `[REGISTRY/]REPOSITORY[:TAG][@DIGEST]`: `alpine` is `docker.io/library/alpine:latest`, and `ghcr.io/owner/app:1.0` is on GitHub's registry. If the image isn't in the store, `run` and `create` pull it first, as `docker run` does. A path, or a directory with an `oci-layout` file, is a layout instead (see [OCI image layouts](#oci-image-layouts)).
+
+### Pulling
+
+`runt pull` talks to the registry with the [OCI distribution API](https://github.com/opencontainers/distribution-spec), which Docker Hub, `ghcr.io`, and every other registry serve. It asks for the image's manifest, by tag or digest, accepting OCI and Docker manifests. If what comes back is an index, a manifest per platform, it follows the one for Linux on this machine's architecture. Then it downloads the image's configuration and each layer it doesn't have yet, checking each one against its digest, and moves them into the store.
+
+Registries answer a request without credentials with `401` and a challenge saying how to authenticate. `Basic` means sending a user name and password with every request. `Bearer` names a token server to ask for a token that allows pulling from the repository, sending the user name and password if there are any. Docker Hub asks for a token even for public images, and hands one out without credentials. Blob requests are often redirected to a CDN; Go's HTTP client doesn't pass the token on to another host.
+
+A registry on this machine (`localhost` or `127.0.0.1`, with any port) is reached over plain HTTP, as Docker does; any other over HTTPS.
+
+### Logging in
+
+```bash
+sudo ./runt login -u myname            # Docker Hub; asks for the password
+echo "$TOKEN" | sudo ./runt login -u myname --password-stdin ghcr.io
+sudo ./runt logout ghcr.io
+```
+
+`runt` keeps credentials where Docker does, in `config.json` under `$DOCKER_CONFIG`, or `~/.docker`. Under `sudo` that's root's, so a `docker login` you ran as yourself isn't seen; run `sudo ./runt login`, or set `DOCKER_CONFIG`. `login` checks the credentials with the registry first, then stores them in the file's `auths`, base64-encoded but not encrypted, like `docker login` without a credential helper. When reading, `runt` also asks a credential helper (`docker-credential-NAME`) if `config.json` names one in `credHelpers` or `credsStore`.
+
+### The image store
+
+The store, `/var/lib/runt/images/`, is itself an OCI image layout: blobs under `blobs/sha256/`, and an `index.json` listing each image under its full name (`docker.io/library/alpine:3.20`) in the `io.containerd.image.name` annotation, as `docker save` writes it. Only this platform's manifest is kept. An image's ID is the digest of its configuration, as in Docker, and `images` shows the first 12 digits, which `run --image` and `rmi` also accept.
+
+`runt rmi NAME` removes that name. The image itself is deleted once no name is left for it; removing it by ID removes all its names, which takes `-f` if there is more than one. An image a container was made from (`runt ps -a`) also takes `-f`; the container keeps its layers until it's removed. Then `rmi` deletes the blobs no image needs, and unpacked layers that neither an image in the store nor a container uses, including those of layout images no container uses any more (they're unpacked again when next run).
+
+Several `runt` processes use the store at once, so a lock file, `/var/lib/runt/images.lock`, guards it. A pull downloads into a directory of its own under `/var/lib/runt/tmp/`, holding the lock shared, then takes it exclusively for the moment it takes to move the blobs in and update `index.json`. Starting a container from an image holds the lock shared until the container's state, which lists its layers, is saved. `rmi` holds it exclusively, so it never removes something that is being pulled, unpacked, or mounted.
+
+### Image configuration
+
+An image's configuration says how to run it, with the defaults a Dockerfile's `ENTRYPOINT`, `CMD`, `ENV`, `WORKDIR`, and `USER` set. `runt` applies them as `docker run` does:
+
+| Setting | From the image | Overridden by |
+| --- | --- | --- |
+| Command | the entrypoint followed by the default command | the arguments after the options replace the default command; `--entrypoint` replaces the entrypoint and drops the default command (`--entrypoint ""` for none) |
+| Environment | the image's, plus `PATH` if it doesn't set one, `TERM=xterm` with `-t`, and `HOME` for the user | `-e NAME=VALUE`, or `-e NAME` to take it from `runt`'s environment |
+| Working directory | `WORKDIR`, or `/` | `-w DIR`; it's created if it doesn't exist |
+| User | `USER` | `-u USER[:GROUP]` |
+
+A user or group is a name or a numeric ID. Names are looked up in the container's own `/etc/passwd` and `/etc/group`, from inside the container, as runc does: a name means whatever the image says it means. A numeric ID needn't be listed. Without a group, the user's primary group is used, and the user also gets the groups that list them as a member. The files come from the image, so init only reads regular files, and only so much of them.
+
+`-e`, `-w`, and `-u` work with `--rootfs` and `--bundle` too, on top of `runt`'s own environment and the bundle's settings.
+
+### OCI image layouts
+
+`--image LAYOUT[:TAG]` also runs an image from an [OCI image layout](https://github.com/opencontainers/image-spec/blob/main/image-layout.md): a directory with an `oci-layout` file, an `index.json` listing the images in it, and every manifest, configuration, and layer stored under `blobs/sha256/` by the digest of its content. `skopeo` and `buildah` write them (`skopeo copy docker://alpine:3.20 oci:alpine:3.20`), and so does `docker save` from Docker 25 on, once untarred.
 
 ```bash
 sudo ./runt run -it --image ./alpine:3.20 -- /bin/sh
 ```
 
-`runt` picks the image tagged `TAG` (the `org.opencontainers.image.ref.name` annotation), or the only image, or the one tagged `latest`. If it comes in several architectures, `runt` picks the Linux one for the machine it runs on. The first time an image is run, `runt` unpacks each layer into `/var/lib/runt/layers/<uid base>-<gid base>/<digest>/`, where every container using that layer shares it. Unpacking:
+`runt` picks the image tagged `TAG` (the `org.opencontainers.image.ref.name` annotation), or the only image, or the one tagged `latest`. If it comes in several architectures, `runt` picks the Linux one for the machine it runs on.
+
+### Unpacking layers
+
+The first time an image is run, from the store or a layout, `runt` unpacks each layer into `/var/lib/runt/layers/<uid base>-<gid base>/<digest>/`, where every container using that layer shares it. Unpacking:
 
 - checks every blob against its digest, and each layer's uncompressed content against the image configuration's `diff_ids`;
 - takes uncompressed or gzipped layers (`zstd` isn't supported, since Go's standard library has no decompressor for it);
@@ -282,7 +370,7 @@ sudo ./runt run -it --image ./alpine:3.20 -- /bin/sh
 - treats the archive as untrusted: names are cleaned of `..`, no entry may be written through a symbolic link, and hard links must point inside the layer;
 - skips device files and extended attributes. The one extended attribute images use, `security.capability`, has no effect under `no_new_privs`.
 
-The image's own configuration (default command, environment, working directory, user) isn't applied yet, so give the command after `--`. Nothing removes unpacked layers yet; `sudo rm -rf /var/lib/runt/layers` is safe while no container uses them.
+`runt rmi` removes unpacked layers that are no longer needed (see [The image store](#the-image-store)).
 
 ## OCI runtime bundles
 

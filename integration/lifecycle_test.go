@@ -289,3 +289,74 @@ func TestExecSignals(t *testing.T) {
 	}
 	stdout.waitFor("got-term")
 }
+
+// TestAttach starts a shell in the background with a terminal and its input
+// open (run -dit), attaches to it from a terminal, types into it, detaches
+// with Ctrl+P, Ctrl+Q, and attaches again to make it exit.
+func TestAttach(t *testing.T) {
+	r := newRuntTester(t)
+	r.startWith("runt-attach", []string{"-it", "--rootfs", r.rootfs}, "/bin/sh")
+
+	term := newTerminal(t, 25, 90)
+	attach := term.run(r.binary, "attach", "runt-attach")
+	// The shell's terminal takes the attached terminal's size.
+	time.Sleep(200 * time.Millisecond)
+	term.master.Write([]byte("stty size; echo attached-$((6*7))\r"))
+	term.waitFor("attached-42")
+	term.waitFor("25 90")
+	term.master.Write([]byte{0x10, 0x11})
+	if code := exitCode(t, attach); code != 0 {
+		t.Errorf("runt attach exited with %d after detaching; want 0\n%s", code, term.String())
+	}
+	if output, _ := r.runt("ps"); !strings.Contains(output, "runt-attach") {
+		t.Fatalf("the container stopped when runt attach detached:\n%s", output)
+	}
+
+	term = newTerminal(t, 25, 90)
+	attach = term.run(r.binary, "attach", "runt-attach")
+	time.Sleep(200 * time.Millisecond)
+	term.master.Write([]byte("exit 7\r"))
+	if code := exitCode(t, attach); code != 7 {
+		t.Errorf("runt attach exited with %d; want the shell's 7\n%s", code, term.String())
+	}
+}
+
+// TestStartAttach creates a container with its input open (create -i), and
+// starts it with start -ai, which connects runt's input and output to it
+// before it runs, so it reads what runt is given and none of its output is
+// missed.
+func TestStartAttach(t *testing.T) {
+	r := newRuntTester(t)
+	r.removeAtEnd("runt-start-ai")
+	if output, err := r.runt("create", "-i", "--name", "runt-start-ai", "--rootfs", r.rootfs, "--",
+		"/bin/sh", "-c", "echo started; read line; echo got-$line >&2; exit 4"); err != nil {
+		t.Fatalf("runt create -i: %v\n%s", err, output)
+	}
+	start := exec.Command(r.binary, "start", "-ai", "runt-start-ai")
+	start.Stdin = strings.NewReader("hello\n")
+	var stdout, stderr strings.Builder
+	start.Stdout, start.Stderr = &stdout, &stderr
+	if code := func() int {
+		if err := start.Start(); err != nil {
+			t.Fatal(err)
+		}
+		return exitCode(t, start)
+	}(); code != 4 {
+		t.Errorf("runt start -ai exited with %d; want the command's 4", code)
+	}
+	if stdout.String() != "started\n" || stderr.String() != "got-hello\n" {
+		t.Errorf("runt start -ai: stdout %q, stderr %q; want started, and got-hello on stderr", stdout.String(), stderr.String())
+	}
+}
+
+// TestDevStdout checks that the command can open /dev/stdout and
+// /dev/stderr, which lead to runt's output pipes, as nginx does for its logs.
+func TestDevStdout(t *testing.T) {
+	r := newRuntTester(t)
+	r.removeAtEnd("runt-dev-stdout")
+	output, err := r.runt("run", "--name", "runt-dev-stdout", "--rootfs", r.rootfs, "--",
+		"/bin/sh", "-c", "echo out > /dev/stdout && echo err > /dev/stderr")
+	if err != nil || !strings.Contains(output, "out") || !strings.Contains(output, "err") {
+		t.Errorf("writing to /dev/stdout and /dev/stderr: %v\n%s", err, output)
+	}
+}

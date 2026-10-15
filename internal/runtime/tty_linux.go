@@ -8,6 +8,7 @@ import (
 	"io"
 	"os"
 	"os/signal"
+	"strings"
 	"syscall"
 	"unsafe"
 )
@@ -195,6 +196,38 @@ func makeRaw(terminal *os.File) (func(), error) {
 		return nil, fmt.Errorf("set terminal to raw mode: %w", err)
 	}
 	return func() { ioctl(terminal, syscall.TCSETS, unsafe.Pointer(&saved)) }, nil
+}
+
+// ReadPassword prints prompt to standard error and reads a line from the
+// terminal on standard input without echoing it.
+func ReadPassword(prompt string) (string, error) {
+	var saved syscall.Termios
+	if err := ioctl(os.Stdin, syscall.TCGETS, unsafe.Pointer(&saved)); err != nil {
+		return "", errors.New("standard input is not a terminal to read a password from")
+	}
+	quiet := saved
+	quiet.Lflag &^= syscall.ECHO
+	quiet.Lflag |= syscall.ICANON | syscall.ECHONL
+	if err := ioctl(os.Stdin, syscall.TCSETS, unsafe.Pointer(&quiet)); err != nil {
+		return "", fmt.Errorf("turn off terminal echo: %w", err)
+	}
+	defer ioctl(os.Stdin, syscall.TCSETS, unsafe.Pointer(&saved))
+	fmt.Fprint(os.Stderr, prompt)
+	var line []byte
+	b := make([]byte, 1)
+	for {
+		n, err := os.Stdin.Read(b)
+		if n == 1 && b[0] != '\n' {
+			line = append(line, b[0])
+			continue
+		}
+		if n == 1 || errors.Is(err, io.EOF) {
+			return strings.TrimSuffix(string(line), "\r"), nil
+		}
+		if err != nil {
+			return "", err
+		}
+	}
 }
 
 // connectTerminal connects runt's own terminal to a container's

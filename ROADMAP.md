@@ -37,15 +37,15 @@ The steps between `runt` and a Docker-like container runtime. Each stage builds 
 - [x] Capture container output so `logs` can show it later.
 - [x] Proper PID 1: forward signals and reap zombie processes. Init forwards every signal to the command and waits for every orphan the kernel hands it.
 - [x] TTY support (`-it`) so `vim`, Ctrl+C, and similar work properly. Works for `run`, `run -dt` (logged), `create -t`, and `exec -it`. The pseudo-terminal is made inside the container, as in runc.
-- [ ] `attach`, to connect to a background container's terminal (and so `run -dit` and `start -ai`). The monitor would need a socket to accept connections on.
+- [x] `attach`, to connect to a background container's terminal or input and output (and so `run -dit`, `create -i`, and `start -ai`). The monitor listens on a Unix socket in the container's state directory; Ctrl+P, Ctrl+Q detaches.
 
 ## Stage 5: Images
 
 - [x] Layered filesystem with overlayfs: shared read-only image layers plus a writable layer per container. `--rootfs` is a single shared layer, too.
 - [x] OCI image and runtime-config formats. `--image` runs an image from an OCI image layout (gzip or uncompressed layers), and `--bundle` runs an OCI runtime bundle's `config.json` (the subset in the README). `runt spec` writes one.
-- [ ] Pull images from a registry (Docker Hub, etc.): manifests, layers, authentication.
-- [ ] Local image store with `images` and `rmi` commands.
-- [ ] Apply image config: default command, environment variables, working directory, user.
+- [x] Pull images from a registry (Docker Hub, etc.): manifests, multi-platform indexes, layers, and token or basic authentication, with credentials from `runt login` or Docker's `config.json`. `run` pulls a missing image itself.
+- [x] Local image store with `images` and `rmi` commands. The store is an OCI image layout under `/var/lib/runt/images`; `rmi` also removes blobs and unpacked layers nothing needs.
+- [x] Apply image config: default command, environment variables, working directory, user, with `--entrypoint`, `-e`, `-w`, and `-u` to override them. Users are looked up in the container's own `/etc/passwd` and `/etc/group`.
 
 ## Stage 6: Networking
 
@@ -85,4 +85,4 @@ The steps between `runt` and a Docker-like container runtime. Each stage builds 
 
 ## Suggested next steps
 
-With OCI layouts supported, existing tools can fill gaps now: `skopeo` to pull images, `buildah` to build them. Applying the image configuration (Stage 5) is small and makes `--image` usable without spelling out the command and environment. A local image store would go with it, so images can be referred to by name and their unpacked layers removed with `rmi`. The bridge network (Stage 6) is what gives containers internet access again.
+With images pulled from registries and run with their own configuration, most images work as they do in Docker, except those that need the network: containers only have a loopback interface. The bridge network with NAT (Stage 6) is what gives them internet access, and port publishing makes servers such as nginx reachable from the host. Bind mounts and volumes (Stage 7) are small by comparison and make containers useful for real work. For building images, `buildah` can fill the gap until Stage 8, writing OCI layouts that `--image` runs.

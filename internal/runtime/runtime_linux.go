@@ -19,8 +19,13 @@ import (
 )
 
 // ExitCode returns the exit code to pass on when err is a process exiting
-// unsuccessfully: the container's command for Init, or init for Run.
+// unsuccessfully: the container's command for Init, init for Run, or the
+// container for Attach.
 func ExitCode(err error) (int, bool) {
+	var status statusError
+	if errors.As(err, &status) {
+		return int(status), true
+	}
 	var commandExit *commandExitError
 	if errors.As(err, &commandExit) {
 		return waitStatusCode(commandExit.status), true
@@ -149,6 +154,8 @@ type initConfig struct {
 	Env  []string `json:"env"`
 	Cwd  string   `json:"cwd,omitempty"`
 	User *User    `json:"user,omitempty"`
+	// UserSpec, if set, is looked up inside the container to give User.
+	UserSpec string `json:"userSpec,omitempty"`
 	// Tty gives the command a pseudo-terminal, whose master end init sends
 	// back on file descriptor 6.
 	Tty bool `json:"tty,omitempty"`
@@ -196,6 +203,9 @@ func Init() error {
 	tty, err := setupContainer(config, consoleSocket)
 	if consoleSocket != nil {
 		consoleSocket.Close()
+	}
+	if err == nil {
+		err = prepareCommand(&config)
 	}
 	if err != nil {
 		fmt.Fprintf(status, "error %v\n", err)
@@ -281,6 +291,50 @@ func Init() error {
 			child.Process.Signal(sig)
 		}
 	}
+}
+
+// prepareCommand finishes working out how to run the command, now that init
+// sees the container's own files: who to run it as, from config.UserSpec;
+// HOME, if the environment is the container's own and doesn't set it; and
+// the working directory, which is created if it doesn't exist, as Docker
+// does.
+func prepareCommand(config *initConfig) error {
+	needHome := config.Env != nil && !hasEnv(config.Env, "HOME")
+	if config.UserSpec != "" || needHome {
+		passwd, err := readPasswd("/etc/passwd")
+		if err != nil {
+			return fmt.Errorf("read the container's /etc/passwd: %w", err)
+		}
+		var home string
+		if config.UserSpec != "" {
+			groups, err := readGroup("/etc/group")
+			if err != nil {
+				return fmt.Errorf("read the container's /etc/group: %w", err)
+			}
+			user, userHome, err := resolveUser(config.UserSpec, passwd, groups)
+			if err != nil {
+				return err
+			}
+			config.User, home = &user, userHome
+		} else {
+			uid := uint32(0)
+			if config.User != nil {
+				uid = config.User.UID
+			}
+			home = homeOf(uid, passwd)
+		}
+		if needHome {
+			config.Env = append(config.Env, "HOME="+home)
+		}
+	}
+	if config.Cwd != "" {
+		if _, err := os.Stat(config.Cwd); errors.Is(err, os.ErrNotExist) {
+			if err := os.MkdirAll(config.Cwd, 0o755); err != nil {
+				return fmt.Errorf("create working directory %s: %w", config.Cwd, err)
+			}
+		}
+	}
+	return nil
 }
 
 // reapChildren collects the exit status of every child of init that has

@@ -4,12 +4,13 @@ import (
 	"errors"
 	"flag"
 	"fmt"
+	"io"
 	"os"
+	goruntime "runtime"
 	"strconv"
 	"strings"
 	"text/tabwriter"
 	"time"
-	goruntime "runtime"
 
 	"container-from-scratch/internal/runtime"
 )
@@ -32,6 +33,8 @@ func main() {
 		exit("runt", create(args))
 	case "start":
 		exit("runt", start(args))
+	case "attach":
+		exit("runt", attach(args))
 	case "ps":
 		exit("runt", ps(args))
 	case "stop":
@@ -46,6 +49,16 @@ func main() {
 		exit("runt", logs(args))
 	case "spec":
 		exit("runt", spec(args))
+	case "pull":
+		exit("runt", pull(args))
+	case "images":
+		exit("runt", images(args))
+	case "rmi":
+		exit("runt", rmi(args))
+	case "login":
+		exit("runt", login(args))
+	case "logout":
+		exit("runt", logout(args))
 	// Internal commands: runt runs itself with these.
 	case "--init":
 		exit("runt init", runtime.Init())
@@ -83,9 +96,36 @@ func containerFlags(name string) (*flag.FlagSet, *runtime.Config) {
 	flags := flag.NewFlagSet(name, flag.ContinueOnError)
 	config := &runtime.Config{}
 	flags.StringVar(&config.Rootfs, "rootfs", "", "path to an unpacked Linux root filesystem, shared read-only under the container's own writable layer")
-	flags.StringVar(&config.Image, "image", "", "OCI image layout directory to run, optionally with :TAG")
+	flags.StringVar(&config.Image, "image", "", "image to run: a name or ID in runt's image store (pulled if missing), or an OCI image layout directory with optional :TAG")
 	flags.StringVar(&config.Bundle, "bundle", "", "OCI runtime bundle directory: config.json and the root filesystem it names")
+	flags.BoolVar(&config.Interactive, "i", false, "connect runt's standard input to the command; in the background, keep its input open for runt attach")
 	flags.BoolVar(&config.Tty, "t", false, "run the command on a pseudo-terminal of its own")
+	flags.Func("entrypoint", "replace the image's entrypoint (\"\" for none), which also drops its default command", func(s string) error {
+		config.Entrypoint = &s
+		return nil
+	})
+	setEnv := func(s string) error {
+		// -e NAME takes NAME's value from runt's own environment, as in
+		// Docker, and is left out if it has none.
+		if !strings.Contains(s, "=") {
+			value, ok := os.LookupEnv(s)
+			if !ok {
+				return nil
+			}
+			s += "=" + value
+		}
+		if strings.HasPrefix(s, "=") {
+			return fmt.Errorf("invalid environment variable %q", s)
+		}
+		config.SetEnv = append(config.SetEnv, s)
+		return nil
+	}
+	flags.Func("e", "set an environment variable, NAME=VALUE (repeatable)", setEnv)
+	flags.Func("env", "same as -e", setEnv)
+	flags.StringVar(&config.Cwd, "w", "", "working directory inside the container")
+	flags.StringVar(&config.Cwd, "workdir", "", "same as -w")
+	flags.StringVar(&config.UserSpec, "u", "", "user to run as: USER[:GROUP], by name or ID")
+	flags.StringVar(&config.UserSpec, "user", "", "same as -u")
 	flags.StringVar(&config.Name, "name", "", "a name to refer to the container by, besides its ID")
 	flags.StringVar(&config.UsernsUser, "userns-user", "", "user whose /etc/subuid and /etc/subgid ranges to map the container onto (default: the invoking user)")
 	flags.StringVar(&config.AppArmorProfile, "apparmor-profile", "", "loaded AppArmor profile to confine the command with (default: none)")
@@ -142,14 +182,23 @@ func parseContainerFlags(flags *flag.FlagSet, config *runtime.Config, args []str
 	if sources != 1 {
 		return errors.New("give one of --rootfs, --image, or --bundle")
 	}
+	if config.Entrypoint != nil && config.Image == "" {
+		return errors.New("--entrypoint only works with --image")
+	}
 	if config.Bundle != "" {
 		if len(config.Command) > 0 {
 			return errors.New("a bundle's command comes from its config.json; don't give one after the options")
 		}
 		return runtime.LoadBundle(config)
 	}
-	if len(config.Command) == 0 {
+	// An image has a default command; a root filesystem doesn't.
+	if len(config.Command) == 0 && config.Image == "" {
 		return errors.New("a command is required after the options")
+	}
+	if config.Image != "" {
+		// Pull the image now if need be, as docker run does, so the
+		// progress shows even for a container in the background.
+		return runtime.EnsureImage(config.Image, os.Stderr)
 	}
 	return nil
 }
@@ -200,13 +249,9 @@ func expandCombinedFlags(flags *flag.FlagSet, args []string) []string {
 
 func run(args []string) error {
 	flags, config := containerFlags("run")
-	flags.BoolVar(&config.Detach, "d", false, "run the container in the background and print its ID; see its output with runt logs")
-	flags.BoolVar(&config.Interactive, "i", false, "connect runt's standard input to the command")
+	flags.BoolVar(&config.Detach, "d", false, "run the container in the background and print its ID; see its output with runt logs, or connect to it with runt attach")
 	if err := parseContainerFlags(flags, config, args); err != nil {
 		return err
-	}
-	if config.Detach && config.Interactive {
-		return errors.New("-i needs runt's input, so it can't be used with -d (runt has no attach command yet); use -dt to keep a shell running")
 	}
 	if !config.Detach {
 		return runtime.Run(*config)
@@ -234,10 +279,31 @@ func create(args []string) error {
 
 func start(args []string) error {
 	flags := flag.NewFlagSet("start", flag.ContinueOnError)
+	attach := flags.Bool("a", false, "attach to the container's output, and wait for it to exit")
+	interactive := flags.Bool("i", false, "attach runt's input to the container too (implies -a)")
+	if err := flags.Parse(expandCombinedFlags(flags, args)); err != nil {
+		return err
+	}
+	if !*attach && !*interactive {
+		return eachContainer(flags.Args(), runtime.Start)
+	}
+	if flags.NArg() != 1 {
+		return errors.New("start -a and -i take a single container")
+	}
+	return runtime.Attach(flags.Arg(0), runtime.AttachOptions{Stdin: *interactive, SigProxy: true, Start: true})
+}
+
+func attach(args []string) error {
+	flags := flag.NewFlagSet("attach", flag.ContinueOnError)
+	noStdin := flags.Bool("no-stdin", false, "don't send runt's input to the container")
+	sigProxy := flags.Bool("sig-proxy", true, "pass signals runt gets on to the container (without a terminal)")
 	if err := flags.Parse(args); err != nil {
 		return err
 	}
-	return eachContainer(flags.Args(), runtime.Start)
+	if flags.NArg() != 1 {
+		return errors.New("usage: runt attach [--no-stdin] [--sig-proxy=false] CONTAINER")
+	}
+	return runtime.Attach(flags.Arg(0), runtime.AttachOptions{Stdin: !*noStdin, SigProxy: *sigProxy})
 }
 
 func stop(args []string) error {
@@ -330,6 +396,161 @@ func spec(args []string) error {
 	return runtime.WriteSpec(*bundle, *rootfs)
 }
 
+func pull(args []string) error {
+	flags := flag.NewFlagSet("pull", flag.ContinueOnError)
+	if err := flags.Parse(args); err != nil {
+		return err
+	}
+	if flags.NArg() != 1 {
+		return errors.New("usage: runt pull IMAGE[:TAG|@DIGEST]")
+	}
+	return runtime.Pull(flags.Arg(0), os.Stdout)
+}
+
+func images(args []string) error {
+	flags := flag.NewFlagSet("images", flag.ContinueOnError)
+	quiet := flags.Bool("q", false, "show only image IDs")
+	digests := flags.Bool("digests", false, "show the digest of images pulled by digest")
+	if err := flags.Parse(args); err != nil {
+		return err
+	}
+	if flags.NArg() != 0 {
+		return errors.New("usage: runt images [-q] [--digests]")
+	}
+	list, err := runtime.ListImages()
+	if err != nil {
+		return err
+	}
+	if *quiet {
+		seen := map[string]bool{}
+		for _, image := range list {
+			if id := shortID(image.ID); !seen[id] {
+				seen[id] = true
+				fmt.Println(id)
+			}
+		}
+		return nil
+	}
+	table := tabwriter.NewWriter(os.Stdout, 0, 0, 3, ' ', 0)
+	header := "REPOSITORY\tTAG\tIMAGE ID\tCREATED\tSIZE"
+	if *digests {
+		header = "REPOSITORY\tTAG\tDIGEST\tIMAGE ID\tCREATED\tSIZE"
+	}
+	fmt.Fprintln(table, header)
+	now := time.Now()
+	for _, image := range list {
+		created := "N/A"
+		if !image.Created.IsZero() {
+			created = humanDuration(now.Sub(image.Created)) + " ago"
+		}
+		digest := ""
+		if *digests {
+			digest = image.Digest + "\t"
+			if image.Digest == "" {
+				digest = "<none>\t"
+			}
+		}
+		fmt.Fprintf(table, "%s\t%s\t%s%s\t%s\t%s\n", image.Repository, image.Tag, digest, shortID(image.ID), created, runtime.HumanSize(image.Size))
+	}
+	return table.Flush()
+}
+
+// shortID is the 12 hex digits Docker shows of an image ID.
+func shortID(id string) string {
+	id = strings.TrimPrefix(id, "sha256:")
+	if len(id) > 12 {
+		id = id[:12]
+	}
+	return id
+}
+
+func rmi(args []string) error {
+	flags := flag.NewFlagSet("rmi", flag.ContinueOnError)
+	force := flags.Bool("f", false, "remove an image that has several names, or that containers were made from")
+	if err := flags.Parse(args); err != nil {
+		return err
+	}
+	if flags.NArg() == 0 {
+		return errors.New("usage: runt rmi [-f] IMAGE ...")
+	}
+	failed := 0
+	for _, ref := range flags.Args() {
+		if err := runtime.RemoveImage(ref, *force, os.Stdout); err != nil {
+			fmt.Fprintln(os.Stderr, "runt:", err)
+			failed++
+		}
+	}
+	if failed > 0 {
+		os.Exit(1)
+	}
+	return nil
+}
+
+func login(args []string) error {
+	flags := flag.NewFlagSet("login", flag.ContinueOnError)
+	user := flags.String("u", "", "user name")
+	password := flags.String("p", "", "password (visible to other users in ps; prefer --password-stdin)")
+	passwordStdin := flags.Bool("password-stdin", false, "read the password from standard input")
+	if err := flags.Parse(args); err != nil {
+		return err
+	}
+	if flags.NArg() > 1 {
+		return errors.New("usage: runt login [-u USER] [-p PASSWORD | --password-stdin] [REGISTRY]")
+	}
+	if *passwordStdin {
+		if *password != "" {
+			return errors.New("give -p or --password-stdin, not both")
+		}
+		if *user == "" {
+			return errors.New("--password-stdin needs -u")
+		}
+		data, err := io.ReadAll(os.Stdin)
+		if err != nil {
+			return err
+		}
+		*password = strings.TrimRight(string(data), "\r\n")
+	}
+	if *user == "" {
+		fmt.Fprint(os.Stderr, "Username: ")
+		var line string
+		fmt.Scanln(&line)
+		*user = strings.TrimSpace(line)
+	}
+	if *password == "" {
+		var err error
+		if *password, err = runtime.ReadPassword("Password: "); err != nil {
+			return err
+		}
+	}
+	path, err := runtime.Login(flags.Arg(0), *user, *password)
+	if err != nil {
+		return err
+	}
+	fmt.Fprintf(os.Stderr, "WARNING! Your password is stored unencrypted in %s.\n", path)
+	fmt.Println("Login Succeeded")
+	return nil
+}
+
+func logout(args []string) error {
+	flags := flag.NewFlagSet("logout", flag.ContinueOnError)
+	if err := flags.Parse(args); err != nil {
+		return err
+	}
+	if flags.NArg() > 1 {
+		return errors.New("usage: runt logout [REGISTRY]")
+	}
+	found, err := runtime.Logout(flags.Arg(0))
+	if err != nil {
+		return err
+	}
+	if !found {
+		fmt.Println("Not logged in")
+		return nil
+	}
+	fmt.Println("Removed login credentials")
+	return nil
+}
+
 func logs(args []string) error {
 	flags := flag.NewFlagSet("logs", flag.ContinueOnError)
 	var options runtime.LogOptions
@@ -417,9 +638,10 @@ func usage() {
 Containers:
   run [-d] [-i] [-t] [OPTIONS] [-- COMMAND [ARG ...]]
                                               create a container and run COMMAND in it
-  create [-t] [OPTIONS] [-- COMMAND [ARG ...]]
+  create [-i] [-t] [OPTIONS] [-- COMMAND [ARG ...]]
                                               set a container up without starting COMMAND
-  start CONTAINER ...                         run the command of created containers
+  start [-a] [-i] CONTAINER ...               run the command of created containers
+  attach [--no-stdin] CONTAINER               connect to a running container's input and output
   ps [-a]                                     list running (with -a, all) containers
   stop [-t SECONDS] CONTAINER ...             SIGTERM, then SIGKILL after a timeout (default 10)
   kill [-s SIGNAL] CONTAINER ...              send a signal (default KILL)
@@ -429,15 +651,29 @@ Containers:
   spec [--bundle DIR] [--rootfs PATH]         write a starting OCI config.json
   hello                                       print a greeting
 
+Images:
+  pull IMAGE                                  download an image from a registry
+  images [-q] [--digests]                     list the images in runt's image store
+  rmi [-f] IMAGE ...                          remove images from the store
+  login [-u USER] [--password-stdin] [REGISTRY]
+                                              store credentials for a registry (default Docker Hub)
+  logout [REGISTRY]                           remove them
+
 OPTIONS for run and create: one of
-  --rootfs PATH  --image LAYOUT[:TAG]  --bundle DIR (whose config.json gives the command)
+  --rootfs PATH  --image IMAGE  --bundle DIR (whose config.json gives the command)
 and any of
   --name NAME  --userns-user NAME  --apparmor-profile NAME
+  -e NAME=VALUE  -w DIR  -u USER[:GROUP]  --entrypoint COMMAND
   --memory SIZE  --cpus N  --pids-limit N  --device-{read,write}-{bps,iops} PATH:RATE
   --debug-init
 
+IMAGE is a name such as alpine:3.20 or ghcr.io/owner/name:tag, an image ID,
+or an OCI image layout directory with an optional :TAG. With --image, the
+command defaults to the image's own.
+
 -i connects runt's input to the command, and -t gives the command a
-pseudo-terminal; use both, as -it, for an interactive shell.
+pseudo-terminal; use both, as -it, for an interactive shell. In the
+background (-dit), runt attach connects to it later; Ctrl+P, Ctrl+Q detaches.
 
 CONTAINER is a name, an ID, or the start of an ID. Options go before other
 arguments. Run "runt COMMAND -h" for details.

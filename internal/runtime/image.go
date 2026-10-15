@@ -11,6 +11,7 @@ import (
 	"regexp"
 	goruntime "runtime"
 	"strings"
+	"time"
 )
 
 // OCI image layout (github.com/opencontainers/image-spec, image-layout.md):
@@ -74,10 +75,19 @@ type ociManifest struct {
 
 // ociImageConfig is the part of an image's configuration runt reads.
 // DiffIDs are the digests of the layers once uncompressed, bottom first.
+// Config holds the defaults for running the image (see applyImageConfig).
 type ociImageConfig struct {
-	Architecture string `json:"architecture"`
-	OS           string `json:"os"`
-	RootFS       struct {
+	Created      time.Time `json:"created,omitzero"`
+	Architecture string    `json:"architecture"`
+	OS           string    `json:"os"`
+	Config       struct {
+		User       string   `json:"User,omitempty"`
+		Env        []string `json:"Env,omitempty"`
+		Entrypoint []string `json:"Entrypoint,omitempty"`
+		Cmd        []string `json:"Cmd,omitempty"`
+		WorkingDir string   `json:"WorkingDir,omitempty"`
+	} `json:"config"`
+	RootFS struct {
 		Type    string   `json:"type"`
 		DiffIDs []string `json:"diff_ids"`
 	} `json:"rootfs"`
@@ -101,11 +111,37 @@ func splitImageRef(ref string) (layout, tag string) {
 	return ref, ""
 }
 
+// isLayoutRef reports whether ref names an OCI image layout directory,
+// rather than an image in runt's image store: it is a path, starting with
+// / or ., or the directory it names has an oci-layout file.
+func isLayoutRef(ref string) bool {
+	if strings.HasPrefix(ref, "/") || strings.HasPrefix(ref, ".") {
+		return true
+	}
+	layout, _ := splitImageRef(ref)
+	_, err := os.Stat(filepath.Join(layout, "oci-layout"))
+	return err == nil
+}
+
 // openImage finds an image in an OCI image layout, by tag if ref has one,
 // and reads its manifest and configuration. If the image comes in several
 // architectures, it picks the one runt is running on.
 func openImage(ref string) (*ociImage, error) {
 	layout, tag := splitImageRef(ref)
+	index, err := readLayoutIndex(layout)
+	if err != nil {
+		return nil, err
+	}
+	desc, err := pickTagged(index.Manifests, tag)
+	if err != nil {
+		return nil, fmt.Errorf("image layout %s: %w", layout, err)
+	}
+	return loadImage(layout, desc)
+}
+
+// readLayoutIndex checks that layout is an OCI image layout and reads its
+// index.json.
+func readLayoutIndex(layout string) (*ociIndex, error) {
 	var marker struct {
 		Version string `json:"imageLayoutVersion"`
 	}
@@ -116,11 +152,14 @@ func openImage(ref string) (*ociImage, error) {
 	if err := readJSONFile(filepath.Join(layout, "index.json"), &index); err != nil {
 		return nil, err
 	}
-	desc, err := pickTagged(index.Manifests, tag)
-	if err != nil {
-		return nil, fmt.Errorf("image layout %s: %w", layout, err)
-	}
+	return &index, nil
+}
+
+// loadImage reads the manifest desc points to in layout, following an index
+// to this platform's manifest, and the image configuration it names.
+func loadImage(layout string, desc ociDescriptor) (*ociImage, error) {
 	image := &ociImage{layout: layout}
+	var err error
 	if image.manifest, err = image.resolveManifest(desc, 0); err != nil {
 		return nil, err
 	}

@@ -10,19 +10,32 @@ type Config struct {
 	DirectRootfs bool
 	// ReadonlyRootfs mounts the container's root filesystem read-only.
 	ReadonlyRootfs bool
-	// Image is an OCI image layout directory to run instead of Rootfs,
-	// optionally followed by :TAG.
+	// Image is the image to run instead of Rootfs: a name or ID in runt's
+	// image store, or an OCI image layout directory, optionally followed by
+	// :TAG. Its configuration fills in what the options below leave out
+	// (see applyImageConfig).
 	Image string
+	// Entrypoint, if set, replaces the image's entrypoint; empty means
+	// none.
+	Entrypoint *string
 	// Bundle is the OCI runtime bundle the configuration was read from, if
 	// any (see LoadBundle).
 	Bundle  string
 	Command []string
 	// Env replaces the command's environment. Nil means it inherits runt's.
 	Env []string
-	// Cwd is the command's working directory inside the container.
+	// SetEnv are NAME=VALUE settings (-e) to make on top of the
+	// environment.
+	SetEnv []string
+	// Cwd is the command's working directory inside the container. It is
+	// created if it doesn't exist.
 	Cwd string
 	// User is who the command runs as. Nil means container root.
 	User *User
+	// UserSpec, if set, is who the command runs as instead of User:
+	// USER[:GROUP], by name or ID, looked up in the container's /etc/passwd
+	// and /etc/group (see resolveUser).
+	UserSpec string
 	// Hostname is the container's hostname; empty means "runt".
 	Hostname string
 	// Name is an optional name to refer to the container by, besides its ID.
@@ -45,7 +58,8 @@ type Config struct {
 	// Detach runs the container in the background, with its output going to
 	// its log.
 	Detach bool
-	// Interactive connects runt's standard input to the command.
+	// Interactive connects runt's standard input to the command. For a
+	// container in the background, its input stays open for runt attach.
 	Interactive bool
 	// Tty gives the command a pseudo-terminal of its own as its standard
 	// input, output, and error.
@@ -65,4 +79,17 @@ type ExecOptions struct {
 	Interactive bool
 	// Tty gives the command a pseudo-terminal of its own.
 	Tty bool
+}
+
+// AttachOptions control how Attach connects to a container.
+type AttachOptions struct {
+	// Stdin sends runt's input to the command, if the container's input is
+	// open (it was made with -i).
+	Stdin bool
+	// SigProxy passes signals runt gets on to the container, when it
+	// doesn't have a terminal.
+	SigProxy bool
+	// Start starts a created container once attached, as runt start -a
+	// does, so none of its output is missed.
+	Start bool
 }

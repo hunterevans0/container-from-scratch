@@ -4,6 +4,7 @@ package runtime
 
 import (
 	"errors"
+	"io"
 	"syscall"
 	"time"
 )
@@ -24,3 +25,17 @@ func Monitor() error                             { return errUnsupported }
 func ExecInit() error                            { return errUnsupported }
 func ExitCode(error) (int, bool)                 { return 0, false }
 func FailureCode(error) int                      { return 1 }
+func Attach(string, AttachOptions) error         { return errUnsupported }
+func Pull(string, io.Writer) error               { return errUnsupported }
+func EnsureImage(string, io.Writer) error        { return errUnsupported }
+func ListImages() ([]ImageSummary, error)        { return nil, errUnsupported }
+func RemoveImage(string, bool, io.Writer) error  { return errUnsupported }
+func ReadPassword(string) (string, error)        { return "", errUnsupported }
+func HumanSize(int64) string                     { return "" }
+
+// ImageSummary describes an image in the store.
+type ImageSummary struct {
+	Repository, Tag, Digest, ID string
+	Created                     time.Time
+	Size                        int64
+}

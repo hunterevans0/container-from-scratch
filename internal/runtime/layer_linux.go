@@ -29,7 +29,7 @@ const (
 	whiteoutOpaque = ".wh..wh..opq"
 )
 
-// unpackImage makes sure every layer of the OCI image ref is unpacked, with
+// unpackImage makes sure every layer of an image is unpacked, with
 // its file ownership shifted into the container's ID ranges, and returns the
 // layer directories top first, the order overlayfs takes them in.
 //
@@ -39,11 +39,7 @@ const (
 // into place when complete, so a half-unpacked layer is never used, and two
 // runt processes unpacking the same layer at once don't get in each other's
 // way.
-func unpackImage(ref string, uids, gids IDRange) ([]string, error) {
-	image, err := openImage(ref)
-	if err != nil {
-		return nil, err
-	}
+func unpackImage(image *ociImage, uids, gids IDRange) ([]string, error) {
 	store := filepath.Join(layerRoot, fmt.Sprintf("%d-%d", uids.Base, gids.Base))
 	if err := os.MkdirAll(store, 0o700); err != nil {
 		return nil, fmt.Errorf("create layer store: %w", err)
