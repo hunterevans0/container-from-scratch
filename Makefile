@@ -3,7 +3,7 @@ ROOTFS ?= /var/lib/runt/rootfs
 # Empty means the user running sudo.
 USERNS_USER ?=
 
-.PHONY: build build-debug test integration vet hello rootfs apparmor shell debug debug-init debug-attach-init debug-integration clean
+.PHONY: build build-debug test integration features vet hello rootfs apparmor shell debug debug-init debug-attach-init debug-integration clean
 
 # CGO_ENABLED=0: dropping capabilities uses syscall.AllThreadsSyscall, which
 # does not work in a cgo binary.
@@ -18,6 +18,15 @@ test:
 integration: build
 	go test -c -tags integration -o integration.test ./integration
 	sudo RUNT_BINARY=$(CURDIR)/runt RUNT_ROOTFS=$(ROOTFS) ./integration.test -test.v
+
+# Only the feature checks in integration/features_test.go, each printing a
+# line saying what it shows. Without -test.v, checks that pass print nothing
+# else. FEATURE picks one: Layers, OCIFormats, Registry, ImageStore, or
+# ImageConfig, optionally with a check, as in FEATURE=Registry/BasicAuth.
+FEATURE ?=
+features: build
+	go test -c -tags integration -o integration.test ./integration
+	sudo RUNT_BINARY=$(CURDIR)/runt RUNT_ROOTFS=$(ROOTFS) ./integration.test -test.run '^TestFeature$(FEATURE)'
 
 vet:
 	go vet ./...

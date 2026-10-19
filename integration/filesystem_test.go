@@ -136,20 +136,44 @@ func (b *layoutBuilder) addBaseLayer(r *runtTester) (map[string]any, string) {
 // command, environment, and so on.
 func (b *layoutBuilder) writeImage(tag string, defaults map[string]any, layers []map[string]any, diffIDs []string) {
 	b.t.Helper()
-	config := b.jsonBlob("application/vnd.oci.image.config.v1+json", map[string]any{
-		"architecture": runtime.GOARCH,
+	manifest, _ := b.image(runtime.GOARCH, defaults, layers, diffIDs)
+	b.writeIndex(tagged(manifest, tag))
+}
+
+// image writes an image's configuration and manifest for architecture,
+// without listing it in index.json, and returns their descriptors.
+func (b *layoutBuilder) image(architecture string, defaults map[string]any, layers []map[string]any, diffIDs []string) (manifest, config map[string]any) {
+	b.t.Helper()
+	config = b.jsonBlob("application/vnd.oci.image.config.v1+json", map[string]any{
+		"architecture": architecture,
 		"os":           "linux",
 		"config":       defaults,
 		"rootfs":       map[string]any{"type": "layers", "diff_ids": diffIDs},
 	})
-	manifest := b.jsonBlob("application/vnd.oci.image.manifest.v1+json", map[string]any{
+	manifest = b.jsonBlob("application/vnd.oci.image.manifest.v1+json", map[string]any{
 		"schemaVersion": 2,
 		"mediaType":     "application/vnd.oci.image.manifest.v1+json",
 		"config":        config,
 		"layers":        layers,
 	})
-	manifest["annotations"] = map[string]string{"org.opencontainers.image.ref.name": tag}
-	b.writeJSON("index.json", map[string]any{"schemaVersion": 2, "manifests": []any{manifest}})
+	return manifest, config
+}
+
+// writeIndex writes index.json, listing entries.
+func (b *layoutBuilder) writeIndex(entries ...map[string]any) {
+	b.t.Helper()
+	b.writeJSON("index.json", map[string]any{"schemaVersion": 2, "manifests": entries})
+}
+
+// tagged returns a copy of desc with the annotation that tags an index.json
+// entry.
+func tagged(desc map[string]any, tag string) map[string]any {
+	entry := map[string]any{}
+	for key, value := range desc {
+		entry[key] = value
+	}
+	entry["annotations"] = map[string]string{"org.opencontainers.image.ref.name": tag}
+	return entry
 }
 
 // TestMain removes the base layer, and what runt unpacked of it, once every
