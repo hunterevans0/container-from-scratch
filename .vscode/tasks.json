@@ -19,7 +19,11 @@
             "problemMatcher": {
                 "owner": "runt",
                 "pattern": {
-                    "regexp": "^__never__$"
+                    "regexp": "^__never__$",
+                    // Never matches; VS Code ignores a pattern without these.
+                    "file": 1,
+                    "location": 2,
+                    "message": 3
                 },
                 "background": {
                     "activeBegins": true,
@@ -43,7 +47,11 @@
             "problemMatcher": {
                 "owner": "runt",
                 "pattern": {
-                    "regexp": "^__never__$"
+                    "regexp": "^__never__$",
+                    // Never matches; VS Code ignores a pattern without these.
+                    "file": 1,
+                    "location": 2,
+                    "message": 3
                 },
                 "background": {
                     "activeBegins": true,
@@ -67,7 +75,11 @@
             "problemMatcher": {
                 "owner": "runt",
                 "pattern": {
-                    "regexp": "^__never__$"
+                    "regexp": "^__never__$",
+                    // Never matches; VS Code ignores a pattern without these.
+                    "file": 1,
+                    "location": 2,
+                    "message": 3
                 },
                 "background": {
                     "activeBegins": true,
@@ -91,7 +103,11 @@
             "problemMatcher": {
                 "owner": "runt",
                 "pattern": {
-                    "regexp": "^__never__$"
+                    "regexp": "^__never__$",
+                    // Never matches; VS Code ignores a pattern without these.
+                    "file": 1,
+                    "location": 2,
+                    "message": 3
                 },
                 "background": {
                     "activeBegins": true,

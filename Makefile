@@ -57,6 +57,11 @@ RUN_ARGS = --rootfs $(ROOTFS) $(if $(USERNS_USER),--userns-user $(USERNS_USER))
 # --only-same-user=false: connections forwarded from Windows don't come from
 # the user running Delve (root), so Delve would refuse them.
 DLV_SERVER = --headless --api-version=2 --accept-multiclient --only-same-user=false
+# Kills a Delve server that an earlier session left on port $(1), and the
+# paused program matching $(2) that it was holding. Otherwise the new Delve
+# can't listen there, and VS Code connects to the stale one instead. The
+# brackets keep a pattern from matching pkill's own command line.
+stop-debug = sudo pkill -KILL -f '[-]-listen=127.0.0.1:$(1)'; $(if $(2),sudo pkill -KILL -f '$(2)';) true
 
 # -N -l turns off optimizations and inlining so every variable and line can be
 # inspected.
@@ -66,6 +71,7 @@ build-debug:
 # Debug the runt parent process (Run). Breakpoints in Init won't hit here,
 # because init is a separate process; use debug-init for that.
 debug: build-debug
+	$(call stop-debug,$(DEBUG_PORT),[r]unt-debug run)
 	sudo $(DLV) exec $(DLV_SERVER) --listen=127.0.0.1:$(DEBUG_PORT) ./runt-debug -- run -it $(RUN_ARGS) -- /bin/bash
 
 # Start a container whose init process waits for a debugger, then attach with
@@ -74,6 +80,7 @@ debug-init: build-debug
 	sudo ./runt-debug run -it --debug-init $(RUN_ARGS) -- /bin/bash
 
 debug-attach-init:
+	@$(call stop-debug,$(INIT_DEBUG_PORT))
 	@echo "waiting for a container started with make debug-init..."; \
 	until pid=$$(pgrep -n -f '^/proc/self/exe --init'); do sleep 0.5; done; \
 	echo "attaching to container init, host PID $$pid"; \
@@ -85,4 +92,5 @@ debug-attach-init:
 INTEGRATION_DEBUG_PORT ?= 2347
 debug-integration: build
 	go test -c -tags integration -gcflags='all=-N -l' -o integration-debug.test ./integration
+	$(call stop-debug,$(INTEGRATION_DEBUG_PORT),[i]ntegration-debug[.]test)
 	sudo RUNT_BINARY=$(CURDIR)/runt RUNT_ROOTFS=$(ROOTFS) $(DLV) exec $(DLV_SERVER) --listen=127.0.0.1:$(INTEGRATION_DEBUG_PORT) ./integration-debug.test -- -test.v
