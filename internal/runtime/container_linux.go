@@ -232,6 +232,13 @@ func supervise(config Config, foreground, autoStart bool, ready func(id string, 
 			return err
 		}
 	}
+	switch config.Network {
+	case "":
+		config.Network = NetworkBridge
+	case NetworkBridge, NetworkNone:
+	default:
+		return fmt.Errorf("unknown network %q: use %s or %s", config.Network, NetworkBridge, NetworkNone)
+	}
 
 	id, err := newID()
 	if err != nil {
@@ -267,6 +274,7 @@ func supervise(config Config, foreground, autoStart bool, ready func(id string, 
 		Interactive:     config.Interactive,
 		AppArmorProfile: config.AppArmorProfile,
 		Resources:       config.Resources,
+		Network:         config.Network,
 		Created:         time.Now(),
 	}
 	if image != nil {
@@ -315,6 +323,23 @@ func supervise(config Config, foreground, autoStart bool, ready func(id string, 
 			return fmt.Errorf("open cgroup %q: %w", cgroup, err)
 		}
 		defer syscall.Close(cgroupFD)
+	}
+
+	// The container's address is held until it exits. Its veth pair is
+	// made once init, and so its network namespace, exists.
+	var network *containerNetwork
+	leaveNetwork := func() {}
+	if config.Network == NetworkBridge {
+		if network, err = joinBridgeNetwork(id); err != nil {
+			return err
+		}
+		leaveNetwork = sync.OnceFunc(func() {
+			if err := network.leave(); err != nil {
+				warn(err)
+			}
+		})
+		defer leaveNetwork()
+		state.IPAddress = network.reservation.ip.String()
 	}
 
 	// The start FIFO. Opening a FIFO for reading and writing never blocks,
@@ -483,6 +508,18 @@ func supervise(config Config, foreground, autoStart bool, ready func(id string, 
 		copies.Wait()
 		return err
 	}
+	// Init waits for its configuration, so eth0 is in place before it
+	// looks for it.
+	var networkConfig *initNetwork
+	if network != nil {
+		if err := network.connect(command.Process.Pid); err != nil {
+			command.Process.Kill()
+			command.Wait()
+			copies.Wait()
+			return err
+		}
+		networkConfig = network.initConfig()
+	}
 	go func() {
 		for sig := range signals {
 			command.Process.Signal(sig)
@@ -499,6 +536,7 @@ func supervise(config Config, foreground, autoStart bool, ready func(id string, 
 		User:            config.User,
 		UserSpec:        config.UserSpec,
 		Tty:             config.Tty,
+		Network:         networkConfig,
 	})
 	configW.Close()
 	if err != nil {
@@ -560,9 +598,13 @@ func supervise(config Config, foreground, autoStart bool, ready func(id string, 
 	finish := func() error {
 		waitErr := command.Wait()
 		copies.Wait()
+		// Before the container is recorded as stopped, so its address is
+		// free again by the time runt stop returns.
+		leaveNetwork()
 		exitCode := exitStatus(command.ProcessState)
 		state.Status = StatusStopped
 		state.Pid = 0
+		state.IPAddress = ""
 		state.ExitCode = &exitCode
 		state.Finished = time.Now()
 		if err := saveState(StateRoot, state); err != nil {

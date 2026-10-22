@@ -127,6 +127,13 @@ func containerFlags(name string) (*flag.FlagSet, *runtime.Config) {
 	flags.StringVar(&config.UserSpec, "u", "", "user to run as: USER[:GROUP], by name or ID")
 	flags.StringVar(&config.UserSpec, "user", "", "same as -u")
 	flags.StringVar(&config.Name, "name", "", "a name to refer to the container by, besides its ID")
+	flags.Func("network", "network to connect the container to: bridge (the default: an address of its own, and NAT to the outside), or none (loopback only)", func(s string) error {
+		if s != runtime.NetworkBridge && s != runtime.NetworkNone {
+			return fmt.Errorf("unknown network %q: use %s or %s", s, runtime.NetworkBridge, runtime.NetworkNone)
+		}
+		config.Network = s
+		return nil
+	})
 	flags.StringVar(&config.UsernsUser, "userns-user", "", "user whose /etc/subuid and /etc/subgid ranges to map the container onto (default: the invoking user)")
 	flags.StringVar(&config.AppArmorProfile, "apparmor-profile", "", "loaded AppArmor profile to confine the command with (default: none)")
 	flags.BoolVar(&config.DebugInit, "debug-init", false, "pause the container's init process until a debugger attaches, and print its host PID")
@@ -662,7 +669,7 @@ Images:
 OPTIONS for run and create: one of
   --rootfs PATH  --image IMAGE  --bundle DIR (whose config.json gives the command)
 and any of
-  --name NAME  --userns-user NAME  --apparmor-profile NAME
+  --name NAME  --network bridge|none  --userns-user NAME  --apparmor-profile NAME
   -e NAME=VALUE  -w DIR  -u USER[:GROUP]  --entrypoint COMMAND
   --memory SIZE  --cpus N  --pids-limit N  --device-{read,write}-{bps,iops} PATH:RATE
   --debug-init

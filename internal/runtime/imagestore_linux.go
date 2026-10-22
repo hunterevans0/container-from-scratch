@@ -11,8 +11,6 @@ import (
 	"path/filepath"
 	"regexp"
 	"strings"
-	"sync"
-	"syscall"
 	"time"
 )
 
@@ -64,27 +62,11 @@ func (s *imageStore) lock(exclusive bool) (func(), error) {
 	if err := os.MkdirAll(filepath.Dir(s.lockPath), 0o711); err != nil {
 		return nil, fmt.Errorf("create %s: %w", filepath.Dir(s.lockPath), err)
 	}
-	file, err := os.OpenFile(s.lockPath, os.O_RDWR|os.O_CREATE, 0o600)
+	unlock, err := lockFile(s.lockPath, exclusive)
 	if err != nil {
-		return nil, fmt.Errorf("open image store lock: %w", err)
-	}
-	how := syscall.LOCK_SH
-	if exclusive {
-		how = syscall.LOCK_EX
-	}
-	for {
-		err = syscall.Flock(int(file.Fd()), how)
-		if !errors.Is(err, syscall.EINTR) {
-			break
-		}
-	}
-	if err != nil {
-		file.Close()
 		return nil, fmt.Errorf("lock image store: %w", err)
 	}
-	var once sync.Once
-	// Closing the file releases the lock.
-	return func() { once.Do(func() { file.Close() }) }, nil
+	return unlock, nil
 }
 
 func (s *imageStore) blobPath(digest string) (string, error) {

@@ -159,6 +159,9 @@ type initConfig struct {
 	// Tty gives the command a pseudo-terminal, whose master end init sends
 	// back on file descriptor 6.
 	Tty bool `json:"tty,omitempty"`
+	// Network, if set, configures eth0, which the supervisor has put in
+	// the container's network namespace.
+	Network *initNetwork `json:"network,omitempty"`
 }
 
 // Init is the container's init process: runt run (or create) clones it into
@@ -381,9 +384,15 @@ func setupContainer(config initConfig, consoleSocket *os.File) (*os.File, error)
 		return nil, fmt.Errorf("set hostname: %w", err)
 	}
 	// The new network namespace starts with only a loopback interface, and
-	// it is down.
+	// it is down. On the bridge network, the supervisor has also moved in
+	// eth0, its end of the container's veth pair.
 	if err := bringUpLoopback(); err != nil {
 		return nil, err
+	}
+	if config.Network != nil {
+		if err := configureNetwork(config.Network); err != nil {
+			return nil, err
+		}
 	}
 	// Stop mount events from propagating back to the host. Without this, a
 	// shared root mount (the systemd default) would leak our mounts out.

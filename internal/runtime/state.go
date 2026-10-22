@@ -52,6 +52,10 @@ type State struct {
 	ExitCode *int `json:"exitCode,omitempty"`
 	// Cgroup is the container's cgroup directory, if it has one.
 	Cgroup string `json:"cgroup,omitempty"`
+	// Network is the network the container is on, and IPAddress its
+	// address there while it is created or running.
+	Network   string `json:"network,omitempty"`
+	IPAddress string `json:"ipAddress,omitempty"`
 	// AppArmorProfile confines the command and anything run with exec.
 	AppArmorProfile string    `json:"apparmorProfile,omitempty"`
 	Resources       Resources `json:"resources"`

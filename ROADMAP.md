@@ -49,9 +49,9 @@ The steps between `runt` and a Docker-like container runtime. Each stage builds 
 
 ## Stage 6: Networking
 
-- [ ] Bridge network with a veth pair per container.
-- [ ] IP address management (assign each container an IP).
-- [ ] Outbound internet through NAT (iptables or nftables).
+- [x] Bridge network with a veth pair per container. The bridge is `runt0`, and `--network none` leaves a container only its loopback interface.
+- [x] IP address management (assign each container an IP): the lowest free address in `10.88.0.0/16`, held with a locked file per address under `/run/runt-net/bridge/`.
+- [x] Outbound internet through NAT (iptables or nftables): iptables masquerading, with forwarding turned on.
 - [ ] Port publishing (`-p 8080:80`).
 - [ ] DNS: write `/etc/resolv.conf` and `/etc/hosts` inside the container.
 - [ ] Container-to-container name resolution on user-defined networks.
@@ -85,4 +85,4 @@ The steps between `runt` and a Docker-like container runtime. Each stage builds 
 
 ## Suggested next steps
 
-With images pulled from registries and run with their own configuration, most images work as they do in Docker, except those that need the network: containers only have a loopback interface. The bridge network with NAT (Stage 6) is what gives them internet access, and port publishing makes servers such as nginx reachable from the host. Bind mounts and volumes (Stage 7) are small by comparison and make containers useful for real work. For building images, `buildah` can fill the gap until Stage 8, writing OCI layouts that `--image` runs.
+With images pulled from registries, run with their own configuration, on a bridge network with NAT, most images work as they do in Docker. The rest of Stage 6 is what network servers and clients still miss: port publishing, so servers such as nginx can be reached from outside the host and not only at the container's address, and an `/etc/resolv.conf` written into each container, since images come without one. Bind mounts and volumes (Stage 7) are small by comparison and make containers useful for real work. For building images, `buildah` can fill the gap until Stage 8, writing OCI layouts that `--image` runs.

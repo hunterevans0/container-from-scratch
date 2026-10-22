@@ -24,9 +24,10 @@ import (
 
 // state is the part of /run/runt/<id>/state.json these tests read.
 type state struct {
-	Status string `json:"status"`
-	Pid    int    `json:"pid"`
-	Cgroup string `json:"cgroup"`
+	Status    string `json:"status"`
+	Pid       int    `json:"pid"`
+	Cgroup    string `json:"cgroup"`
+	IPAddress string `json:"ipAddress"`
 }
 
 // envOr returns the environment variable key, or fallback if it is unset.

@@ -38,6 +38,8 @@ type Config struct {
 	UserSpec string
 	// Hostname is the container's hostname; empty means "runt".
 	Hostname string
+	// Network is NetworkBridge (the default, if empty) or NetworkNone.
+	Network string
 	// Name is an optional name to refer to the container by, besides its ID.
 	Name string
 	// UsernsUser is the user whose /etc/subuid and /etc/subgid ranges the
@@ -65,6 +67,15 @@ type Config struct {
 	// input, output, and error.
 	Tty bool
 }
+
+// Networks a container can be on.
+const (
+	// NetworkBridge plugs the container into a bridge on the host, with an
+	// address of its own and NAT to the outside world.
+	NetworkBridge = "bridge"
+	// NetworkNone gives the container only a loopback interface.
+	NetworkNone = "none"
+)
 
 // User is who a command runs as inside the container.
 type User struct {
