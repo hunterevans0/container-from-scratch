@@ -52,10 +52,13 @@ type State struct {
 	ExitCode *int `json:"exitCode,omitempty"`
 	// Cgroup is the container's cgroup directory, if it has one.
 	Cgroup string `json:"cgroup,omitempty"`
-	// Network is the network the container is on, and IPAddress its
-	// address there while it is created or running.
-	Network   string `json:"network,omitempty"`
-	IPAddress string `json:"ipAddress,omitempty"`
+	// Network is the network the container is on. While it is created or
+	// running, IPAddress is its address there, and Ports are its ports
+	// published on the host, with the host ports the system picked for any
+	// that left them to it.
+	Network   string        `json:"network,omitempty"`
+	IPAddress string        `json:"ipAddress,omitempty"`
+	Ports     []PortMapping `json:"ports,omitempty"`
 	// AppArmorProfile confines the command and anything run with exec.
 	AppArmorProfile string    `json:"apparmorProfile,omitempty"`
 	Resources       Resources `json:"resources"`

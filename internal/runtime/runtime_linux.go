@@ -145,8 +145,11 @@ func checkRootfsOwner(rootfs string, uids, gids IDRange) error {
 type initConfig struct {
 	// Rootfs is the directory to make the container's root: the overlay
 	// mount, or the rootfs itself.
-	Rootfs          string   `json:"rootfs"`
-	ReadonlyRootfs  bool     `json:"readonlyRootfs,omitempty"`
+	Rootfs         string `json:"rootfs"`
+	ReadonlyRootfs bool   `json:"readonlyRootfs,omitempty"`
+	// DirectRootfs is set if Rootfs is the rootfs itself, which mustn't be
+	// changed, rather than an overlay with a writable layer.
+	DirectRootfs    bool     `json:"directRootfs,omitempty"`
 	Hostname        string   `json:"hostname"`
 	AppArmorProfile string   `json:"apparmorProfile,omitempty"`
 	Command         []string `json:"command"`
@@ -162,6 +165,9 @@ type initConfig struct {
 	// Network, if set, configures eth0, which the supervisor has put in
 	// the container's network namespace.
 	Network *initNetwork `json:"network,omitempty"`
+	// EtcFiles are files to mount over the container's own, by path and
+	// content: /etc/hosts and /etc/resolv.conf (see mountEtcFiles).
+	EtcFiles map[string]string `json:"etcFiles,omitempty"`
 }
 
 // Init is the container's init process: runt run (or create) clones it into
@@ -378,7 +384,7 @@ func setupContainer(config initConfig, consoleSocket *os.File) (*os.File, error)
 	}
 	hostname := config.Hostname
 	if hostname == "" {
-		hostname = "runt"
+		hostname = defaultHostname
 	}
 	if err := syscall.Sethostname([]byte(hostname)); err != nil {
 		return nil, fmt.Errorf("set hostname: %w", err)
@@ -424,6 +430,11 @@ func setupContainer(config initConfig, consoleSocket *os.File) (*os.File, error)
 		return nil, err
 	}
 	if err := protectPaths(); err != nil {
+		return nil, err
+	}
+	// Only now that the container's root is "/", so that symlinks among
+	// the container's files can't lead to the host's.
+	if err := mountEtcFiles(config.EtcFiles, config.DirectRootfs); err != nil {
 		return nil, err
 	}
 	var tty *os.File

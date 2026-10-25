@@ -232,12 +232,11 @@ func supervise(config Config, foreground, autoStart bool, ready func(id string, 
 			return err
 		}
 	}
-	switch config.Network {
-	case "":
+	if config.Network == "" {
 		config.Network = NetworkBridge
-	case NetworkBridge, NetworkNone:
-	default:
-		return fmt.Errorf("unknown network %q: use %s or %s", config.Network, NetworkBridge, NetworkNone)
+	}
+	if config.Network == NetworkNone && len(config.Ports) > 0 {
+		return errors.New("publishing ports needs a network, and --network none has none")
 	}
 
 	id, err := newID()
@@ -325,12 +324,13 @@ func supervise(config Config, foreground, autoStart bool, ready func(id string, 
 		defer syscall.Close(cgroupFD)
 	}
 
-	// The container's address is held until it exits. Its veth pair is
-	// made once init, and so its network namespace, exists.
+	// The container's address and published ports are held until it exits.
+	// Its veth pair is made once init, and so its network namespace,
+	// exists.
 	var network *containerNetwork
 	leaveNetwork := func() {}
-	if config.Network == NetworkBridge {
-		if network, err = joinBridgeNetwork(id); err != nil {
+	if config.Network != NetworkNone {
+		if network, err = joinNetwork(id, config.Network, config.Ports); err != nil {
 			return err
 		}
 		leaveNetwork = sync.OnceFunc(func() {
@@ -340,6 +340,7 @@ func supervise(config Config, foreground, autoStart bool, ready func(id string, 
 		})
 		defer leaveNetwork()
 		state.IPAddress = network.reservation.ip.String()
+		state.Ports = network.portMappings()
 	}
 
 	// The start FIFO. Opening a FIFO for reading and writing never blocks,
@@ -509,7 +510,7 @@ func supervise(config Config, foreground, autoStart bool, ready func(id string, 
 		return err
 	}
 	// Init waits for its configuration, so eth0 is in place before it
-	// looks for it.
+	// looks for it, and so is the DNS server, on networks that have one.
 	var networkConfig *initNetwork
 	if network != nil {
 		if err := network.connect(command.Process.Pid); err != nil {
@@ -528,6 +529,7 @@ func supervise(config Config, foreground, autoStart bool, ready func(id string, 
 	err = json.NewEncoder(configW).Encode(initConfig{
 		Rootfs:          rootfs,
 		ReadonlyRootfs:  config.ReadonlyRootfs,
+		DirectRootfs:    layers == nil,
 		Hostname:        config.Hostname,
 		AppArmorProfile: config.AppArmorProfile,
 		Command:         config.Command,
@@ -537,6 +539,7 @@ func supervise(config Config, foreground, autoStart bool, ready func(id string, 
 		UserSpec:        config.UserSpec,
 		Tty:             config.Tty,
 		Network:         networkConfig,
+		EtcFiles:        etcFiles(config.Hostname, network),
 	})
 	configW.Close()
 	if err != nil {
@@ -605,6 +608,7 @@ func supervise(config Config, foreground, autoStart bool, ready func(id string, 
 		state.Status = StatusStopped
 		state.Pid = 0
 		state.IPAddress = ""
+		state.Ports = nil
 		state.ExitCode = &exitCode
 		state.Finished = time.Now()
 		if err := saveState(StateRoot, state); err != nil {

@@ -144,6 +144,39 @@ func (r *reservation) release() error {
 	return nil
 }
 
+// inUse reports whether any container holds an address in the subnet: any
+// reservation file that somebody has locked.
+func (p *ipam) inUse() (bool, error) {
+	entries, err := os.ReadDir(p.dir)
+	if errors.Is(err, os.ErrNotExist) {
+		return false, nil
+	}
+	if err != nil {
+		return false, err
+	}
+	for _, entry := range entries {
+		if net.ParseIP(entry.Name()) == nil {
+			continue
+		}
+		file, err := os.Open(filepath.Join(p.dir, entry.Name()))
+		if errors.Is(err, os.ErrNotExist) {
+			continue
+		}
+		if err != nil {
+			return false, err
+		}
+		err = flock(file, syscall.LOCK_SH|syscall.LOCK_NB)
+		file.Close()
+		if errors.Is(err, syscall.EWOULDBLOCK) {
+			return true, nil
+		}
+		if err != nil {
+			return false, err
+		}
+	}
+	return false, nil
+}
+
 // subnetAddress returns the nth address in an IPv4 subnet, counting the
 // subnet's own as 0.
 func subnetAddress(subnet *net.IPNet, n uint32) net.IP {

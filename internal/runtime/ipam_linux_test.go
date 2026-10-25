@@ -77,6 +77,24 @@ func TestReserveFull(t *testing.T) {
 	}
 }
 
+// TestInUse covers runt network rm's check: a network is in use while any
+// address on it is held, but not because of a dead container's file.
+func TestInUse(t *testing.T) {
+	p := testIPAM(t, "10.89.0.0/24")
+	if inUse, err := p.inUse(); err != nil || inUse {
+		t.Errorf("before any reservation: got %v, %v; want not in use", inUse, err)
+	}
+	r := mustReserve(t, p, "aaaa", "10.89.0.2")
+	if inUse, err := p.inUse(); err != nil || !inUse {
+		t.Errorf("with an address held: got %v, %v; want in use", inUse, err)
+	}
+	// Closing the file without removing it, as a killed process leaves it.
+	r.file.Close()
+	if inUse, err := p.inUse(); err != nil || inUse {
+		t.Errorf("with only an abandoned reservation: got %v, %v; want not in use", inUse, err)
+	}
+}
+
 func TestMACAddress(t *testing.T) {
 	if got, want := macAddress(net.IP{10, 88, 1, 2}).String(), "02:42:0a:58:01:02"; got != want {
 		t.Errorf("got %s, want %s", got, want)

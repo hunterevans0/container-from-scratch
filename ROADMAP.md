@@ -52,9 +52,9 @@ The steps between `runt` and a Docker-like container runtime. Each stage builds 
 - [x] Bridge network with a veth pair per container. The bridge is `runt0`, and `--network none` leaves a container only its loopback interface.
 - [x] IP address management (assign each container an IP): the lowest free address in `10.88.0.0/16`, held with a locked file per address under `/run/runt-net/bridge/`.
 - [x] Outbound internet through NAT (iptables or nftables): iptables masquerading, with forwarding turned on.
-- [ ] Port publishing (`-p 8080:80`).
-- [ ] DNS: write `/etc/resolv.conf` and `/etc/hosts` inside the container.
-- [ ] Container-to-container name resolution on user-defined networks.
+- [x] Port publishing (`-p 8080:80`): a DNAT rule for connections from elsewhere, and a proxy in the supervisor for the host's own and containers', which also holds the port. TCP and UDP; no port ranges or IPv6.
+- [x] DNS: write `/etc/resolv.conf` and `/etc/hosts` inside the container. Bind-mounted after `pivot_root`, from the host's servers less any on its loopback interface (or systemd-resolved's real ones).
+- [x] Container-to-container name resolution on user-defined networks: `runt network create`, `ls`, and `rm`, with networks kept apart by iptables, and a DNS server per container at `127.0.0.11` that knows the network's containers by name or ID and passes other questions to the host's servers.
 
 ## Stage 7: Storage
 
@@ -85,4 +85,4 @@ The steps between `runt` and a Docker-like container runtime. Each stage builds 
 
 ## Suggested next steps
 
-With images pulled from registries, run with their own configuration, on a bridge network with NAT, most images work as they do in Docker. The rest of Stage 6 is what network servers and clients still miss: port publishing, so servers such as nginx can be reached from outside the host and not only at the container's address, and an `/etc/resolv.conf` written into each container, since images come without one. Bind mounts and volumes (Stage 7) are small by comparison and make containers useful for real work. For building images, `buildah` can fill the gap until Stage 8, writing OCI layouts that `--image` runs.
+With images pulled from registries and run with their own configuration, published ports, DNS, and networks whose containers find each other by name, most images and small multi-container setups work as they do in Docker. What they miss most now is storage: bind mounts and volumes (Stage 7) are small by comparison and make containers useful for real work, such as a database whose data outlives its container. For building images, `buildah` can fill the gap until Stage 8, writing OCI layouts that `--image` runs.

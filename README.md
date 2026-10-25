@@ -25,6 +25,7 @@
 - an overlay filesystem per container: shared read-only layers underneath, and a writable layer of its own on top
 - OCI image layouts (`--image`) and OCI runtime bundles (`--bundle`, with `runt spec` to write a `config.json`)
 - `pull` from Docker Hub and other registries (with `login`), a local image store with `images` and `rmi`, and each image's default command, environment, working directory, and user
+- published ports (`-p 8080:80`), an `/etc/resolv.conf` and `/etc/hosts` in every container, and networks of your own (`runt network create`), apart from each other, whose containers find each other by name
 
 This is educational code, not a production container runtime. It currently requires Linux and root privileges for `run`.
 
@@ -74,9 +75,9 @@ The rootfs itself never changes: whatever the shell writes or deletes goes to a 
 
 ## Integration tests
 
-`make test` only runs tests that don't start containers (the layer-unpacking tests also skip themselves unless run as root). `make integration` builds `runt` and runs the tests in [integration/](integration/), which start real containers with `sudo`. They check that containers can't reach each other (one tries to see the other's processes, kill it by its host PID, and move itself into its cgroup) and don't see each other's files. They also cover init reaping orphans, terminals for `run -it`, `run -dt`, and `exec -it`, signals reaching `exec`'d commands, `attach` (and detaching from it) and `start -ai`, an OCI image built from the rootfs, an image's configuration and the options that override it, a bundle made with `runt spec`, and the bridge network. One test serves an image from a registry of its own on localhost, which wants a password, and logs in, pulls, runs, and removes it. They need the rootfs from `make rootfs`, but not the internet: the network test stands a network namespace in for it.
+`make test` only runs tests that don't start containers (the layer-unpacking tests also skip themselves unless run as root). `make integration` builds `runt` and runs the tests in [integration/](integration/), which start real containers with `sudo`. They check that containers can't reach each other (one tries to see the other's processes, kill it by its host PID, and move itself into its cgroup) and don't see each other's files. They also cover init reaping orphans, terminals for `run -it`, `run -dt`, and `exec -it`, signals reaching `exec`'d commands, `attach` (and detaching from it) and `start -ai`, an OCI image built from the rootfs, an image's configuration and the options that override it, a bundle made with `runt spec`, the bridge network, published ports, `/etc/resolv.conf` and `/etc/hosts`, and networks made with `runt network create`. One test serves an image from a registry of its own on localhost, which wants a password, and logs in, pulls, runs, and removes it. They need the rootfs from `make rootfs`, but not the internet: the network tests stand a network namespace in for it.
 
-`make features` runs only the checks in [integration/features_test.go](integration/features_test.go): a test for each image, filesystem, and network feature (`Layers`, `OCIFormats`, `Registry`, `ImageStore`, `ImageConfig`, `Network`), with a subtest per check, each printing a line saying what it shows. Checks that pass print nothing else; one that fails is marked, with the details after its feature. `make features FEATURE=Registry` runs one of them, and `FEATURE=Registry/BasicAuth` one check.
+`make features` runs only the feature checks, in [integration/features_test.go](integration/features_test.go) and [integration/network_test.go](integration/network_test.go): a test for each image, filesystem, and network feature (`Layers`, `OCIFormats`, `Registry`, `ImageStore`, `ImageConfig`, `Network`, `Ports`, `DNS`, `UserNetworks`), with a subtest per check, each printing a line saying what it shows. Checks that pass print nothing else; one that fails is marked, with the details after its feature. `make features FEATURE=Registry` runs one of them, and `FEATURE=Registry/BasicAuth` one check.
 
 ## Debugging with breakpoints
 
@@ -172,39 +173,93 @@ Inside the container, its cgroup is mounted read-only at `/sys/fs/cgroup`, so `c
 
 ## Networking
 
-By default, a container is on the bridge network, which works like Docker's default network: it has an address of its own, reaches other containers and the host directly, and the internet through the host.
+By default, a container is on the bridge network, which works like Docker's default network: it has an address of its own, reaches other containers and the host directly, and the internet through the host. `-p` publishes its ports on the host. On a network made with `runt network create`, containers find each other by name.
 
 ```bash
 sudo ./runt run -it --rootfs /var/lib/runt/rootfs -- /bin/bash
 hostname -I                  # inside: 10.88.0.2
-getent hosts example.com     # DNS, with the rootfs's own /etc/resolv.conf
+getent hosts example.com     # DNS, with the host's servers in /etc/resolv.conf
+
+sudo ./runt run -d --name web -p 8080:80 --image nginx
+curl http://localhost:8080/  # on the host, or at the host's address from another machine
+
+sudo ./runt network create mynet
+sudo ./runt run -d --name db --network mynet --image redis
+sudo ./runt run -it --network mynet --image redis -- redis-cli -h db ping
 ```
 
 **The bridge.** The host has a bridge, `runt0`: a virtual switch, with the address `10.88.0.1/16`. Each container gets a veth pair, two virtual interfaces joined like the ends of a cable. One end is `eth0` in the container's network namespace, and the other, `veth` followed by the first 8 characters of the container's ID, is plugged into the bridge (`ip link show master runt0` lists them). `runt` makes the pair once init has been cloned, with the container's end created straight in init's network namespace, and only then sends init its configuration. Init gives `eth0` its address, brings it up, and makes `10.88.0.1` its default route, while it still has `CAP_NET_ADMIN` in its own namespace. When the container stops, `runt` deletes the pair, which the kernel would also do once the namespace is gone.
 
 **Addresses.** Each container gets the lowest free address in `10.88.0.0/16` (Podman's default range; Docker's is `172.17.0.0/16`), which `state.json` records as `ipAddress` while it runs. Its MAC address is made from it, as Docker does (`02:42:0a:58:00:02` for `10.88.0.2`), so a container that gets an address another one had also gets its MAC address, and ARP caches stay right. The bridge's MAC address is fixed the same way; otherwise a bridge takes the lowest MAC address of whatever is plugged into it, which changes as containers come and go.
 
-An address in use has a file, `/run/runt-net/bridge/<address>`, holding the container's ID, which the process supervising the container keeps locked with `flock`. A new container takes the first address whose file nobody has locked, so an address whose monitor was killed before it could clean up is free again: the kernel dropped the lock when the process died. A new file is locked before it appears under the address's name (it's written under another name and then hard-linked), so two containers starting at once can't both take the same address. CNI's `host-local` plugin, which Podman uses, keeps a file per address the same way.
+An address in use has a file, `/run/runt-net/<network>/<address>` (the default network is `bridge`), holding the container's ID, which the process supervising the container keeps locked with `flock`. A new container takes the first address whose file nobody has locked, so an address whose monitor was killed before it could clean up is free again: the kernel dropped the lock when the process died. A new file is locked before it appears under the address's name (it's written under another name and then hard-linked), so two containers starting at once can't both take the same address. CNI's `host-local` plugin, which Podman uses, keeps a file per address the same way.
 
-**NAT.** For the internet, the host passes containers' packets on to its own network (`net.ipv4.ip_forward`, which `runt` turns on, as Docker does), and these iptables rules let them through:
+**NAT.** For the internet, the host passes containers' packets on to its own network (`net.ipv4.ip_forward`, which `runt` turns on, as Docker does), and these iptables rules let them through. Each network has its own, with its own subnet and bridge; these are the default network's:
 
 | Table and chain | Rule | Why |
 | --- | --- | --- |
 | `nat POSTROUTING` | `-s 10.88.0.0/16 ! -o runt0 -j MASQUERADE` | Packets leaving the host get its address as their source, so replies come back to it. Connection tracking remembers each change and undoes it on the replies. |
-| `filter FORWARD` | `-i runt0 -j ACCEPT` | What containers send is let through, even where the firewall drops forwarded packets by default, as Docker and ufw set it up. |
+| `filter FORWARD` | `-i runt0 ! -o runt+ -j ACCEPT` | What containers send beyond `runt`'s bridges is let through, even where the firewall drops forwarded packets by default, as Docker and ufw set it up. `runt+` matches every bridge `runt` makes. |
+| `filter FORWARD` | `-i runt0 -o runt0 -j ACCEPT` | So is what they send each other, which the firewall sees only if `br_netfilter` is loaded (Docker loads it). |
 | `filter FORWARD` | `-o runt0 -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT` | So are the replies. |
+| `filter FORWARD` | `-o runt0 -m conntrack --ctstate DNAT -j ACCEPT` | And connections to [published ports](#publishing-ports). |
 
-The first container that needs them sets up the bridge, the rules, and forwarding, and they stay, as Docker leaves `docker0`. To remove them, run `sudo ip link del runt0`, and `sudo iptables -D` for each rule (with `-t nat` for the first).
+All networks share one more rule, `filter FORWARD -i runt+ -o runt+ -j DROP`: nothing else passes from one network to another. It goes in before any network's rules, which are each put first in their chain, so they come ahead of it.
+
+The first container that needs them sets up a network's bridge, its rules, and forwarding, and they stay, as Docker leaves `docker0`. `runt network rm` removes a network's own. To remove the default network's, run `sudo ip link del runt0`, and `sudo iptables -D` for each rule (with `-t nat` for the first).
 
 `runt` changes the network configuration with rtnetlink, the kernel interface `ip` uses. Go's standard library can't, and `runt` needs only a few requests, so [netlink_linux.go](internal/runtime/netlink_linux.go) builds them by hand, as the seccomp filter is.
 
-Not done yet (see [ROADMAP.md](ROADMAP.md)):
+`--network none` gives a container only a loopback interface, and an `/etc/hosts` with only `localhost`.
 
-- Containers keep their image's or rootfs's `/etc/resolv.conf`. In WSL, the rootfs from `make rootfs` has WSL's own, `10.255.255.254`, an address of the host, which containers reach through the bridge. Images usually have none, since Docker writes one into each container, so names don't resolve in them yet.
-- Ports aren't published: the host reaches a server in a container at the container's address (`curl http://10.88.0.2/`), and other machines can't reach it.
-- Containers find each other by address, not by name.
+### Publishing ports
 
-`--network none` gives a container only a loopback interface, as before.
+`-p 8080:80` publishes the container's port 80 at the host's port 8080, as `docker run -p` does. The forms are Docker's:
+
+- `-p 8080:80` on all of the host's addresses
+- `-p 127.0.0.1:8080:80` on only one of them
+- `-p 53:53/udp` for UDP
+- `-p 80`, or `-p 127.0.0.1::80`, at a free port the system picks
+
+`runt ps` and `state.json` show which port was picked. Port ranges and IPv6 aren't supported.
+
+Connections from other machines go through a DNAT rule. It lives in a chain of `runt`'s own, `RUNT` in the nat table, which `PREROUTING` jumps to for packets addressed to the host. `OUTPUT` jumps to it too, for the host's own connections to its non-loopback addresses:
+
+```
+-A RUNT ! -i runt+ -p tcp -m tcp --dport 8080 -j DNAT --to-destination 10.88.0.2:80
+```
+
+The kernel rewrites the destination as the packets arrive, and routes them on through the bridge. Connection tracking undoes the rewrite on the replies, and the container sees the client's own address.
+
+Two kinds of connection can't go that way:
+
+- The host's own, to `127.0.0.1:8080`. The kernel won't route a packet from a loopback address out of another interface.
+- A container's, to the host's address. The container it's rewritten to would answer straight through the bridge, from an address the client doesn't expect.
+
+Those go to a proxy instead, like Docker's `docker-proxy`. The process supervising the container listens on the host port and relays each connection, or for UDP each client's datagrams, to the container. The container sees them come from the bridge's address.
+
+Listening also holds the port. A second container, or any other program, that tries to publish it fails with "address already in use". When the container stops, its rules go and its ports are free again. A monitor that's killed can't remove its rules, but its sockets close with it, so whoever next holds the port, or gets the address, removes any rules left for it.
+
+### DNS
+
+Every container gets an `/etc/resolv.conf` and an `/etc/hosts` of `runt`'s, as with Docker, since images come without a `resolv.conf`:
+
+- `/etc/hosts` has `localhost`, and the container's hostname at its address.
+- `/etc/resolv.conf` has the host's DNS servers, search domains, and options, without the servers on the host's loopback interface, which a container can't reach.
+
+On a host using systemd-resolved, `/etc/resolv.conf` names only its stub server, `127.0.0.53`. There `runt` reads the servers it really uses from `/run/systemd/resolve/resolv.conf`, as Docker does. With no server left, a container gets Google's, `8.8.8.8` and `8.8.4.4`, also as with Docker. In WSL, it gets WSL's own, `10.255.255.254`, which containers reach through the bridge.
+
+The supervisor writes the files and init bind-mounts them over the container's own, after `pivot_root`, so a symlink there can only lead within the container. Init first writes them to a small tmpfs of their own, and detaches it once they're mounted, so they leave the image's layers alone. The container's writable layer changes only when the image lacks a file, or has a symlink that leads nowhere: then an empty file is made there to mount over. A bundle's root filesystem, which `runt` uses as it is, gets them only over files it already has. The container can still change them, even with a read-only root.
+
+### User-defined networks
+
+`runt network create NAME` makes a network with a bridge of its own, named `runt-` and the start of the network's ID. Its subnet is the one `--subnet` gives, or else the first free `/24` from `10.89.0.0/24` on (as Podman picks), avoiding the host's own networks. `runt network ls` lists networks. `runt network rm` removes a network, with its bridge and rules, once no container is on it. Networks are kept in `/var/lib/runt/networks/`, so they survive a reboot, and a network's bridge is made when a container first joins it, as `runt0` is.
+
+Containers on such a network find each other by name or ID, alone or followed by the network's name (`db.mynet`). Their `/etc/resolv.conf` names a DNS server at `127.0.0.11`, the address of Docker's embedded server. It also sets `options ndots:0`, so `db` is looked up as it is first, not under each search domain.
+
+The server is the process supervising the container. It makes a UDP and a TCP socket inside the container's network namespace, with `setns` on a thread of its own that ends once they exist, so it answers on the container's own loopback interface. It looks names up among the containers created or running on the same network, in their `state.json`. Every other question it passes on to the host's DNS servers. It does that from the host's network namespace, so servers on the host's loopback interface, such as systemd-resolved's, work too. [dns_linux.go](internal/runtime/dns_linux.go) speaks just enough DNS for this, by hand.
+
+As with Docker, containers on the default network don't get the server, and find each other only by address. Containers on different networks can't reach each other at all (see the `DROP` rule above), though each still reaches the host, the internet, and published ports.
 
 ## Managing containers
 
@@ -240,8 +295,9 @@ sudo ./runt attach box         # its terminal; Ctrl+P, Ctrl+Q detaches and leave
 | `images [-q] [--digests]` | List the images in the store. |
 | `rmi [-f] IMAGE...` | Remove images from the store. |
 | `login [-u USER] [--password-stdin] [REGISTRY]` / `logout [REGISTRY]` | Store or remove credentials for a registry, Docker Hub by default. |
+| `network create [--subnet CIDR] NAME` / `network ls` / `network rm NAME...` | Make, list, or remove [networks](#user-defined-networks) whose containers find each other by name. |
 
-`run` and `create` take the container's filesystem from one of `--rootfs PATH` (a root filesystem directory), `--image IMAGE` (an [image](#images) from the store, pulled if need be, or an OCI image layout), or `--bundle DIR` (an [OCI runtime bundle](#oci-runtime-bundles), whose `config.json` also gives the command). They also take `--network bridge|none` (see [Networking](#networking)), `-e NAME=VALUE` (repeatable), `-w DIR`, and `-u USER[:GROUP]`, as `docker run` does, and with an image, `--entrypoint` (see [Image configuration](#image-configuration)).
+`run` and `create` take the container's filesystem from one of `--rootfs PATH` (a root filesystem directory), `--image IMAGE` (an [image](#images) from the store, pulled if need be, or an OCI image layout), or `--bundle DIR` (an [OCI runtime bundle](#oci-runtime-bundles), whose `config.json` also gives the command). They also take `--network bridge|none|NAME` and `-p [[HOSTIP:]HOSTPORT:]PORT[/udp]` (repeatable; see [Networking](#networking)), `-e NAME=VALUE` (repeatable), `-w DIR`, and `-u USER[:GROUP]`, as `docker run` does, and with an image, `--entrypoint` (see [Image configuration](#image-configuration)).
 
 `CONTAINER` is the name given with `--name`, the full ID, or enough of the start of the ID to be unique. Options go before the other arguments, as in `logs -f web`. Single-letter options combine, as in `-it` or `-dt`.
 
@@ -249,7 +305,7 @@ sudo ./runt attach box         # its terminal; Ctrl+P, Ctrl+Q detaches and leave
 
 Each container gets a random 12-character hex ID and a directory `/run/runt/<id>/`:
 
-- `state.json`: the rootfs or image, command, limits, cgroup, network and address, timestamps, and status. The status moves from `created` (set up, with the host PID of its init) to `running` and then `stopped` (with the exit code).
+- `state.json`: the rootfs or image, command, limits, cgroup, network, address and published ports, timestamps, and status. The status moves from `created` (set up, with the host PID of its init) to `running` and then `stopped` (with the exit code).
 - `container.log`: the container's output, one JSON object per line, in the format of Docker's `json-file` log driver.
 - `start.fifo`: what a created container's init waits on (see below).
 - `attach.sock`: the Unix socket `runt attach` connects to, while the container runs.

@@ -2,6 +2,9 @@ package runtime
 
 const sysSeccomp = 277
 
+// sysSetns is setns, which the syscall package doesn't define here.
+const sysSetns = 268
+
 // Syscall numbers from <asm-generic/unistd.h>. The denied list follows
 // Docker's default profile for a container without extra capabilities; it is
 // shorter than amd64's because arm64 never had the obsolete calls.

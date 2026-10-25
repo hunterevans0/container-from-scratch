@@ -1,5 +1,7 @@
 package runtime
 
+import "time"
+
 type Config struct {
 	// Rootfs is an unpacked root filesystem. The container sees it through
 	// an overlay with a writable layer of its own, so the directory itself
@@ -38,8 +40,11 @@ type Config struct {
 	UserSpec string
 	// Hostname is the container's hostname; empty means "runt".
 	Hostname string
-	// Network is NetworkBridge (the default, if empty) or NetworkNone.
+	// Network is NetworkBridge (the default, if empty), NetworkNone, or the
+	// name of a network made with CreateNetwork.
 	Network string
+	// Ports are the container's ports to publish on the host.
+	Ports []PortMapping
 	// Name is an optional name to refer to the container by, besides its ID.
 	Name string
 	// UsernsUser is the user whose /etc/subuid and /etc/subgid ranges the
@@ -76,6 +81,19 @@ const (
 	// NetworkNone gives the container only a loopback interface.
 	NetworkNone = "none"
 )
+
+// Network is a network containers can be on: the default bridge network, or
+// one made with CreateNetwork, whose containers find each other by name.
+type Network struct {
+	Name string `json:"name"`
+	// ID is set on networks made with CreateNetwork.
+	ID string `json:"id,omitempty"`
+	// Bridge is the network's bridge on the host, and Subnet its range of
+	// addresses. NetworkNone has neither.
+	Bridge  string    `json:"bridge,omitempty"`
+	Subnet  string    `json:"subnet,omitempty"`
+	Created time.Time `json:"created,omitzero"`
+}
 
 // User is who a command runs as inside the container.
 type User struct {

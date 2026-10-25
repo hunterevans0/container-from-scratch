@@ -28,6 +28,12 @@ type state struct {
 	Pid       int    `json:"pid"`
 	Cgroup    string `json:"cgroup"`
 	IPAddress string `json:"ipAddress"`
+	Ports     []struct {
+		HostIP        string `json:"hostIp"`
+		HostPort      int    `json:"hostPort"`
+		ContainerPort int    `json:"containerPort"`
+		Protocol      string `json:"protocol"`
+	} `json:"ports"`
 }
 
 // envOr returns the environment variable key, or fallback if it is unset.

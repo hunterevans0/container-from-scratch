@@ -20,10 +20,14 @@ const (
 	// greetingPort is where the test's servers listen. Each tells a client
 	// the address it sees the connection come from.
 	greetingPort = 7000
+	// udpGreetingPort is where the test's UDP servers listen.
+	udpGreetingPort = 7001
 	// The stand-in for the outside world (see startOutside), on a
-	// documentation range nobody routes.
+	// documentation range nobody routes. The host's end of its veth pair
+	// mustn't start with runt, as runt's bridges do: the rule that keeps
+	// networks apart would take it for one.
 	outsideNamespace = "runt-feature-outside"
-	outsideHostEnd   = "runt-outside"
+	outsideHostEnd   = "outside-veth"
 	outsideHostIP    = "198.51.100.1"
 	outsideServerIP  = "198.51.100.2"
 )
@@ -34,18 +38,50 @@ var greetingServer = fmt.Sprintf(`exec perl -MIO::Socket::INET -e '
 $s = IO::Socket::INET->new(LocalPort => %d, Listen => 5, ReuseAddr => 1) or die "listen: $!";
 while ($c = $s->accept) { print $c "you are " . $c->peerhost . "\n"; close $c }'`, greetingPort)
 
-// greetingFrom has container connect to a greeting server at ip with bash's
-// /dev/tcp, trying for a few seconds while the server starts, and returns
-// the greeting.
-func (r *runtTester) greetingFrom(container, ip string) (string, error) {
-	script := fmt.Sprintf(`for i in $(seq 50); do exec 3<>/dev/tcp/%s/%d && break; sleep 0.1; done 2>/dev/null; cat <&3`, ip, greetingPort)
-	output, err := r.runt("exec", container, "/bin/bash", "-c", script)
+// udpGreetingServer is greetingServer over UDP: it answers each datagram.
+var udpGreetingServer = fmt.Sprintf(`perl -MIO::Socket::INET -e '
+$s = IO::Socket::INET->new(LocalPort => %d, Proto => "udp") or die "bind: $!";
+while ($s->recv($m, 512)) { $s->send("you are " . $s->peerhost . "\n") }'`, udpGreetingPort)
+
+// tcpGreetingScript is a bash script that connects to a greeting server at
+// host and port with bash's /dev/tcp, trying for a few seconds while the
+// server starts, and prints the greeting.
+func tcpGreetingScript(host string, port int) string {
+	return fmt.Sprintf(`for i in $(seq 50); do exec 3<>/dev/tcp/%s/%d && break; sleep 0.1; done 2>/dev/null; cat <&3`, host, port)
+}
+
+// udpGreetingScript is a bash script that sends datagrams to a UDP greeting
+// server at host and port with bash's /dev/udp until one is answered, and
+// prints the answer.
+func udpGreetingScript(host string, port int) string {
+	return fmt.Sprintf(`exec 3<>/dev/udp/%s/%d; for i in $(seq 20); do echo hi >&3; if read -t 0.3 line <&3; then echo "$line"; exit 0; fi; done; exit 1`, host, port)
+}
+
+// greetingFrom has container connect to a greeting server at host and
+// returns the greeting.
+func (r *runtTester) greetingFrom(container, host string) (string, error) {
+	return r.greetingFromPort(container, host, greetingPort)
+}
+
+func (r *runtTester) greetingFromPort(container, host string, port int) (string, error) {
+	output, err := r.runt("exec", container, "/bin/bash", "-c", tcpGreetingScript(host, port))
 	return strings.TrimSpace(output), err
+}
+
+// greetingFromOutside runs a greeting script in the outside world's
+// namespace (see startOutside) and returns the greeting.
+func greetingFromOutside(script string) (string, error) {
+	output, err := exec.Command("ip", "netns", "exec", outsideNamespace, "/bin/bash", "-c", script).CombinedOutput()
+	return strings.TrimSpace(string(output)), err
 }
 
 // greetingFromHost connects to a greeting server at ip from the host.
 func greetingFromHost(ip string) (string, error) {
-	address := net.JoinHostPort(ip, fmt.Sprint(greetingPort))
+	return greetingAt(net.JoinHostPort(ip, fmt.Sprint(greetingPort)))
+}
+
+// greetingAt connects to a greeting server at address from the host.
+func greetingAt(address string) (string, error) {
 	var err error
 	for deadline := time.Now().Add(5 * time.Second); time.Now().Before(deadline); time.Sleep(100 * time.Millisecond) {
 		var conn net.Conn
@@ -56,6 +92,28 @@ func greetingFromHost(ip string) (string, error) {
 		conn.SetDeadline(time.Now().Add(5 * time.Second))
 		line, err := bufio.NewReader(conn).ReadString('\n')
 		return strings.TrimSpace(line), err
+	}
+	return "", err
+}
+
+// udpGreetingAt sends datagrams to a UDP greeting server at address from the
+// host until one is answered, and returns the answer.
+func udpGreetingAt(address string) (string, error) {
+	conn, err := net.Dial("udp4", address)
+	if err != nil {
+		return "", err
+	}
+	defer conn.Close()
+	buffer := make([]byte, 512)
+	for i := 0; i < 20; i++ {
+		if _, err = conn.Write([]byte("hi\n")); err != nil {
+			continue
+		}
+		conn.SetReadDeadline(time.Now().Add(300 * time.Millisecond))
+		var n int
+		if n, err = conn.Read(buffer); err == nil {
+			return strings.TrimSpace(string(buffer[:n])), nil
+		}
 	}
 	return "", err
 }
@@ -231,6 +289,290 @@ func TestFeatureNetwork(t *testing.T) {
 		mustSucceed(t, "runt run --network none", output, err)
 		if output != "lo\n" {
 			t.Errorf("interfaces: got %q, want only lo", output)
+		}
+	})
+}
+
+// TestFeaturePorts checks port publishing: a container's port reached at a
+// port of the host's, from elsewhere through a DNAT rule, and from the host
+// itself and other containers through runt's proxy.
+func TestFeaturePorts(t *testing.T) {
+	explain(t, "Port publishing: -p HOSTPORT:CONTAINERPORT, by DNAT from elsewhere and a proxy from the host and containers")
+	r := newRuntTester(t)
+	startOutside(t)
+	options := []string{"--rootfs", r.rootfs, "-p", "17000:7000", "-p", "17001:7001/udp", "-p", "7000"}
+	id := r.startWith("runt-feature-ports", options, "/bin/sh", "-c", udpGreetingServer+" & "+greetingServer)
+	r.start("runt-feature-ports-client", "/bin/sleep", "600")
+	s := readState(t, id)
+
+	t.Run("FromElsewhere", func(t *testing.T) {
+		explain(t, "from another machine, a DNAT rule passes connections on, and the container sees who they come from")
+		greeting, err := greetingFromOutside(tcpGreetingScript(outsideHostIP, 17000))
+		mustSucceed(t, "the outside connecting to the host's port 17000", greeting, err, "you are "+outsideServerIP)
+		greeting, err = greetingFromOutside(udpGreetingScript(outsideHostIP, 17001))
+		mustSucceed(t, "the outside sending to the host's UDP port 17001", greeting, err, "you are "+outsideServerIP)
+		observe("outside (%s) -> %s:17000 -> %s:7000: %q", outsideServerIP, outsideHostIP, s.IPAddress, greeting)
+	})
+
+	t.Run("FromHost", func(t *testing.T) {
+		explain(t, "from the host, at 127.0.0.1, the proxy passes connections on, from the bridge's address")
+		greeting, err := greetingAt("127.0.0.1:17000")
+		mustSucceed(t, "the host connecting to 127.0.0.1:17000", greeting, err, "you are "+bridgeGateway)
+		greeting, err = udpGreetingAt("127.0.0.1:17001")
+		mustSucceed(t, "the host sending to 127.0.0.1:17001/udp", greeting, err, "you are "+bridgeGateway)
+	})
+
+	t.Run("FromContainer", func(t *testing.T) {
+		explain(t, "from another container, at the host's address, the proxy passes connections on too")
+		greeting, err := r.greetingFromPort("runt-feature-ports-client", bridgeGateway, 17000)
+		mustSucceed(t, "a container connecting to the host's port 17000", greeting, err, "you are "+bridgeGateway)
+	})
+
+	t.Run("AnyFreePort", func(t *testing.T) {
+		explain(t, "-p 7000 publishes the port at a free port the system picks, recorded in state.json")
+		hostPort := 0
+		for _, port := range s.Ports {
+			if port.ContainerPort == 7000 && port.HostPort != 17000 {
+				hostPort = port.HostPort
+			}
+		}
+		if hostPort == 0 {
+			t.Fatalf("state.json has no host port for -p 7000: %+v", s.Ports)
+		}
+		greeting, err := greetingAt(fmt.Sprintf("127.0.0.1:%d", hostPort))
+		mustSucceed(t, fmt.Sprintf("the host connecting to the picked port %d", hostPort), greeting, err, "you are "+bridgeGateway)
+		observe("-p 7000 got host port %d", hostPort)
+	})
+
+	t.Run("Ps", func(t *testing.T) {
+		explain(t, "runt ps shows the published ports, as docker ps does")
+		output, err := r.runt("ps")
+		mustSucceed(t, "runt ps", output, err, "0.0.0.0:17000->7000/tcp", "0.0.0.0:17001->7001/udp")
+	})
+
+	t.Run("Taken", func(t *testing.T) {
+		explain(t, "a port another container has published can't be published again")
+		output, err := r.runOnce("runt-feature-ports-taken", "--rootfs", r.rootfs, "-p", "17000:7000", "--", "/bin/true")
+		mustFail(t, "publishing port 17000 twice", output, err, "address already in use")
+	})
+
+	t.Run("NoNetwork", func(t *testing.T) {
+		explain(t, "--network none has no ports to publish")
+		output, err := r.runOnce("runt-feature-ports-none", "--rootfs", r.rootfs, "--network", "none", "-p", "7000", "--", "/bin/true")
+		mustFail(t, "publishing a port with --network none", output, err, "--network none")
+	})
+
+	t.Run("ReleasedOnStop", func(t *testing.T) {
+		explain(t, "a container's DNAT rules go, and its ports are free again, when it stops")
+		output, err := r.runt("stop", "-t", "1", "runt-feature-ports")
+		mustSucceed(t, "runt stop", output, err)
+		rules, err := exec.Command("iptables", "-t", "nat", "-S", "RUNT").CombinedOutput()
+		if err != nil {
+			t.Fatalf("iptables -t nat -S RUNT: %v\n%s", err, rules)
+		}
+		if strings.Contains(string(rules), s.IPAddress+":") {
+			t.Errorf("rules for the stopped container are still there:\n%s", rules)
+		}
+		listener, err := net.Listen("tcp4", ":17000")
+		if err != nil {
+			t.Errorf("port 17000 is still taken: %v", err)
+		} else {
+			listener.Close()
+		}
+	})
+}
+
+// hostNameservers are the DNS servers a container on the default network
+// should get from the host: those not on its loopback interface.
+func hostNameservers(t *testing.T) []string {
+	t.Helper()
+	all := resolvConfServers(t, "/etc/resolv.conf")
+	// systemd-resolved's stub server stands for the servers it asks.
+	if len(all) == 1 && all[0] == "127.0.0.53" {
+		if _, err := os.Stat("/run/systemd/resolve/resolv.conf"); err == nil {
+			all = resolvConfServers(t, "/run/systemd/resolve/resolv.conf")
+		}
+	}
+	var nameservers []string
+	for _, nameserver := range all {
+		if ip := net.ParseIP(nameserver); ip != nil && ip.To4() != nil && !ip.IsLoopback() {
+			nameservers = append(nameservers, nameserver)
+		}
+	}
+	return nameservers
+}
+
+// resolvConfServers returns the servers a resolv.conf names.
+func resolvConfServers(t *testing.T, path string) []string {
+	t.Helper()
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var nameservers []string
+	for _, line := range strings.Split(string(data), "\n") {
+		if fields := strings.Fields(line); len(fields) >= 2 && fields[0] == "nameserver" {
+			nameservers = append(nameservers, fields[1])
+		}
+	}
+	return nameservers
+}
+
+// TestFeatureDNS checks the /etc/resolv.conf and /etc/hosts runt gives every
+// container.
+func TestFeatureDNS(t *testing.T) {
+	explain(t, "DNS: an /etc/resolv.conf and /etc/hosts of runt's in every container")
+	r := newRuntTester(t)
+	id := r.start("runt-feature-dns", "/bin/sleep", "600")
+	s := readState(t, id)
+
+	t.Run("ResolvConf", func(t *testing.T) {
+		explain(t, "/etc/resolv.conf has the host's DNS servers, but none on the host's loopback interface")
+		output, err := r.exec("runt-feature-dns", "cat /etc/resolv.conf")
+		mustSucceed(t, "reading /etc/resolv.conf", output, err)
+		nameservers := hostNameservers(t)
+		if len(nameservers) == 0 {
+			nameservers = []string{"8.8.8.8", "8.8.4.4"}
+		}
+		for _, nameserver := range nameservers {
+			if !strings.Contains(output, "nameserver "+nameserver+"\n") {
+				t.Errorf("/etc/resolv.conf is missing the host's server %s:\n%s", nameserver, output)
+			}
+		}
+		if strings.Contains(output, "nameserver 127.") {
+			t.Errorf("/etc/resolv.conf has a loopback server, which the container can't reach:\n%s", output)
+		}
+		observe("servers: %s", strings.Join(nameservers, ", "))
+	})
+
+	t.Run("Hosts", func(t *testing.T) {
+		explain(t, "/etc/hosts has localhost, and the container's hostname at its address")
+		output, err := r.exec("runt-feature-dns", "cat /etc/hosts")
+		mustSucceed(t, "reading /etc/hosts", output, err, "127.0.0.1\tlocalhost\n", s.IPAddress+"\trunt\n")
+		output, err = r.exec("runt-feature-dns", "getent hosts runt")
+		mustSucceed(t, "looking up the container's hostname", output, err, s.IPAddress)
+	})
+
+	t.Run("Mounted", func(t *testing.T) {
+		explain(t, "they are mounted over the container's own files, which the container can still change")
+		output, err := r.exec("runt-feature-dns", "cut -d' ' -f5 /proc/self/mountinfo; echo '192.0.2.9 added' >> /etc/hosts && getent hosts added")
+		mustSucceed(t, "listing mounts and adding to /etc/hosts", output, err, "/etc/resolv.conf\n", "/etc/hosts\n", "192.0.2.9")
+	})
+
+	t.Run("NoNetwork", func(t *testing.T) {
+		explain(t, "with --network none, /etc/hosts has only localhost")
+		output, err := r.runOnce("runt-feature-dns-none", "--rootfs", r.rootfs, "--network", "none", "--", "/bin/cat", "/etc/hosts")
+		mustSucceed(t, "reading /etc/hosts with --network none", output, err, "127.0.0.1\tlocalhost\n")
+		if strings.Contains(output, "\trunt") {
+			t.Errorf("/etc/hosts names the container, which has no address:\n%s", output)
+		}
+	})
+}
+
+// TestFeatureUserNetworks checks networks made with runt network create:
+// their containers find each other by name, and can't reach containers on
+// other networks.
+func TestFeatureUserNetworks(t *testing.T) {
+	explain(t, "User-defined networks: runt network create, where containers find each other by name, apart from other networks")
+	r := newRuntTester(t)
+	const network = "runt-feature-net"
+	const server, client, other = "runt-feature-nets-server", "runt-feature-nets-client", "runt-feature-nets-other"
+	// Whatever an earlier run left behind. Its containers go first: a
+	// network with containers on it can't be removed.
+	r.runt("rm", "-f", server, client, other)
+	r.runt("network", "rm", network)
+	output, err := r.runt("network", "create", network)
+	mustSucceed(t, "runt network create", output, err)
+	// Cleanups run last first, so this runs after the containers' own.
+	t.Cleanup(func() { r.runt("network", "rm", network) })
+	onNetwork := []string{"--rootfs", r.rootfs, "--network", network}
+	serverID := r.startWith(server, onNetwork, "/bin/sh", "-c", greetingServer)
+	r.startWith(client, onNetwork, "/bin/sleep", "600")
+	r.start(other, "/bin/sleep", "600")
+	serverState, clientState, otherState := readState(t, serverID), readState(t, containerID(t, client)), readState(t, containerID(t, other))
+	// The network's bridge, as runt network ls shows it.
+	var bridge string
+
+	t.Run("Create", func(t *testing.T) {
+		explain(t, "the network gets a subnet of its own, from 10.89.0.0/24 on, and a bridge, made when a container first joins")
+		output, err := r.runt("network", "ls")
+		mustSucceed(t, "runt network ls", output, err, network)
+		var subnet string
+		for _, line := range strings.Split(output, "\n") {
+			if fields := strings.Fields(line); len(fields) == 4 && fields[1] == network {
+				subnet, bridge = fields[2], fields[3]
+			}
+		}
+		_, ipNet, err := net.ParseCIDR(subnet)
+		if err != nil || !strings.HasPrefix(subnet, "10.89.") {
+			t.Fatalf("network %s has subnet %q, want one from 10.89.0.0/24 on:\n%s", network, subnet, output)
+		}
+		if !ipNet.Contains(net.ParseIP(serverState.IPAddress)) {
+			t.Errorf("the server has address %s, outside its network's %s", serverState.IPAddress, subnet)
+		}
+		master, err := os.Readlink(filepath.Join("/sys/class/net", hostVeth(serverID), "master"))
+		if err != nil || filepath.Base(master) != bridge {
+			t.Errorf("the server's veth is plugged into %q (%v), want the network's bridge %s", master, err, bridge)
+		}
+		observe("%s: %s on %s, with the server at %s", network, subnet, bridge, serverState.IPAddress)
+	})
+
+	t.Run("ResolvConf", func(t *testing.T) {
+		explain(t, "its containers' /etc/resolv.conf names runt's DNS server, at 127.0.0.11")
+		output, err := r.exec(client, "cat /etc/resolv.conf")
+		mustSucceed(t, "reading /etc/resolv.conf", output, err, "nameserver 127.0.0.11\n")
+	})
+
+	t.Run("ByName", func(t *testing.T) {
+		explain(t, "its containers find each other by name or ID")
+		for _, name := range []string{server, serverID, server + "." + network} {
+			output, err := r.exec(client, "getent hosts "+name)
+			mustSucceed(t, "looking up "+name, output, err, serverState.IPAddress)
+		}
+		greeting, err := r.greetingFrom(client, server)
+		mustSucceed(t, "the client connecting to the server by name", greeting, err, "you are "+clientState.IPAddress)
+		observe("%s -> %s (%s): %q", client, server, serverState.IPAddress, greeting)
+	})
+
+	t.Run("Isolated", func(t *testing.T) {
+		explain(t, "a container on another network can't find them by name, or reach them")
+		output, err := r.exec(other, "getent hosts "+server)
+		mustFail(t, "the default network's container looking up "+server, output, err, "")
+		script := fmt.Sprintf("timeout 3 bash -c 'exec 3<>/dev/tcp/%s/%d' && echo connected", serverState.IPAddress, greetingPort)
+		if output, err := r.exec(other, script); err == nil {
+			t.Errorf("the default network's container (%s) connected to the server at %s:\n%s", otherState.IPAddress, serverState.IPAddress, output)
+		}
+		rule := []string{"-C", "FORWARD", "-i", "runt+", "-o", "runt+", "-j", "DROP"}
+		if output, err := exec.Command("iptables", rule...).CombinedOutput(); err != nil {
+			t.Errorf("iptables %s: %v\n%s", strings.Join(rule, " "), err, output)
+		}
+	})
+
+	t.Run("NAT", func(t *testing.T) {
+		explain(t, "its containers reach beyond the host, as on the default network")
+		startOutside(t)
+		greeting, err := r.greetingFrom(client, outsideServerIP)
+		mustSucceed(t, "the client connecting to the outside server", greeting, err, "you are "+outsideHostIP)
+	})
+
+	t.Run("Remove", func(t *testing.T) {
+		explain(t, "runt network rm removes the network and its bridge, once no container is on it")
+		output, err := r.runt("network", "rm", network)
+		mustFail(t, "removing the network with containers on it", output, err, "has containers on it")
+		for _, name := range []string{server, client} {
+			output, err := r.runt("rm", "-f", name)
+			mustSucceed(t, "runt rm -f "+name, output, err)
+		}
+		output, err = r.runt("network", "rm", network)
+		mustSucceed(t, "runt network rm", output, err)
+		if output, _ := r.runt("network", "ls"); strings.Contains(output, network) {
+			t.Errorf("runt network ls still lists %s:\n%s", network, output)
+		}
+		if _, err := os.Stat(filepath.Join("/var/lib/runt/networks", network+".json")); err == nil {
+			t.Errorf("the network's configuration is still there")
+		}
+		if _, err := os.Stat(filepath.Join("/sys/class/net", bridge)); bridge != "" && err == nil {
+			t.Errorf("the network's bridge %s is still there", bridge)
 		}
 	})
 }

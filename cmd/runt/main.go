@@ -59,6 +59,8 @@ func main() {
 		exit("runt", login(args))
 	case "logout":
 		exit("runt", logout(args))
+	case "network":
+		exit("runt", networkCommand(args))
 	// Internal commands: runt runs itself with these.
 	case "--init":
 		exit("runt init", runtime.Init())
@@ -127,13 +129,17 @@ func containerFlags(name string) (*flag.FlagSet, *runtime.Config) {
 	flags.StringVar(&config.UserSpec, "u", "", "user to run as: USER[:GROUP], by name or ID")
 	flags.StringVar(&config.UserSpec, "user", "", "same as -u")
 	flags.StringVar(&config.Name, "name", "", "a name to refer to the container by, besides its ID")
-	flags.Func("network", "network to connect the container to: bridge (the default: an address of its own, and NAT to the outside), or none (loopback only)", func(s string) error {
-		if s != runtime.NetworkBridge && s != runtime.NetworkNone {
-			return fmt.Errorf("unknown network %q: use %s or %s", s, runtime.NetworkBridge, runtime.NetworkNone)
+	flags.StringVar(&config.Network, "network", "", "network to connect the container to: bridge (the default: an address of its own, and NAT to the outside), none (loopback only), or one made with runt network create, where containers find each other by name")
+	publish := func(s string) error {
+		mapping, err := runtime.ParsePortMapping(s)
+		if err != nil {
+			return err
 		}
-		config.Network = s
+		config.Ports = append(config.Ports, mapping)
 		return nil
-	})
+	}
+	flags.Func("p", "publish a container port on the host, [[HOSTIP:]HOSTPORT:]CONTAINERPORT[/udp], as in 8080:80 (repeatable)", publish)
+	flags.Func("publish", "same as -p", publish)
 	flags.StringVar(&config.UsernsUser, "userns-user", "", "user whose /etc/subuid and /etc/subgid ranges to map the container onto (default: the invoking user)")
 	flags.StringVar(&config.AppArmorProfile, "apparmor-profile", "", "loaded AppArmor profile to confine the command with (default: none)")
 	flags.BoolVar(&config.DebugInit, "debug-init", false, "pause the container's init process until a debugger attaches, and print its host PID")
@@ -584,17 +590,65 @@ func ps(args []string) error {
 		return err
 	}
 	table := tabwriter.NewWriter(os.Stdout, 0, 0, 3, ' ', 0)
-	fmt.Fprintln(table, "CONTAINER ID\tNAME\tCOMMAND\tCREATED\tSTATUS\tPID")
+	fmt.Fprintln(table, "CONTAINER ID\tNAME\tCOMMAND\tCREATED\tSTATUS\tPORTS\tPID")
 	now := time.Now()
 	for _, state := range states {
 		pid := ""
 		if state.Pid != 0 {
 			pid = strconv.Itoa(state.Pid)
 		}
-		fmt.Fprintf(table, "%s\t%s\t%s\t%s ago\t%s\t%s\n", state.ID, state.Name, shortCommand(state.Command),
-			humanDuration(now.Sub(state.Created)), statusText(state, now), pid)
+		var ports []string
+		for _, port := range state.Ports {
+			ports = append(ports, port.String())
+		}
+		fmt.Fprintf(table, "%s\t%s\t%s\t%s ago\t%s\t%s\t%s\n", state.ID, state.Name, shortCommand(state.Command),
+			humanDuration(now.Sub(state.Created)), statusText(state, now), strings.Join(ports, ", "), pid)
 	}
 	return table.Flush()
+}
+
+func networkCommand(args []string) error {
+	const usage = "usage: runt network create [--subnet CIDR] NAME | ls | rm NAME ..."
+	if len(args) == 0 {
+		return errors.New(usage)
+	}
+	switch args[0] {
+	case "create":
+		flags := flag.NewFlagSet("network create", flag.ContinueOnError)
+		subnet := flags.String("subnet", "", "the network's range of addresses, such as 10.90.0.0/24 (default: the first free /24 from 10.89.0.0/24 on)")
+		if err := flags.Parse(args[1:]); err != nil {
+			return err
+		}
+		if flags.NArg() != 1 {
+			return errors.New("usage: runt network create [--subnet CIDR] NAME")
+		}
+		network, err := runtime.CreateNetwork(flags.Arg(0), *subnet)
+		if err != nil {
+			return err
+		}
+		fmt.Println(network.ID)
+		return nil
+	case "ls", "list":
+		if len(args) != 1 {
+			return errors.New("usage: runt network ls")
+		}
+		networks, err := runtime.ListNetworks()
+		if err != nil {
+			return err
+		}
+		table := tabwriter.NewWriter(os.Stdout, 0, 0, 3, ' ', 0)
+		fmt.Fprintln(table, "NETWORK ID\tNAME\tSUBNET\tBRIDGE")
+		for _, network := range networks {
+			fmt.Fprintf(table, "%s\t%s\t%s\t%s\n", network.ID, network.Name, network.Subnet, network.Bridge)
+		}
+		return table.Flush()
+	case "rm", "remove":
+		if len(args) == 1 {
+			return errors.New("usage: runt network rm NAME ...")
+		}
+		return eachContainer(args[1:], runtime.RemoveNetwork)
+	}
+	return errors.New(usage)
 }
 
 func statusText(state *runtime.State, now time.Time) string {
@@ -666,10 +720,16 @@ Images:
                                               store credentials for a registry (default Docker Hub)
   logout [REGISTRY]                           remove them
 
+Networks:
+  network create [--subnet CIDR] NAME         make a network whose containers find each other by name
+  network ls                                  list networks
+  network rm NAME ...                         remove networks
+
 OPTIONS for run and create: one of
   --rootfs PATH  --image IMAGE  --bundle DIR (whose config.json gives the command)
 and any of
-  --name NAME  --network bridge|none  --userns-user NAME  --apparmor-profile NAME
+  --name NAME  --network bridge|none|NAME  -p [[HOSTIP:]HOSTPORT:]PORT[/udp]
+  --userns-user NAME  --apparmor-profile NAME
   -e NAME=VALUE  -w DIR  -u USER[:GROUP]  --entrypoint COMMAND
   --memory SIZE  --cpus N  --pids-limit N  --device-{read,write}-{bps,iops} PATH:RATE
   --debug-init
