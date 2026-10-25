@@ -2,6 +2,12 @@
 
 package runtime
 
+// AppArmor is a Linux security module: a profile loaded into the kernel
+// lists what a program may do (which files it may read or write, whether it
+// may mount filesystems, and so on), and the kernel enforces it. runt can
+// confine a container's command with one (--apparmor-profile), such as
+// apparmor/runt-default. For how to read the Go here, see doc.go.
+
 import (
 	"errors"
 	"fmt"
@@ -17,6 +23,10 @@ import (
 // thread with LockOSThread until the command has been started.
 //
 // The profile must already be loaded into the kernel (see `make apparmor`).
+//
+// The kernel takes the request through a file under /proc: writing
+// "exec PROFILE" to it means "change to PROFILE when this thread next runs a
+// program". /proc/thread-self is the calling thread's own directory.
 func applyAppArmorProfile(profile string) error {
 	enabled, err := os.ReadFile("/sys/module/apparmor/parameters/enabled")
 	if err != nil || strings.TrimSpace(string(enabled)) != "Y" {
@@ -34,6 +44,8 @@ func applyAppArmorProfile(profile string) error {
 	}
 	defer file.Close()
 
+	// The kernel answers a write naming a profile it doesn't have with
+	// ENOENT, "no such file or directory".
 	_, err = file.WriteString("exec " + profile)
 	if errors.Is(err, syscall.ENOENT) {
 		return fmt.Errorf("AppArmor profile %q is not loaded; run `make apparmor`", profile)

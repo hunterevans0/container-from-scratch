@@ -7,6 +7,11 @@ import (
 	"testing"
 )
 
+// Tests for networks_linux.go that need no root: choosing and checking
+// subnets. For how Go tests work, see "Tests" in doc.go.
+
+// mustCIDR parses a subnet, such as 10.89.0.0/24, and stops the test if it
+// can't.
 func mustCIDR(t *testing.T, cidr string) *net.IPNet {
 	t.Helper()
 	_, subnet, err := net.ParseCIDR(cidr)
@@ -16,6 +21,8 @@ func mustCIDR(t *testing.T, cidr string) *net.IPNet {
 	return subnet
 }
 
+// TestFreeSubnet checks that a new network gets the first /24 from
+// 10.89.0.0 on that nothing else has.
 func TestFreeSubnet(t *testing.T) {
 	taken := []*net.IPNet{defaultSubnet, mustCIDR(t, "10.89.0.0/24"), mustCIDR(t, "10.89.1.0/25")}
 	subnet, err := freeSubnet(taken)
@@ -31,6 +38,8 @@ func TestFreeSubnet(t *testing.T) {
 	}
 }
 
+// TestParseSubnet checks --subnet's checks: IPv4, the network's own
+// address, and room for containers.
 func TestParseSubnet(t *testing.T) {
 	if subnet, err := parseSubnet("10.90.0.0/24"); err != nil || subnet.String() != "10.90.0.0/24" {
 		t.Errorf("parseSubnet(10.90.0.0/24) = %v, %v", subnet, err)
@@ -42,6 +51,8 @@ func TestParseSubnet(t *testing.T) {
 	}
 }
 
+// TestOverlapping checks telling whether subnets share addresses: one
+// inside the other, either way round, or apart.
 func TestOverlapping(t *testing.T) {
 	taken := []*net.IPNet{defaultSubnet}
 	if other := overlapping(mustCIDR(t, "10.88.5.0/24"), taken); other != defaultSubnet {

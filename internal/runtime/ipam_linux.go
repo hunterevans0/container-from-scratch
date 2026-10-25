@@ -22,6 +22,9 @@ import (
 // the file. Taking an address nobody has used creates its file, which only
 // one process can do, so two containers starting at once never get the same
 // address. CNI's host-local plugin keeps a file per address in the same way.
+//
+// Each network has one (see bridgeNetwork.ipam in network_linux.go). For
+// how to read the Go here, see doc.go.
 type ipam struct {
 	dir    string
 	subnet *net.IPNet
@@ -41,6 +44,9 @@ func (p *ipam) reserve(id string) (*reservation, error) {
 	if err := os.MkdirAll(p.dir, 0o700); err != nil {
 		return nil, fmt.Errorf("create %s: %w", p.dir, err)
 	}
+	// A /16 has 16 bits for the network out of 32, leaving 16 for
+	// addresses, so 1 << 16 = 65536 of them. Try each in turn, from the
+	// third (n = 2) to the one before the last.
 	ones, bits := p.subnet.Mask.Size()
 	size := uint64(1) << (bits - ones)
 	for n := uint64(2); n+1 < size; n++ {
@@ -56,6 +62,12 @@ func (p *ipam) reserve(id string) (*reservation, error) {
 }
 
 // tryReserve holds ip for container id, or returns nil if it is taken.
+//
+// Three cases: no file (nobody has the address: create one, locked), a
+// file somebody holds locked (taken: return nil), or a file nobody holds
+// (its owner died: take it over). Other processes may be doing the same at
+// the same moment, so where the situation may have changed between two
+// steps, the loop starts over (continue) and looks again.
 func (p *ipam) tryReserve(ip net.IP, id string) (*reservation, error) {
 	path := filepath.Join(p.dir, ip.String())
 	for {
@@ -105,6 +117,9 @@ func (p *ipam) tryReserve(ip net.IP, id string) (*reservation, error) {
 // The file is written and locked under a temporary name and then linked to
 // path, which fails if path exists, so nobody ever sees it unlocked.
 func createLocked(path, id string) (*os.File, error) {
+	// CreateTemp makes a new file with a unique name starting .new-. A hard
+	// link (os.Link) gives the same file a second name; removing the
+	// temporary name afterwards (deferred) leaves just the address's.
 	file, err := os.CreateTemp(filepath.Dir(path), ".new-")
 	if err != nil {
 		return nil, err
@@ -122,7 +137,10 @@ func createLocked(path, id string) (*os.File, error) {
 	return file, nil
 }
 
-// samePath reports whether file is still the file at path.
+// samePath reports whether file is still the file at path, rather than one
+// that has since been removed and replaced by another of the same name.
+// os.SameFile compares the two by device and inode number, which identify
+// a file whatever its name.
 func samePath(file *os.File, path string) bool {
 	opened, err := file.Stat()
 	if err != nil {
@@ -145,21 +163,32 @@ func (r *reservation) release() error {
 }
 
 // inUse reports whether any container holds an address in the subnet: any
-// reservation file that somebody has locked.
+// reservation file that somebody has locked. runt network rm asks this
+// before removing a network.
+//
+// It tries to lock each file itself, without waiting (LOCK_NB). If that
+// fails with EWOULDBLOCK, "would have to wait", a living container holds
+// the file locked, and so the address. If it succeeds, the file is a dead
+// container's, and closing it lets go of the lock again at once.
 func (p *ipam) inUse() (bool, error) {
 	entries, err := os.ReadDir(p.dir)
 	if errors.Is(err, os.ErrNotExist) {
+		// No container ever joined.
 		return false, nil
 	}
 	if err != nil {
 		return false, err
 	}
 	for _, entry := range entries {
+		// Reservation files are named after their address. Anything else,
+		// such as a temporary file being made (see createLocked), isn't
+		// one.
 		if net.ParseIP(entry.Name()) == nil {
 			continue
 		}
 		file, err := os.Open(filepath.Join(p.dir, entry.Name()))
 		if errors.Is(err, os.ErrNotExist) {
+			// Released between listing and opening it.
 			continue
 		}
 		if err != nil {
@@ -178,7 +207,8 @@ func (p *ipam) inUse() (bool, error) {
 }
 
 // subnetAddress returns the nth address in an IPv4 subnet, counting the
-// subnet's own as 0.
+// subnet's own as 0. An IPv4 address is 4 bytes, which read as one 32-bit
+// number (big-endian, most significant byte first) can simply have n added.
 func subnetAddress(subnet *net.IPNet, n uint32) net.IP {
 	return binary.BigEndian.AppendUint32(nil, binary.BigEndian.Uint32(subnet.IP.To4())+n)
 }

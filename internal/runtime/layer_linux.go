@@ -19,6 +19,11 @@ import (
 	"time"
 )
 
+// Unpacking an image's layers into directories, for the overlay that
+// overlay_linux.go mounts. A layer is a tar archive: a sequence of entries,
+// each a header (the file's name, type, owner, mode, and times) followed by
+// its content. For how to read the Go here, see doc.go.
+
 // Whiteouts in OCI layers: an empty file .wh.NAME means NAME was deleted, and
 // .wh..wh..opq in a directory means everything below it in earlier layers is
 // hidden. overlayfs marks the same things its own way, so they are converted
@@ -72,12 +77,22 @@ func unpackImage(image *ociImage, uids, gids IDRange) ([]string, error) {
 			return nil, fmt.Errorf("unpack layer %s: %w", layer.Digest, err)
 		}
 	}
+	// The manifest lists layers bottom first; overlayfs wants them top
+	// first.
 	slices.Reverse(dirs)
 	return dirs, nil
 }
 
 // unpackLayer extracts the layer blob into dest, checking it against both its
 // digest and diffID, the digest of its uncompressed content.
+//
+// It reads the file once, through a chain of readers, each passing on what
+// it reads: the file, then a TeeReader that also feeds every byte to the
+// blob's hash, then (for a gzipped layer) the decompressor, then another
+// TeeReader feeding the uncompressed bytes to the content's hash, and
+// finally the tar reader in extractLayer. So both hashes are worked out as
+// the layer is unpacked, without reading it twice. A hash (sha256.New) is
+// fed bytes as they come, and Sum gives the result at the end.
 func unpackLayer(blob string, desc ociDescriptor, diffID, dest string, uids, gids IDRange) error {
 	compression, err := layerCompression(desc.MediaType)
 	if err != nil {
@@ -90,6 +105,8 @@ func unpackLayer(blob string, desc ociDescriptor, diffID, dest string, uids, gid
 	defer file.Close()
 	blobHash := sha256.New()
 	raw := io.TeeReader(file, blobHash)
+	// content is declared as an io.Reader, the interface, so it can hold
+	// either the raw reader or the gzip one.
 	var content io.Reader = raw
 	if compression == "gzip" {
 		gz, err := gzip.NewReader(raw)
@@ -135,6 +152,7 @@ func unpackLayer(blob string, desc ociDescriptor, diffID, dest string, uids, gid
 // attributes are skipped too; the one images use, security.capability,
 // would be ignored under no_new_privs.
 func extractLayer(r io.Reader, root string, uids, gids IDRange) error {
+	// A type can be declared inside a function, for use only there.
 	type dirTime struct {
 		path  string
 		mtime time.Time
@@ -143,6 +161,9 @@ func extractLayer(r io.Reader, root string, uids, gids IDRange) error {
 	devices := 0
 	sawRoot := false
 
+	// Next moves to the next entry and returns its header; reading from
+	// archive then reads that entry's content. io.EOF means there are no
+	// more entries.
 	archive := tar.NewReader(r)
 	for {
 		header, err := archive.Next()
@@ -152,6 +173,10 @@ func extractLayer(r io.Reader, root string, uids, gids IDRange) error {
 		if err != nil {
 			return err
 		}
+		// Putting a / in front and cleaning the path resolves every ..
+		// against that /, so ../../etc/passwd becomes /etc/passwd, which
+		// is then made relative again: it can only ever name something
+		// inside root.
 		name := strings.TrimPrefix(path.Clean("/"+header.Name), "/")
 		dir, base := path.Split(name)
 
@@ -206,6 +231,8 @@ func extractLayer(r io.Reader, root string, uids, gids IDRange) error {
 			}
 		}
 
+		// Make the entry, by its type. Entries are made with tight
+		// permissions first, and given their real owner and mode after.
 		switch header.Typeflag {
 		case tar.TypeDir:
 			if err := os.Mkdir(target, 0o700); err != nil && !errors.Is(err, os.ErrExist) {
@@ -242,6 +269,8 @@ func extractLayer(r io.Reader, root string, uids, gids IDRange) error {
 			continue
 		}
 
+		// The archive's owner is a container ID; on disk it is the host ID it
+		// maps to, Base plus the container ID.
 		if header.Uid < 0 || header.Uid >= uids.Size || header.Gid < 0 || header.Gid >= gids.Size {
 			return fmt.Errorf("%s is owned by %d:%d, outside the container's ID range", name, header.Uid, header.Gid)
 		}
@@ -312,6 +341,9 @@ func layerDir(root, dir string, uids, gids IDRange, create bool) (string, error)
 	return current, nil
 }
 
+// writeLayerFile writes a regular file's content. O_EXCL fails if anything
+// is already at target, and O_NOFOLLOW if it is a symlink, so the write
+// can't be steered elsewhere.
 func writeLayerFile(target string, content io.Reader) error {
 	file, err := os.OpenFile(target, os.O_WRONLY|os.O_CREATE|os.O_EXCL|syscall.O_NOFOLLOW, 0o600)
 	if err != nil {

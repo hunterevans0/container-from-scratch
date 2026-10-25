@@ -1,5 +1,8 @@
 package runtime
 
+// Tests for bundle.go: reading OCI runtime bundles' config.json, and
+// writing one with runt spec. For how Go tests work, see "Tests" in doc.go.
+
 import (
 	"encoding/json"
 	"os"
@@ -11,6 +14,12 @@ import (
 
 // writeBundle writes config.json into a new bundle directory, starting from
 // what WriteSpec writes and letting edit change it.
+//
+// The file is decoded into a map[string]any, rather than runtimeSpec, so
+// edit can set any field, even ones runt doesn't know. Its values are then
+// maps, slices, strings, and numbers as JSON has them, so getting at a
+// nested object takes a type assertion, as in
+// spec["process"].(map[string]any).
 func writeBundle(t *testing.T, edit func(spec map[string]any)) string {
 	t.Helper()
 	dir := t.TempDir()
@@ -89,6 +98,8 @@ func TestLoadBundle(t *testing.T) {
 // TestLoadBundleRejects checks that LoadBundle refuses what runt can't do,
 // rather than running the container differently from what config.json says.
 func TestLoadBundleRejects(t *testing.T) {
+	// A table whose cases are functions: each name maps to an edit that
+	// makes config.json ask for something runt can't do.
 	for name, edit := range map[string]func(spec map[string]any){
 		"bind mount": func(spec map[string]any) {
 			spec["mounts"] = []map[string]any{{"destination": "/data", "type": "bind", "source": "/srv"}}

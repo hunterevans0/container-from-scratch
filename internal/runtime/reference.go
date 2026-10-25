@@ -14,6 +14,9 @@ import (
 // ghcr.io/foo/bar:1 is left as it is. The first component names a registry
 // only if it has a dot or a colon (a port), or is localhost; otherwise it is
 // part of the repository, as in someuser/someimage.
+//
+// This file has no build constraint, so its tests run anywhere. For how to
+// read the Go here, see doc.go.
 
 const (
 	dockerHubDomain = "docker.io"
@@ -24,6 +27,11 @@ const (
 	dockerHubAuthKey = "https://index.docker.io/v1/"
 )
 
+// The patterns, as regular expressions, that a reference's parts must
+// match. In them, ^ and $ anchor the match to the whole string, [a-z0-9]
+// is any one of those characters, + is one or more, * zero or more, ? at
+// most one, (?:...) groups without capturing, and \w is a letter, digit, or
+// underscore. They are compiled once, when runt starts.
 var (
 	// referencePathComponent is one component of a repository path: lower
 	// case letters and digits, separated by '.', '_', '__', or runs of '-'.
@@ -46,6 +54,11 @@ type imageReference struct {
 // parseReference parses and normalizes an image reference. With neither a
 // tag nor a digest, the tag is latest. With both, the digest wins, as with
 // docker pull.
+//
+// It peels the parts off from the end: the digest after an @, then a tag
+// after the last colon, then the registry from the front, and checks what
+// is left is a valid repository path. invalid is a small helper, kept in a
+// variable, that makes each error message the same way.
 func parseReference(text string) (imageReference, error) {
 	var ref imageReference
 	invalid := func(why string) (imageReference, error) {
@@ -91,6 +104,8 @@ func parseReference(text string) (imageReference, error) {
 	if ref.Path == "" || len(ref.Domain)+1+len(ref.Path) > 255 {
 		return invalid("bad repository name")
 	}
+	// SplitSeq yields the parts one at a time to the loop, rather than
+	// making a slice of them all first.
 	for component := range strings.SplitSeq(ref.Path, "/") {
 		if !referencePathComponent.MatchString(component) {
 			return invalid("repository names are lower-case letters, digits, and separators (. _ __ -)")

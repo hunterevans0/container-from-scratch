@@ -10,6 +10,13 @@ import (
 	"testing"
 )
 
+// Tests for imagestore_linux.go: pulling into the store, finding, listing,
+// and removing images. They pull from the pretend registry in
+// registry_test.go, into a store in a temporary directory. For how Go tests
+// work, see "Tests" in doc.go.
+
+// newTestStore makes an image store in a temporary directory, rather than
+// /var/lib/runt.
 func newTestStore(t *testing.T) *imageStore {
 	dir := t.TempDir()
 	return &imageStore{
@@ -32,6 +39,9 @@ func (s *imageStore) blobCount(t *testing.T) int {
 // TestPullAndRemove pulls images into a store, looks them up by name and ID,
 // and removes them, checking what is left behind at each step.
 func TestPullAndRemove(t *testing.T) {
+	// DOCKER_CONFIG points credentials at an empty directory, so the
+	// test never reads the real ones. pull is a helper for this test only,
+	// pulling a tag and returning what it printed.
 	r := newTestRegistry(t)
 	t.Setenv("DOCKER_CONFIG", t.TempDir())
 	r.tag("v1", r.multiPlatform("one"))
@@ -64,6 +74,7 @@ func TestPullAndRemove(t *testing.T) {
 	if got := image.image.config.Config.Cmd; len(got) != 1 || got[0] != "native" {
 		t.Errorf("stored image has command %q; want this platform's", got)
 	}
+	// The first 8 hex digits of the ID, after its sha256: prefix.
 	id := image.id()
 	if byID, err := store.find(id[len("sha256:") : len("sha256:")+8]); err != nil || byID.id() != id {
 		t.Errorf("find by ID prefix: %v", err)
@@ -85,6 +96,7 @@ func TestPullAndRemove(t *testing.T) {
 		summaries[0].Repository != r.host()+"/test/app" || summaries[0].Size == 0 {
 		t.Errorf("summaries = %+v, %v", summaries, err)
 	}
+	// io.Discard is a writer that throws away whatever is written to it.
 	stateRoot := t.TempDir()
 	if err := store.remove(id, false, stateRoot, io.Discard); err == nil || !strings.Contains(err.Error(), "several names") {
 		t.Errorf("removing an image with two names by ID: %v", err)
@@ -142,6 +154,8 @@ func TestPullAndRemove(t *testing.T) {
 	if n := store.blobCount(t); n != 0 {
 		t.Errorf("the store has %d blobs left; want none", n)
 	}
+	// Each layer directory, and whether it should still be there: (err ==
+	// nil) is whether it is.
 	for dir, want := range map[string]bool{imageLayer: true, containerLayer: true, unused: false, unfinished: false} {
 		if _, err := os.Stat(dir); (err == nil) != want {
 			t.Errorf("%s exists: %v; want %v", filepath.Base(dir), err == nil, want)

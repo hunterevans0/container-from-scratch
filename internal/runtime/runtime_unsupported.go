@@ -2,6 +2,13 @@
 
 package runtime
 
+// The build constraint above, !linux, is the opposite of the other files':
+// this file is compiled only when building for anything but Linux, such as
+// Windows. It defines every function cmd/runt calls, so that runt still
+// builds there, but each one only returns errUnsupported, since containers
+// need Linux's namespaces, cgroups, and the rest. On Windows, runt runs in
+// WSL2 (see the README). For how to read the Go here, see doc.go.
+
 import (
 	"errors"
 	"io"
@@ -11,6 +18,9 @@ import (
 
 var errUnsupported = errors.New("containers require Linux; use WSL2 on Windows")
 
+// Each function's parameters are listed by type only, with no names, since
+// none of them are used. The bodies are written on one line, which Go
+// allows for short functions.
 func Run(Config) error                               { return errUnsupported }
 func Create(Config, bool) (string, error)            { return "", errUnsupported }
 func Start(string) error                             { return errUnsupported }
@@ -36,7 +46,8 @@ func CreateNetwork(string, string) (*Network, error) { return nil, errUnsupporte
 func ListNetworks() ([]Network, error)               { return nil, errUnsupported }
 func RemoveNetwork(string) error                     { return errUnsupported }
 
-// ImageSummary describes an image in the store.
+// ImageSummary describes an image in the store. On Linux it is defined in
+// imagestore_linux.go; it is needed here too because ListImages returns it.
 type ImageSummary struct {
 	Repository, Tag, Digest, ID string
 	Created                     time.Time

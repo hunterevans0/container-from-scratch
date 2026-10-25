@@ -1,5 +1,8 @@
 package runtime
 
+// Tests for resources.go: parsing --memory and the disk I/O limits. For how
+// Go tests work, see "Tests" in doc.go.
+
 import "testing"
 
 // TestParseBytes checks that ParseBytes accepts plain numbers and b/k/m/g/t

@@ -17,6 +17,12 @@ import (
 	"unsafe"
 )
 
+// Lifecycle tests: init's job as PID 1, terminals (run -it, run -dt, exec
+// -it), signals, attach, start -ai, and /dev/stdout. The terminal tests run
+// runt inside a pseudo-terminal the test makes, and type into it, as a
+// person would. For how to read these tests, see the top of
+// isolation_test.go.
+
 // output collects what a process writes, as it arrives, without ever
 // blocking the test: if the process hangs, the test fails at a deadline.
 type output struct {
@@ -43,6 +49,8 @@ func collect(t *testing.T, r io.Reader) *output {
 	return o
 }
 
+// String is what has been collected so far. The mutex keeps it from
+// reading the buffer while the collecting goroutine writes to it.
 func (o *output) String() string {
 	o.mu.Lock()
 	defer o.mu.Unlock()
@@ -61,6 +69,11 @@ func (o *output) waitFor(text string) {
 
 // terminal is a pseudo-terminal on the host for runt to run in, standing in
 // for the terminal a person would type into. Its output is what runt shows.
+// Writing to master is typing; runt's side is slave.
+//
+// *output, a field with no name, is embedded: a terminal has all of
+// output's fields and methods as its own, so term.waitFor and term.String
+// work directly.
 type terminal struct {
 	*output
 	master *os.File
@@ -113,6 +126,8 @@ func newTerminal(t *testing.T, rows, cols uint16) *terminal {
 	return term
 }
 
+// resize sets the terminal's size, as resizing its window would. The four
+// numbers are struct winsize: rows, columns, and two pixel sizes, unused.
 func (term *terminal) resize(rows, cols uint16) {
 	term.t.Helper()
 	size := [4]uint16{rows, cols, 0, 0}
@@ -134,7 +149,10 @@ func (term *terminal) run(binary string, args ...string) *exec.Cmd {
 	return command
 }
 
-// exitCode waits for command and returns its exit code.
+// exitCode waits for command and returns its exit code. Waiting happens in
+// a goroutine, which sends Wait's result on done; the select takes whichever
+// comes first, that result or the 20-second timeout, so a runt that hangs
+// fails the test rather than hanging it too.
 func exitCode(t *testing.T, command *exec.Cmd) int {
 	t.Helper()
 	done := make(chan error, 1)
@@ -182,6 +200,9 @@ func TestTerminal(t *testing.T) {
 	r := newRuntTester(t)
 	r.removeAtEnd("runt-tty")
 	term := newTerminal(t, 30, 100)
+	// The container's shell script: print its terminal and size, print the
+	// size again on each resize (SIGWINCH), and exit with 3 on Ctrl+C
+	// (SIGINT).
 	script := `tty; stty size
 trap "stty size" WINCH
 trap "echo got-int; exit 3" INT
@@ -334,6 +355,8 @@ func TestStartAttach(t *testing.T) {
 	}
 	start := exec.Command(r.binary, "start", "-ai", "runt-start-ai")
 	start.Stdin = strings.NewReader("hello\n")
+	// The anonymous function is called on the spot (note the () after its
+	// body), to start runt and wait for its exit code in one expression.
 	var stdout, stderr strings.Builder
 	start.Stdout, start.Stderr = &stdout, &stderr
 	if code := func() int {

@@ -1,5 +1,12 @@
 package runtime
 
+// A container runs in a user namespace, where its user IDs are mapped onto a
+// range of the host's: container root (ID 0) is, say, host user 100000, an
+// ordinary unprivileged user on the host, and container ID 1 is host 100001,
+// and so on. /etc/subuid and /etc/subgid say which ranges each host user may
+// use, and this file reads them. It has no build constraint, so its tests run
+// anywhere. For how to read the Go here, see doc.go.
+
 import (
 	"bufio"
 	"fmt"
@@ -21,7 +28,8 @@ type IDRange struct {
 var defaultIDRange = IDRange{Base: 100000, Size: 65536}
 
 // usernsUser picks whose subordinate ID range to use: the user asked for, else
-// whoever ran sudo, else the current user.
+// whoever ran sudo, else the current user. sudo sets SUDO_USER to the name
+// of the user who ran it, since runt itself then runs as root.
 func usernsUser(requested string) string {
 	if requested != "" {
 		return requested
@@ -41,6 +49,8 @@ func subIDRange(path, user string, explicit bool) (IDRange, error) {
 		if os.IsNotExist(err) && !explicit {
 			return defaultIDRange, nil
 		}
+		// IDRange{} is an IDRange with every field zero, returned alongside
+		// an error, which callers check first.
 		return IDRange{}, err
 	}
 	defer file.Close()
@@ -61,6 +71,11 @@ func subIDRange(path, user string, explicit bool) (IDRange, error) {
 // parseSubID returns the first range belonging to user. Each line is
 // "name:start:count" (see subuid(5)), where name is a login name or a
 // numeric ID.
+//
+// It reads from an io.Reader, an interface for anything that can be read
+// from, rather than a file by name, so the tests can hand it a string. A
+// bufio.Scanner reads it a line at a time: Scan moves to the next line, and
+// returns false at the end, or on an error, which Err then reports.
 func parseSubID(r io.Reader, user string) (IDRange, bool, error) {
 	scanner := bufio.NewScanner(r)
 	for scanner.Scan() {

@@ -1,5 +1,8 @@
 package runtime
 
+// Tests for subid.go: reading /etc/subuid-style files, and picking whose
+// range to use. For how Go tests work, see "Tests" in doc.go.
+
 import (
 	"os"
 	"path/filepath"
@@ -19,6 +22,9 @@ bob:165536:1000
 alice:500000:65536
 `
 
+	// The table of cases: a slice of an anonymous struct type, one element
+	// per case. strings.NewReader lets parseSubID read the file's text as
+	// if from a file.
 	tests := []struct {
 		user  string
 		want  IDRange
@@ -40,6 +46,9 @@ alice:500000:65536
 	}
 }
 
+// TestUsernsUser checks whose range usernsUser picks: the one asked for,
+// else sudo's caller, else the current user. t.Setenv sets an environment
+// variable for the rest of the test, and puts it back afterwards.
 func TestUsernsUser(t *testing.T) {
 
 	tests := []struct {

@@ -19,6 +19,25 @@ import (
 	"time"
 )
 
+// The container's life, from the host's side: making it (supervise, through
+// Run in the foreground or Create in the background), and the commands that
+// act on it afterwards: start, ps, kill, stop, and rm. What happens inside
+// the container is in runtime_linux.go (Init).
+//
+// Three processes take part in running a container:
+//
+//	runt run (or runt create, whose monitor stays behind)  -- the supervisor
+//	  `-- runt --init, cloned into new namespaces           -- the container's PID 1
+//	        `-- the container's command
+//
+// The supervisor sets up everything that has to be done from the host (the
+// filesystem, cgroup, network, and log), starts init, and then waits,
+// copying output into the log, until init exits. They talk over pipes: the
+// supervisor sends init its configuration as JSON, and init answers with a
+// line saying how far it got ("ready", "started", or "error MESSAGE").
+//
+// For how to read the Go here, see doc.go.
+
 // startFifoName is the FIFO in a container's state directory that its init
 // waits on before running the command; runt start writes to it.
 const startFifoName = "start.fifo"
@@ -28,6 +47,7 @@ const startFifoName = "start.fifo"
 // points this at monitor.log in the state directory.
 var warnOutput io.Writer = os.Stderr
 
+// warn reports a problem that isn't worth failing over.
 func warn(err error) {
 	fmt.Fprintln(warnOutput, "runt: warning:", err)
 }
@@ -47,8 +67,15 @@ func Run(config Config) error {
 // and remove its cgroup, long after this command returns. That is a monitor
 // process (like containerd-shim or conmon): runt again, with --monitor, in a
 // session of its own so it is not tied to this terminal.
+//
+// The two talk over two pipes: runt sends the monitor the request (the
+// configuration, as JSON) on one, and the monitor answers on the other once
+// the container is made, or has failed to be. A pipe is a one-way channel
+// between processes: what is written to one end can be read from the other.
 func Create(config Config, start bool) (string, error) {
 	// The monitor runs in "/", so a relative path would change meaning.
+	// paths holds pointers to the fields to make absolute, so the loop can
+	// change the fields themselves through them (*path = ...).
 	paths := []*string{&config.Rootfs}
 	if config.Image != "" && isLayoutRef(config.Image) {
 		paths = append(paths, &config.Image)
@@ -70,6 +97,10 @@ func Create(config Config, start bool) (string, error) {
 	if err != nil {
 		return "", err
 	}
+	// /proc/self/exe is the running program itself: runt starts another
+	// copy of runt. --monitor makes main call Monitor. ExtraFiles become
+	// the monitor's descriptors 3 and 4, and Setsid puts it in a session of
+	// its own.
 	monitor := exec.Command("/proc/self/exe", "--monitor")
 	monitor.Dir = "/"
 	monitor.ExtraFiles = []*os.File{requestR, replyW}
@@ -104,11 +135,13 @@ func Create(config Config, start bool) (string, error) {
 	return reply.ID, nil
 }
 
+// monitorRequest is what Create sends the monitor.
 type monitorRequest struct {
 	Config Config `json:"config"`
 	Start  bool   `json:"start"`
 }
 
+// monitorReply is what the monitor sends back.
 type monitorReply struct {
 	ID    string `json:"id,omitempty"`
 	Error string `json:"error,omitempty"`
@@ -131,6 +164,10 @@ func Monitor() error {
 		return fmt.Errorf("read container config: %w", err)
 	}
 
+	// reply answers runt create, once only. It is passed to supervise as
+	// its ready function, so supervise can answer as soon as the container
+	// exists and then carry on supervising it, long after runt create has
+	// returned.
 	replied := false
 	reply := func(id string, err error) {
 		if replied {
@@ -168,6 +205,20 @@ func Monitor() error {
 // ready, if set, is called once: when the container has been created (and,
 // with autoStart, when its command is running), or with the reason it
 // failed.
+//
+// It is a long function, as the steps share much, and it reads top to
+// bottom in the order they happen:
+//
+//  1. Work out the filesystem: an image's layers, or a rootfs.
+//  2. Make the state directory, and from there on, the cleanups: each step
+//     that makes something defers its undoing, so a failure at any later
+//     step, or the container's exit, undoes everything in reverse order.
+//  3. Mount the overlay, make the cgroup, join the network.
+//  4. Make the pipes and FIFO init uses, and connect its input and output.
+//  5. Start init, in new namespaces and the cgroup, and make its veth pair.
+//  6. Send init its configuration, and wait for "ready".
+//  7. Start the command (or leave that to runt start), and wait for init
+//     to exit (finish).
 func supervise(config Config, foreground, autoStart bool, ready func(id string, err error)) error {
 	if foreground && config.Interactive && config.Tty && !isTerminal(os.Stdin) {
 		return errors.New("the input device is not a terminal; use -t without -i, or run from a terminal")
@@ -232,6 +283,8 @@ func supervise(config Config, foreground, autoStart bool, ready func(id string, 
 			return err
 		}
 	}
+	// Whether a network of another name exists is found out when the
+	// container joins it (see joinNetwork in network_linux.go).
 	if config.Network == "" {
 		config.Network = NetworkBridge
 	}
@@ -248,7 +301,8 @@ func supervise(config Config, foreground, autoStart bool, ready func(id string, 
 	}
 	dir := stateDir(StateRoot, id)
 	// A container that never gets as far as being set up leaves no state
-	// behind.
+	// behind. The deferred function runs when supervise returns, and reads
+	// keepState as it is then, which is set to true once init is ready.
 	keepState := false
 	defer func() {
 		if !keepState {
@@ -326,7 +380,11 @@ func supervise(config Config, foreground, autoStart bool, ready func(id string, 
 
 	// The container's address and published ports are held until it exits.
 	// Its veth pair is made once init, and so its network namespace,
-	// exists.
+	// exists. network stays nil with --network none. leaveNetwork starts as
+	// a function that does nothing, so it can be called either way;
+	// sync.OnceFunc below makes one that does its work only the first time
+	// it is called, since it is called both when the container exits and,
+	// deferred, when supervise returns.
 	var network *containerNetwork
 	leaveNetwork := func() {}
 	if config.Network != NetworkNone {
@@ -393,6 +451,10 @@ func supervise(config Config, foreground, autoStart bool, ready func(id string, 
 	defer logFile.Close()
 	log := &logWriter{file: logFile}
 
+	// Init is runt again, with --init. SysProcAttr says how the kernel
+	// makes the new process: Cloneflags lists the new namespaces it gets,
+	// one flag each, combined with |; UidMappings and GidMappings set up
+	// its user namespace's ID mapping (container 0.. onto host Base..).
 	command := exec.Command("/proc/self/exe", "--init")
 	command.ExtraFiles = extraFiles
 	command.SysProcAttr = &syscall.SysProcAttr{
@@ -446,6 +508,8 @@ func supervise(config Config, foreground, autoStart bool, ready func(id string, 
 	// pseudo-terminal, below, and these pipes only carry what init itself
 	// prints. With -i, input is runt's own in the foreground, and in the
 	// background a pipe held open for runt attach. Otherwise it is empty.
+	// copies counts the goroutines copying output, so the supervisor can
+	// wait for the last of it before recording the exit.
 	var copies sync.WaitGroup
 	if config.Interactive && !config.Tty {
 		if foreground {
@@ -471,6 +535,8 @@ func supervise(config Config, foreground, autoStart bool, ready func(id string, 
 		}
 		outputs[i] = w
 		childEnds = append(childEnds, w)
+		// io.MultiWriter makes one writer that writes to several: here,
+		// the attached clients and runt's own output.
 		passthrough := hub.output(kinds[i])
 		if foreground {
 			passthrough = io.MultiWriter(passthrough, ours)
@@ -490,6 +556,8 @@ func supervise(config Config, foreground, autoStart bool, ready func(id string, 
 	// Signals such as SIGTERM would otherwise kill runt before it records
 	// that the container stopped and removes its cgroup. Pass them on to the
 	// container's init instead, which passes them to the command.
+	// signal.Notify delivers these signals on the channel instead of
+	// letting them end runt; a goroutine started below passes each on.
 	signals := make(chan os.Signal, 1)
 	signal.Notify(signals, syscall.SIGINT, syscall.SIGTERM, syscall.SIGHUP, syscall.SIGQUIT)
 	defer func() {
@@ -497,6 +565,8 @@ func supervise(config Config, foreground, autoStart bool, ready func(id string, 
 		close(signals)
 	}()
 
+	// Start makes the new process and returns at once, without waiting for
+	// it; Wait, in finish below, waits for it to exit.
 	err = command.Start()
 	// Only init holds these now. Closing ours means the log copies end when
 	// the container's processes are gone, and init sees end-of-file on its
@@ -526,6 +596,9 @@ func supervise(config Config, foreground, autoStart bool, ready func(id string, 
 			command.Process.Signal(sig)
 		}
 	}()
+	// The configuration goes to init as JSON, written to the pipe init
+	// reads as its descriptor 5. Closing the pipe after tells init it has
+	// all of it.
 	err = json.NewEncoder(configW).Encode(initConfig{
 		Rootfs:          rootfs,
 		ReadonlyRootfs:  config.ReadonlyRootfs,
@@ -539,7 +612,9 @@ func supervise(config Config, foreground, autoStart bool, ready func(id string, 
 		UserSpec:        config.UserSpec,
 		Tty:             config.Tty,
 		Network:         networkConfig,
-		EtcFiles:        etcFiles(config.Hostname, network),
+		// /etc/hosts and /etc/resolv.conf, which init mounts into the
+		// container (see etc_linux.go).
+		EtcFiles: etcFiles(config.Hostname, network),
 	})
 	configW.Close()
 	if err != nil {
@@ -618,6 +693,8 @@ func supervise(config Config, foreground, autoStart bool, ready func(id string, 
 		return waitErr
 	}
 
+	// Read init's first status line. It comes once init has set the
+	// container up, or failed to.
 	status := bufio.NewScanner(statusR)
 	line := nextLine(status)
 	if line != "ready" {
@@ -714,6 +791,8 @@ func idRanges(config Config) (uids, gids IDRange, err error) {
 }
 
 // exitCodeError is an error that runt reports with a particular exit code.
+// Any type with an Error method is an error. Unwrap lets errors.Is and
+// errors.As look through it to the error it wraps.
 type exitCodeError struct {
 	err  error
 	code int
@@ -746,6 +825,8 @@ func initAlive(pid int) bool {
 	if pid <= 0 {
 		return false
 	}
+	// /proc/<pid>/cmdline holds a process's command line, its arguments
+	// separated by zero bytes (written \x00).
 	cmdline, err := os.ReadFile(fmt.Sprintf("/proc/%d/cmdline", pid))
 	return err == nil && bytes.HasPrefix(cmdline, []byte("/proc/self/exe\x00--init\x00"))
 }
@@ -792,7 +873,10 @@ func Start(ref string) error {
 		return err
 	}
 
-	// The monitor records whether the command started.
+	// The monitor records whether the command started. A Go for loop has
+	// three parts, as in C: one that runs first (set the deadline), the
+	// test before each round (not past it yet), and one that runs after
+	// each round (wait 50ms).
 	for deadline := time.Now().Add(10 * time.Second); time.Now().Before(deadline); time.Sleep(50 * time.Millisecond) {
 		current, err := loadState(StateRoot, state.ID)
 		if err != nil {
@@ -857,6 +941,7 @@ func Stop(ref string, timeout time.Duration) error {
 	if state.Status == StatusStopped {
 		return nil
 	}
+	// ESRCH, "no such process": it has exited already.
 	if err := syscall.Kill(state.Pid, syscall.SIGTERM); err != nil && !errors.Is(err, syscall.ESRCH) {
 		return fmt.Errorf("stop container %s: %w", state.ID, err)
 	}

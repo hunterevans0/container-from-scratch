@@ -1,5 +1,8 @@
 package runtime
 
+// Tests for reference.go: parsing image names. For how Go tests work, see
+// "Tests" in doc.go.
+
 import (
 	"strings"
 	"testing"
@@ -9,6 +12,8 @@ import (
 // Docker Hub by default, library/ for its official images, and latest when
 // there is no tag.
 func TestParseReference(t *testing.T) {
+	// A made-up digest: "ab" 32 times is 64 hex digits. Each case maps a
+	// reference to an array of two strings, [2]string.
 	digest := "sha256:" + strings.Repeat("ab", 32)
 	for text, want := range map[string][2]string{
 		// The full reference, and the familiar one.

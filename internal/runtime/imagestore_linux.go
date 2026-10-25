@@ -30,10 +30,16 @@ import (
 //     saved;
 //   - runt rmi holds it exclusively while it untags images and removes
 //     blobs and unpacked layers that nothing uses any more.
+//
+// For how to read the Go here, see doc.go.
 
-// errNoSuchImage means the store has no image by that name or ID.
+// errNoSuchImage means the store has no image by that name or ID. It is a
+// single error value, made once, so callers can recognize it with
+// errors.Is, even after it has been wrapped with more detail.
 var errNoSuchImage = errors.New("no such image")
 
+// imageStore is where the store's files are. It is a struct, rather than
+// constants, so the tests can make a store in a temporary directory.
 type imageStore struct {
 	// dir is the OCI image layout.
 	dir string
@@ -46,6 +52,7 @@ type imageStore struct {
 	layers string
 }
 
+// defaultImageStore is the store under /var/lib/runt that runt uses.
 func defaultImageStore() *imageStore {
 	return &imageStore{
 		dir:      DataRoot + "/images",
@@ -69,10 +76,14 @@ func (s *imageStore) lock(exclusive bool) (func(), error) {
 	return unlock, nil
 }
 
+// blobPath is where the blob with digest is, or would be, in the store. It
+// borrows ociImage's method by making an ociImage for the store's layout on
+// the spot.
 func (s *imageStore) blobPath(digest string) (string, error) {
 	return (&ociImage{layout: s.dir}).blobPath(digest)
 }
 
+// hasBlob reports whether the store has the blob with digest.
 func (s *imageStore) hasBlob(digest string) bool {
 	path, err := s.blobPath(digest)
 	if err != nil {
@@ -139,7 +150,9 @@ type storedImage struct {
 	image *ociImage
 }
 
-// id is the image's ID: the digest of its configuration.
+// id is the image's ID: the digest of its configuration. The method's
+// receiver is a storedImage, not a pointer to one, so it gets a copy, which
+// is fine for reading.
 func (image storedImage) id() string {
 	return image.image.manifest.Config.Digest
 }
@@ -162,6 +175,8 @@ func (s *imageStore) list() ([]storedImage, error) {
 	return images, nil
 }
 
+// imageIDPrefix matches an image ID or the start of one: an optional
+// sha256:, then 1 to 64 hex digits.
 var imageIDPrefix = regexp.MustCompile(`^(?:sha256:)?[0-9a-f]{1,64}$`)
 
 // find looks an image up by name, such as alpine:3.20, or by its ID or the
@@ -175,6 +190,8 @@ func (s *imageStore) find(text string) (storedImage, error) {
 	if len(matches) == 0 {
 		return storedImage{}, fmt.Errorf("%w: %s", errNoSuchImage, text)
 	}
+	// Several matches are fine if they are all the same image, under
+	// different names. matches[1:] is every match but the first.
 	for _, match := range matches[1:] {
 		if match.id() != matches[0].id() {
 			return storedImage{}, fmt.Errorf("%q matches more than one image; use more of the ID", text)
@@ -255,6 +272,12 @@ func Pull(ref string, out io.Writer) error {
 	return defaultImageStore().pull(parsed, out)
 }
 
+// pull does Pull's work, in two halves. First, with the lock shared, so
+// other pulls and containers can carry on, it downloads into a temporary
+// directory of its own: the manifest (following an index to this
+// platform's), the configuration, and each layer the store doesn't already
+// have. Then, with the lock exclusive, it moves what it downloaded into the
+// store and adds the image to index.json.
 func (s *imageStore) pull(ref imageReference, out io.Writer) error {
 	unlock, err := s.lock(false)
 	if err != nil {
@@ -270,7 +293,7 @@ func (s *imageStore) pull(ref imageReference, out io.Writer) error {
 	}
 	defer os.RemoveAll(tmp)
 	// Downloaded blobs, by digest, waiting in tmp to be moved into the
-	// store.
+	// store. save writes a blob already in memory there, and records it.
 	downloaded := map[string]string{}
 	save := func(desc ociDescriptor, data []byte) error {
 		path := filepath.Join(tmp, strings.TrimPrefix(desc.Digest, "sha256:"))
@@ -344,6 +367,8 @@ func (s *imageStore) pull(ref imageReference, out io.Writer) error {
 		}
 	}
 
+	// Looking up a key a map doesn't have gives the zero value, "" for a
+	// string, so downloaded[digest] != "" asks whether it was downloaded.
 	for _, layer := range manifest.Layers {
 		short := shortDigest(layer.Digest)
 		if s.hasBlob(layer.Digest) || downloaded[layer.Digest] != "" {
@@ -390,6 +415,8 @@ func (s *imageStore) pull(ref imageReference, out io.Writer) error {
 		}
 	}
 
+	// The new index: every entry but the one under this name, if any, and
+	// then a new entry for it.
 	name := ref.String()
 	upToDate := false
 	var kept []ociDescriptor
@@ -439,6 +466,8 @@ func shortDigest(digest string) string {
 }
 
 // HumanSize formats a size in decimal units, as Docker shows image sizes.
+// It divides by 1000 until the number is under 1000, and %.3g prints it with
+// three significant digits, as in 12.3MB.
 func HumanSize(n int64) string {
 	units := []string{"B", "kB", "MB", "GB", "TB"}
 	size := float64(n)
@@ -472,6 +501,7 @@ func ListImages() ([]ImageSummary, error) {
 	return defaultImageStore().summaries()
 }
 
+// summaries does ListImages's work, for this store.
 func (s *imageStore) summaries() ([]ImageSummary, error) {
 	unlock, err := s.lock(false)
 	if err != nil {
@@ -544,6 +574,8 @@ func (s *imageStore) remove(ref string, force bool, stateRoot string, out io.Wri
 			return fmt.Errorf("%q matches more than one image; use more of the ID", ref)
 		}
 	}
+	// untag is a set of the names to remove: a map whose keys are the
+	// names, each mapped to true.
 	untag := map[string]bool{}
 	var names []string
 	for _, match := range matches {
@@ -605,6 +637,11 @@ func (s *imageStore) remove(ref string, force bool, stateRoot string, out io.Wri
 // store nor one of the containers in states uses, and leftovers of pulls and
 // unpacking that never finished. The caller holds the lock exclusively, so
 // nothing is being pulled or unpacked.
+//
+// It works as a "mark and sweep" garbage collector does: first mark every
+// blob reachable from index.json (each manifest, and the configuration and
+// layers it names, following indexes down), then sweep away every blob
+// that wasn't marked.
 func (s *imageStore) collectGarbage(layers bool, states []*State) error {
 	index, err := s.readIndex()
 	if err != nil {
@@ -613,6 +650,8 @@ func (s *imageStore) collectGarbage(layers bool, states []*State) error {
 	keep := map[string]bool{}
 	keepLayers := map[string]bool{}
 	layout := &ociImage{layout: s.dir}
+	// mark calls itself for an index's entries, so it is declared first
+	// (var mark ...) and then given its body, which can then refer to it.
 	var mark func(desc ociDescriptor, depth int)
 	mark = func(desc ociDescriptor, depth int) {
 		keep[strings.TrimPrefix(desc.Digest, "sha256:")] = true

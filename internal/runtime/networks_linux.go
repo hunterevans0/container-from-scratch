@@ -2,6 +2,10 @@
 
 package runtime
 
+// User-defined networks: runt network create, ls, and rm, and how a network
+// is found again by name when a container joins it (see joinNetwork in
+// network_linux.go). For how to read the Go here, see doc.go.
+
 import (
 	"encoding/json"
 	"errors"
@@ -23,11 +27,17 @@ import (
 const networkConfigRoot = "/var/lib/runt/networks"
 
 // lockNetworks locks the networks' configuration, shared or exclusive. It
-// returns a function that releases the lock.
+// returns a function that releases the lock. A shared lock, for reading,
+// can be held by many processes at once; an exclusive one, for changing
+// networks, only by one, and only while nobody holds a shared one. Callers
+// usually defer the function they get back, so the lock is released when
+// they return.
 func lockNetworks(exclusive bool) (func(), error) {
 	if err := os.MkdirAll(networkConfigRoot, 0o700); err != nil {
 		return nil, fmt.Errorf("create %s: %w", networkConfigRoot, err)
 	}
+	// The name starts with a dot so it can't clash with a network's file:
+	// network names must start with a letter or digit.
 	unlock, err := lockFile(filepath.Join(networkConfigRoot, ".lock"), exclusive)
 	if err != nil {
 		return nil, fmt.Errorf("lock networks: %w", err)
@@ -41,7 +51,8 @@ func networkConfigPath(name string) string {
 
 // readNetwork reads the configuration of the network called name.
 func readNetwork(name string) (*Network, error) {
-	// A name such as ../x would lead out of networkConfigRoot.
+	// A name such as ../x would lead out of networkConfigRoot. validName
+	// (in state.go) is the pattern container names must match too.
 	if !validName.MatchString(name) {
 		return nil, fmt.Errorf("no such network: %s", name)
 	}
@@ -52,6 +63,9 @@ func readNetwork(name string) (*Network, error) {
 	if err != nil {
 		return nil, err
 	}
+	// json.Unmarshal fills in the struct from the JSON, matching keys to
+	// fields by their tags (see Network, in runtime.go). It needs a pointer,
+	// &network, to be able to change the variable.
 	var network Network
 	if err := json.Unmarshal(data, &network); err != nil {
 		return nil, fmt.Errorf("parse network %s: %w", name, err)
@@ -69,6 +83,9 @@ func loadNetwork(name string) (*bridgeNetwork, error) {
 	return network.bridgeNetwork()
 }
 
+// bridgeNetwork turns a network's saved configuration, which keeps its
+// subnet as text, into the form the rest of the code works with. Network is
+// the exported type, which cmd/runt sees; bridgeNetwork is runt's own.
 func (n *Network) bridgeNetwork() (*bridgeNetwork, error) {
 	_, subnet, err := net.ParseCIDR(n.Subnet)
 	if err != nil {
@@ -79,6 +96,7 @@ func (n *Network) bridgeNetwork() (*bridgeNetwork, error) {
 
 // userNetworks reads every network made with runt network create, by name.
 func userNetworks() ([]Network, error) {
+	// Glob lists the files matching a pattern, as a shell's * does.
 	paths, err := filepath.Glob(filepath.Join(networkConfigRoot, "*.json"))
 	if err != nil {
 		return nil, err
@@ -89,8 +107,12 @@ func userNetworks() ([]Network, error) {
 		if err != nil {
 			return nil, err
 		}
+		// network is a pointer; *network is the Network it points to,
+		// which append copies into the slice.
 		networks = append(networks, *network)
 	}
+	// sort.Slice sorts with a function that says whether element i goes
+	// before element j.
 	sort.Slice(networks, func(i, j int) bool { return networks[i].Name < networks[j].Name })
 	return networks, nil
 }
@@ -113,6 +135,10 @@ func checkNetworkName(name string) error {
 // addresses, or, if empty, the first free /24 from 10.89.0.0/24 on, as
 // Podman picks. The network's bridge is made when a container first needs
 // it.
+//
+// All it does now is choose the network's subnet, ID, and bridge name, and
+// save them. The exclusive lock keeps two runt network create commands from
+// choosing the same subnet, or name, at once.
 func CreateNetwork(name, subnet string) (*Network, error) {
 	if err := checkNetworkName(name); err != nil {
 		return nil, err
@@ -129,6 +155,9 @@ func CreateNetwork(name, subnet string) (*Network, error) {
 	if err != nil {
 		return nil, err
 	}
+	// The subnets the new network mustn't overlap. Two networks sharing
+	// addresses would confuse the host's routing: it couldn't tell which
+	// bridge an address is behind.
 	taken := []*net.IPNet{defaultSubnet}
 	for _, network := range networks {
 		if _, subnet, err := net.ParseCIDR(network.Subnet); err == nil {
@@ -145,7 +174,11 @@ func CreateNetwork(name, subnet string) (*Network, error) {
 		}
 	} else {
 		// Nor any of the host's own networks, so the host can still reach
-		// them.
+		// them. InterfaceAddrs lists the addresses of the host's interfaces,
+		// each with its network's mask, such as 192.168.1.20/24; Mask makes
+		// that the network itself, 192.168.1.0/24. The ", ok" form of a
+		// type assertion reports whether the value holds that type, rather
+		// than crashing if it doesn't.
 		if addresses, err := net.InterfaceAddrs(); err == nil {
 			for _, address := range addresses {
 				if ipNet, ok := address.(*net.IPNet); ok && ipNet.IP.To4() != nil {
@@ -174,6 +207,8 @@ func CreateNetwork(name, subnet string) (*Network, error) {
 	if err != nil {
 		return nil, err
 	}
+	// Written under another name and then renamed into place, so nobody
+	// ever reads a half-written file: a rename happens all at once.
 	temp := networkConfigPath(name) + ".tmp"
 	if err := os.WriteFile(temp, append(data, '\n'), 0o600); err != nil {
 		return nil, fmt.Errorf("save network %s: %w", name, err)
@@ -193,11 +228,15 @@ func parseSubnet(s string) (*net.IPNet, error) {
 	if ip.To4() == nil {
 		return nil, fmt.Errorf("invalid subnet %q: only IPv4 networks are supported", s)
 	}
+	// 10.90.0.1/24 names an address within 10.90.0.0/24, not the network
+	// itself, which is probably a mistake.
 	if !ip.Equal(subnet.IP) {
 		return nil, fmt.Errorf("invalid subnet %q: did you mean %s?", s, subnet)
 	}
 	// The subnet's own address, the gateway's, and the broadcast address
-	// leave the rest for containers.
+	// leave the rest for containers. Size returns the mask's length (the
+	// number after the /) and the address's, of which only the first is
+	// needed here.
 	if ones, _ := subnet.Mask.Size(); ones > 30 {
 		return nil, fmt.Errorf("invalid subnet %q: it leaves no addresses for containers; use /30 or larger", s)
 	}
@@ -205,7 +244,8 @@ func parseSubnet(s string) (*net.IPNet, error) {
 }
 
 // overlapping returns the first of others that shares addresses with
-// subnet, or nil.
+// subnet, or nil. Two subnets are either apart or one is inside the other,
+// in which case one contains the other's first address.
 func overlapping(subnet *net.IPNet, others []*net.IPNet) *net.IPNet {
 	for _, other := range others {
 		if subnet.Contains(other.IP) || other.Contains(subnet.IP) {
@@ -249,6 +289,9 @@ func ListNetworks() ([]Network, error) {
 // RemoveNetwork removes a network made with CreateNetwork, along with its
 // bridge and iptables rules, if a container ever made them. Containers that
 // are created or running must leave it first.
+//
+// The exclusive lock waits for any container that is joining the network
+// (see joinNetwork) to have reserved its address, which inUse then sees.
 func RemoveNetwork(name string) error {
 	if name == NetworkBridge || name == NetworkNone {
 		return fmt.Errorf("the %s network is built in, and can't be removed", name)
@@ -275,6 +318,8 @@ func RemoveNetwork(name string) error {
 	}
 	err = conn.deleteLink(network.bridge)
 	conn.Close()
+	// ENODEV: no such device. No container ever joined, so there is no
+	// bridge, or a reboot took it.
 	if err != nil && !errors.Is(err, syscall.ENODEV) {
 		return fmt.Errorf("delete bridge %s: %w", network.bridge, err)
 	}

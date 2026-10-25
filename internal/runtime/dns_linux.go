@@ -2,6 +2,11 @@
 
 package runtime
 
+// For how to read the Go here, see doc.go.
+
+// The import of runtime as goruntime renames Go's own runtime package, which
+// controls goroutines and threads, because this package is called runtime
+// too.
 import (
 	"bytes"
 	"encoding/binary"
@@ -35,6 +40,20 @@ import (
 // series of labels each preceded by its length and ending with an empty
 // one, then a type (1 is A, an IPv4 address) and a class (1 is IN, the
 // internet). Over TCP, each message is preceded by its length.
+//
+// For example, a question for web.mynet's address is the bytes
+//
+//	3 'w' 'e' 'b' 5 'm' 'y' 'n' 'e' 't' 0   0 1   0 1
+//
+// the two labels, the empty one that ends the name, type 1 (A), and class 1
+// (IN), each number in two bytes, most significant first ("big-endian",
+// which is what binary.BigEndian reads and writes).
+//
+// Where a question goes, as answer handles it:
+//
+//	container's program -> 127.0.0.11:53 (in the container) -> answer
+//	   a container's name: reply with its address, from its state.json
+//	   anything else: forward -> the host's DNS servers -> their reply
 
 const (
 	// dnsAddress is the DNS server's address in the container, the same
@@ -58,7 +77,9 @@ type dnsServer struct {
 	// name may be followed by, as in web.mynet.
 	network string
 	// lookup returns the address of the container called name on the
-	// network, or nil if there is none.
+	// network, or nil if there is none. It is a field holding a function,
+	// rather than a call to lookupContainer, so the tests can give the
+	// server a pretend list of containers.
 	lookup func(name string) net.IP
 	// upstreams are the host's DNS servers, as host:port.
 	upstreams []string
@@ -67,7 +88,8 @@ type dnsServer struct {
 }
 
 // startDNS starts a DNS server for the container whose init is pid, on
-// network.
+// network. It returns once the sockets are ready; the serving goes on in two
+// goroutines, one for UDP and one for TCP, until close.
 func startDNS(pid int, network string) (*dnsServer, error) {
 	s := &dnsServer{
 		network:   network,
@@ -83,6 +105,8 @@ func startDNS(pid int, network string) (*dnsServer, error) {
 	return s, nil
 }
 
+// close stops the server. The serving goroutines see their sockets closed
+// and return.
 func (s *dnsServer) close() {
 	s.udp.Close()
 	s.tcp.Close()
@@ -104,7 +128,8 @@ func hostNameservers() []string {
 
 // lookupContainer returns the address of the container on network called
 // name (in any case, as DNS names are), or with that ID, if it is created
-// or running.
+// or running. It reads every container's state.json each time, so it always
+// sees containers as they come and go, and needs nothing kept up to date.
 func lookupContainer(network, name string) net.IP {
 	if name == "" {
 		return nil
@@ -114,6 +139,9 @@ func lookupContainer(network, name string) net.IP {
 		return nil
 	}
 	for _, state := range states {
+		// Skip containers on other networks, stopped ones (whose address
+		// is cleared), and ones with other names. EqualFold compares
+		// without regard to case.
 		if state.Network != network || state.IPAddress == "" || !(strings.EqualFold(state.Name, name) || state.ID == name) {
 			continue
 		}
@@ -139,9 +167,17 @@ const ipFreebind = 15
 // The container's loopback interface doesn't have 127.0.0.11 yet, nor any
 // address: they come once init brings it up, which hasn't happened yet.
 // IP_FREEBIND binds the address regardless.
+//
+// A socket made by a system call is a file descriptor, a plain number. Once
+// made, they are wrapped in the net package's types, which the rest of the
+// server uses as it would any other socket.
 func listenDNS(pid int) (net.PacketConn, net.Listener, error) {
 	var udp, tcp int
+	// The anonymous function runs inside the container's namespace, and
+	// sets udp and tcp, which it shares with listenDNS.
 	err := inNetworkNamespace(pid, func() error {
+		// [4]byte(...) turns the 4-byte slice of the address into an
+		// array of exactly 4 bytes, as the socket address wants.
 		address := &syscall.SockaddrInet4{Port: 53, Addr: [4]byte(net.ParseIP(dnsAddress).To4())}
 		var err error
 		if udp, err = boundSocket(syscall.SOCK_DGRAM, address); err != nil {
@@ -151,6 +187,7 @@ func listenDNS(pid int) (net.PacketConn, net.Listener, error) {
 			syscall.Close(udp)
 			return err
 		}
+		// listen makes a TCP socket accept connections.
 		if err = syscall.Listen(tcp, syscall.SOMAXCONN); err != nil {
 			syscall.Close(udp)
 			syscall.Close(tcp)
@@ -160,7 +197,8 @@ func listenDNS(pid int) (net.PacketConn, net.Listener, error) {
 	if err != nil {
 		return nil, nil, err
 	}
-	// The net package's File functions take a copy of the descriptor.
+	// The net package's File functions take a copy of the descriptor, so
+	// these originals are closed (deferred) once the copies exist.
 	udpFile, tcpFile := os.NewFile(uintptr(udp), "dns-udp"), os.NewFile(uintptr(tcp), "dns-tcp")
 	defer udpFile.Close()
 	defer tcpFile.Close()
@@ -176,7 +214,10 @@ func listenDNS(pid int) (net.PacketConn, net.Listener, error) {
 	return packets, listener, nil
 }
 
-// boundSocket makes an IPv4 socket of kind bound to address.
+// boundSocket makes an IPv4 socket of kind (SOCK_DGRAM for UDP, SOCK_STREAM
+// for TCP) bound to address. SOCK_CLOEXEC keeps the socket from passing on
+// to programs this process starts. SO_REUSEADDR lets TCP bind the address
+// even while an earlier server's connections there are still closing.
 func boundSocket(kind int, address *syscall.SockaddrInet4) (int, error) {
 	fd, err := syscall.Socket(syscall.AF_INET, kind|syscall.SOCK_CLOEXEC, 0)
 	if err != nil {
@@ -200,17 +241,28 @@ func boundSocket(kind int, address *syscall.SockaddrInet4) (int, error) {
 // of process pid. Sockets made there stay in that namespace wherever they
 // are used from. The thread never leaves the namespace: it ends with f,
 // rather than going back to run other goroutines there.
+//
+// A namespace belongs to a thread, not a whole process, and Go normally
+// moves goroutines between threads as it likes. LockOSThread pins this
+// goroutine to the thread it is on, so setns and f run on the same one.
+// The result comes back on a channel, which inNetworkNamespace waits on.
 func inNetworkNamespace(pid int, f func() error) error {
+	// A channel with room for one value, so the goroutine can send its
+	// result and end without waiting for it to be received.
 	errs := make(chan error, 1)
 	go func() {
 		// Never unlocked, so the thread ends with this goroutine.
 		goruntime.LockOSThread()
+		// Each process's namespaces appear as files under /proc/<pid>/ns.
+		// Opening one gives a handle on the namespace, which setns joins.
 		ns, err := os.Open(fmt.Sprintf("/proc/%d/ns/net", pid))
 		if err != nil {
 			errs <- err
 			return
 		}
 		defer ns.Close()
+		// syscall.Syscall makes a system call by number (see sysSetns),
+		// returning two results and an error number, 0 for success.
 		if _, _, errno := syscall.Syscall(sysSetns, ns.Fd(), syscall.CLONE_NEWNET, 0); errno != 0 {
 			errs <- fmt.Errorf("join the container's network namespace: %w", errno)
 			return
@@ -220,6 +272,9 @@ func inNetworkNamespace(pid int, f func() error) error {
 	return <-errs
 }
 
+// serveUDP answers questions over UDP, one datagram each, until the socket
+// is closed. Each question is answered in a goroutine of its own, since
+// passing one on to the host's servers can take a while.
 func (s *dnsServer) serveUDP() {
 	buffer := make([]byte, 65535)
 	for {
@@ -230,6 +285,8 @@ func (s *dnsServer) serveUDP() {
 		if err != nil {
 			continue
 		}
+		// A copy, since the buffer is reused for the next datagram while
+		// this one is being answered.
 		query := bytes.Clone(buffer[:n])
 		go func() {
 			if reply := s.answer(query, false); reply != nil {
@@ -239,6 +296,10 @@ func (s *dnsServer) serveUDP() {
 	}
 }
 
+// serveTCP answers questions over TCP, until the socket is closed. Clients
+// use TCP for answers too big for a UDP reply, and may ask several questions
+// on one connection, so each connection gets a goroutine that answers until
+// the client stops or goes quiet for dnsTimeout.
 func (s *dnsServer) serveTCP() {
 	for {
 		conn, err := s.tcp.Accept()
@@ -267,9 +328,11 @@ func (s *dnsServer) serveTCP() {
 }
 
 // readDNSMessage reads a message from a TCP connection, where each comes
-// after its length, in 2 bytes.
+// after its length, in 2 bytes. io.ReadFull keeps reading until it has
+// filled the buffer, since TCP may deliver a message in pieces.
 func readDNSMessage(r io.Reader) ([]byte, error) {
 	var length [2]byte
+	// length[:] is a slice of the whole array, which ReadFull fills.
 	if _, err := io.ReadFull(r, length[:]); err != nil {
 		return nil, err
 	}
@@ -280,6 +343,7 @@ func readDNSMessage(r io.Reader) ([]byte, error) {
 	return message, nil
 }
 
+// writeDNSMessage writes a message to a TCP connection, after its length.
 func writeDNSMessage(w io.Writer, message []byte) error {
 	_, err := w.Write(append(binary.BigEndian.AppendUint16(nil, uint16(len(message))), message...))
 	return err
@@ -294,6 +358,7 @@ func (s *dnsServer) answer(query []byte, tcp bool) []byte {
 		return nil
 	}
 	if question.class == dnsClassIN {
+		// web.mynet means the container web, on mynet.
 		if ip := s.lookup(strings.TrimSuffix(question.name, "."+s.network)); ip != nil {
 			// The name exists. A container has no other kind of address,
 			// so a question about any other type of record, such as AAAA
@@ -307,6 +372,8 @@ func (s *dnsServer) answer(query []byte, tcp bool) []byte {
 	}
 	reply, err := s.forward(query, tcp)
 	if err != nil {
+		// SERVFAIL tells the client the server couldn't answer, so it can
+		// give up at once rather than wait.
 		return dnsReply(query, question, dnsRcodeServFail, nil)
 	}
 	return reply
@@ -314,7 +381,8 @@ func (s *dnsServer) answer(query []byte, tcp bool) []byte {
 
 // forward asks the host's servers query, one after another until one
 // answers, the same way the client asked, so that a reply too big for UDP
-// comes back truncated, and the client asks again over TCP.
+// comes back truncated, and the client asks again over TCP. The query and
+// reply pass through unchanged.
 func (s *dnsServer) forward(query []byte, tcp bool) ([]byte, error) {
 	err := errors.New("no DNS servers to ask")
 	for _, upstream := range s.upstreams {
@@ -327,7 +395,9 @@ func (s *dnsServer) forward(query []byte, tcp bool) ([]byte, error) {
 }
 
 // exchangeDNS sends query to server, over TCP if tcp is set, and returns its
-// reply.
+// reply. Unlike the server's own sockets, the one this makes is in the
+// host's network namespace, which is where the host's DNS servers are
+// reachable.
 func exchangeDNS(server string, query []byte, tcp bool) ([]byte, error) {
 	network := "udp"
 	if tcp {
@@ -338,6 +408,8 @@ func exchangeDNS(server string, query []byte, tcp bool) ([]byte, error) {
 		return nil, err
 	}
 	defer conn.Close()
+	// After the deadline, reads and writes fail, rather than wait for a
+	// server that won't answer.
 	conn.SetDeadline(time.Now().Add(dnsTimeout))
 	if tcp {
 		if err := writeDNSMessage(conn, query); err != nil {
@@ -354,7 +426,8 @@ func exchangeDNS(server string, query []byte, tcp bool) ([]byte, error) {
 		if err != nil {
 			return nil, err
 		}
-		// Anything else is a late reply to some other question.
+		// A reply carries the query's ID, its first two bytes. Anything
+		// else is a late reply to some other question.
 		if n >= 2 && bytes.Equal(buffer[:2], query[:2]) {
 			return buffer[:n], nil
 		}
@@ -370,19 +443,27 @@ type dnsQuestion struct {
 	end int
 }
 
-// parseDNSQuestion parses a query, which must ask one question.
+// parseDNSQuestion parses a query, which must ask one question. It reads the
+// header's fields at their fixed places, then the name label by label, and
+// checks before each step that the message is long enough, so that a short
+// or malformed message is an error rather than a crash.
 func parseDNSQuestion(query []byte) (dnsQuestion, error) {
 	var question dnsQuestion
 	if len(query) < 12 {
 		return question, errors.New("short DNS message")
 	}
+	// The top bit of the third byte (QR) is set in replies. & is bitwise
+	// and.
 	if query[2]&0x80 != 0 {
 		return question, errors.New("not a DNS query")
 	}
+	// Bytes 4 and 5 are how many questions follow.
 	if binary.BigEndian.Uint16(query[4:]) != 1 {
 		return question, errors.New("DNS query doesn't ask one question")
 	}
 	var labels []string
+	// i is where in the message we are; the question starts right after
+	// the 12-byte header.
 	i := 12
 	for {
 		if i >= len(query) {
@@ -413,24 +494,35 @@ func parseDNSQuestion(query []byte) (dnsQuestion, error) {
 
 // dnsReply makes a reply to query, which asks question, with the response
 // code rcode (0 for success) and an A record for each of addresses.
+//
+// A reply starts like its query: the same ID, and the question repeated.
+// Then come the answers, each a name, a type, a class, how long it may be
+// remembered (TTL), and the data, here the 4 bytes of an IPv4 address.
 func dnsReply(query []byte, question dnsQuestion, rcode int, addresses []net.IP) []byte {
+	// A slice of 12 zero bytes for the header, with room to grow (the third
+	// argument) for the rest, so append needn't reallocate.
 	reply := make([]byte, 12, question.end+16*len(addresses))
+	// The query's ID.
 	copy(reply, query[:2])
 	// QR: a reply. The query's opcode and RD, which asks for recursion.
 	// AA: an authoritative answer. RA: recursion is available, by passing
-	// questions on.
+	// questions on. Each is a bit of the 16-bit flags field, combined with
+	// | (bitwise or); the response code is the lowest 4 bits.
 	flags := 0x8000 | binary.BigEndian.Uint16(query[2:])&0x7900 | 0x0400 | 0x0080 | uint16(rcode)
 	binary.BigEndian.PutUint16(reply[2:], flags)
+	// One question, and as many answers as addresses.
 	binary.BigEndian.PutUint16(reply[4:], 1)
 	binary.BigEndian.PutUint16(reply[6:], uint16(len(addresses)))
 	reply = append(reply, query[12:question.end]...)
 	for _, ip := range addresses {
 		// The record's name is a pointer to the question's, which starts
-		// right after the header, at byte 12.
+		// right after the header, at byte 12. A pointer is two bytes whose
+		// top two bits are set: 0xc0 is binary 11000000.
 		reply = append(reply, 0xc0, 12)
 		reply = binary.BigEndian.AppendUint16(reply, dnsTypeA)
 		reply = binary.BigEndian.AppendUint16(reply, dnsClassIN)
 		reply = binary.BigEndian.AppendUint32(reply, dnsTTL)
+		// The data's length, 4 bytes, and the address itself.
 		reply = binary.BigEndian.AppendUint16(reply, 4)
 		reply = append(reply, ip.To4()...)
 	}

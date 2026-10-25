@@ -21,6 +21,16 @@ import (
 // is about (an interface, an address, a route), and attributes: each a
 // length, a type, and a value, padded to a multiple of 4 bytes. An
 // attribute's value can be more attributes, nested.
+//
+// For example, "make a bridge called runt0" is: the header (message type
+// RTM_NEWLINK, "new interface"), an ifinfomsg struct of zeros (a new
+// interface has no number yet), an IFLA_IFNAME attribute holding "runt0",
+// and an IFLA_LINKINFO attribute holding a nested IFLA_INFO_KIND attribute
+// holding "bridge".
+//
+// The numbers are written in the machine's own byte order
+// (binary.NativeEndian), as the kernel's C structs hold them. For how to
+// read the Go here, see doc.go.
 
 // Attribute types the syscall package doesn't define, from linux/if_link.h
 // and linux/veth.h.
@@ -31,12 +41,16 @@ const (
 )
 
 // netlinkConn is a NETLINK_ROUTE socket. Its requests apply to the network
-// namespace it was opened in.
+// namespace it was opened in. seq numbers the requests, so each reply can
+// be matched to its request.
 type netlinkConn struct {
 	fd  int
 	seq uint32
 }
 
+// openNetlink opens a netlink socket to the kernel's routing subsystem.
+// Binding it with an empty address lets the kernel give it an address of
+// its own.
 func openNetlink() (*netlinkConn, error) {
 	fd, err := syscall.Socket(syscall.AF_NETLINK, syscall.SOCK_RAW|syscall.SOCK_CLOEXEC, syscall.NETLINK_ROUTE)
 	if err != nil {
@@ -61,6 +75,11 @@ type netlinkRequest struct {
 // newRequest starts a request of type kind about body, which is an
 // ifinfomsg, ifaddrmsg, or rtmsg. Every request asks for an
 // acknowledgement, so that errors come back.
+//
+// The header is: the message's length (4 bytes, filled in by do once it is
+// known), its type (2), flags (2), sequence number (4, also filled in by
+// do), and sender (4, left 0). make([]byte, 16, 256) makes 16 zero bytes,
+// with room to grow to 256 without copying.
 func newRequest(kind, flags uint16, body []byte) *netlinkRequest {
 	r := &netlinkRequest{data: make([]byte, syscall.NLMSG_HDRLEN, 256)}
 	binary.NativeEndian.PutUint16(r.data[4:], kind)
@@ -69,7 +88,8 @@ func newRequest(kind, flags uint16, body []byte) *netlinkRequest {
 	return r
 }
 
-// attr adds an attribute.
+// attr adds an attribute: its length (4 bytes of header plus the value),
+// its type, the value, and zero bytes up to the next multiple of 4.
 func (r *netlinkRequest) attr(kind uint16, value []byte) {
 	r.data = binary.NativeEndian.AppendUint16(r.data, uint16(syscall.SizeofRtAttr+len(value)))
 	r.data = binary.NativeEndian.AppendUint16(r.data, kind)
@@ -79,7 +99,11 @@ func (r *netlinkRequest) attr(kind uint16, value []byte) {
 	}
 }
 
-// nested adds an attribute whose value is whatever add adds.
+// nested adds an attribute whose value is whatever add adds. Its length
+// isn't known until add has run, so it starts as an attribute with no value,
+// and its length is written over afterwards, once everything inside it is
+// in place. add is a function the caller passes, which calls attr (or
+// nested) itself.
 func (r *netlinkRequest) nested(kind uint16, add func()) {
 	start := len(r.data)
 	r.attr(kind, nil)
@@ -87,10 +111,13 @@ func (r *netlinkRequest) nested(kind uint16, add func()) {
 	binary.NativeEndian.PutUint16(r.data[start:], uint16(len(r.data)-start))
 }
 
+// cString is s as C strings are, ending in a zero byte, as the kernel
+// expects names to be.
 func cString(s string) []byte {
 	return append([]byte(s), 0)
 }
 
+// uint32Value is n as 4 bytes, for an attribute holding a number.
 func uint32Value(n int) []byte {
 	return binary.NativeEndian.AppendUint32(nil, uint32(n))
 }
@@ -107,7 +134,10 @@ func ifInfo(index int, flags, change uint32) []byte {
 	return b
 }
 
-// do sends a request and waits for the kernel's answer.
+// do sends a request and waits for the kernel's answer. The kernel may send
+// other messages on the socket too, so it reads until it finds the
+// acknowledgement (an NLMSG_ERROR message, which carries 0 for success)
+// with this request's sequence number.
 func (c *netlinkConn) do(r *netlinkRequest) error {
 	c.seq++
 	binary.NativeEndian.PutUint32(r.data[0:], uint32(len(r.data)))

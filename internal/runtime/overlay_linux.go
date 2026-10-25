@@ -2,6 +2,10 @@
 
 package runtime
 
+// Each container's root filesystem, as an overlay mount (see below). The
+// image layers it stacks are unpacked by layer_linux.go. For how to read the
+// Go here, see doc.go.
+
 import (
 	"errors"
 	"fmt"
@@ -68,6 +72,8 @@ func mountContainerFS(id string, layers []string, uids, gids IDRange) (string, e
 	if err := os.Mkdir(dir, 0o710); err != nil {
 		return "", fmt.Errorf("create container filesystem directory: %w", err)
 	}
+	// cleanup removes what has been made so far, on any failure from here
+	// on.
 	cleanup := func() { os.RemoveAll(dir) }
 	if err := os.Chown(dir, 0, gids.Base); err != nil {
 		cleanup()
@@ -84,6 +90,8 @@ func mountContainerFS(id string, layers []string, uids, gids IDRange) (string, e
 	if info, err := os.Stat(layers[0]); err == nil {
 		mode = info.Mode().Perm()
 	}
+	// The steps are a slice of anonymous functions, run in order, so that
+	// one error check covers them all.
 	for _, step := range []func() error{
 		func() error { return os.Mkdir(upper, mode) },
 		func() error { return os.Chmod(upper, mode) }, // undo the umask
@@ -97,6 +105,9 @@ func mountContainerFS(id string, layers []string, uids, gids IDRange) (string, e
 		}
 	}
 
+	// The overlay's options name its layers: lowerdir lists the read-only
+	// ones, top first and separated by colons, upperdir is the writable one,
+	// and workdir the scratch space.
 	options := fmt.Sprintf("lowerdir=%s,upperdir=%s,workdir=%s", strings.Join(layers, ":"), upper, work)
 	// Mount options must fit in one page.
 	if len(options) >= os.Getpagesize() {
@@ -116,6 +127,10 @@ func mountContainerFS(id string, layers []string, uids, gids IDRange) (string, e
 // mounted. The writable layer stays.
 func unmountContainerFS(id string) error {
 	merged := filepath.Join(containerFSDir(id), "rootfs")
+	// MNT_DETACH unmounts at once even if something is still using the
+	// mount, which then goes away when it is no longer used. EINVAL means
+	// nothing was mounted there, and ENOENT that there is no such directory:
+	// either way, it is already unmounted.
 	err := syscall.Unmount(merged, syscall.MNT_DETACH)
 	if err == nil || errors.Is(err, syscall.EINVAL) || errors.Is(err, syscall.ENOENT) {
 		return nil
@@ -144,6 +159,8 @@ func removeContainerFS(id string) error {
 
 // isMountPoint reports whether something is mounted at path, which then has
 // a different device from its parent directory. A missing path isn't one.
+// Lstat describes a file (without following a symlink), including Dev, the
+// number of the filesystem it is on.
 func isMountPoint(path string) (bool, error) {
 	var stat, parent syscall.Stat_t
 	if err := syscall.Lstat(path, &stat); err != nil {

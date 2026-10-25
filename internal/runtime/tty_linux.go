@@ -23,6 +23,12 @@ import (
 // root, rather than one of the host's terminals. The master is handed out to
 // runt over a Unix socket (SCM_RIGHTS), and the slave never leaves the
 // container.
+//
+// Most of what is done to a terminal is done with ioctl, a system call that
+// sends a device a numbered request with a pointer to a struct: TCGETS reads
+// a terminal's settings into a Termios struct, TCSETS writes them back,
+// TIOCGWINSZ and TIOCSWINSZ get and set its size, and so on. For how to read
+// the Go here, see doc.go.
 
 // defaultWinsize is the size a pseudo-terminal gets when there is no
 // terminal to copy the size from.
@@ -35,6 +41,10 @@ type winsize struct {
 
 // ioctl makes an ioctl call on file. It goes through SyscallConn rather than
 // Fd, which would switch the file to blocking mode and break read deadlines.
+// conn.Control runs the function it is given with the file's raw descriptor
+// number, while making sure the file isn't closed meanwhile. arg is an
+// unsafe.Pointer, a bare memory address, since each request takes a
+// different struct.
 func ioctl(file *os.File, request uintptr, arg unsafe.Pointer) error {
 	conn, err := file.SyscallConn()
 	if err != nil {
@@ -52,12 +62,14 @@ func ioctl(file *os.File, request uintptr, arg unsafe.Pointer) error {
 	return nil
 }
 
-// isTerminal reports whether file is a terminal.
+// isTerminal reports whether file is a terminal: only a terminal can report
+// terminal settings, so asking for them succeeds only for one.
 func isTerminal(file *os.File) bool {
 	var termios syscall.Termios
 	return ioctl(file, syscall.TCGETS, unsafe.Pointer(&termios)) == nil
 }
 
+// getWinsize reads a terminal's size, in rows and columns.
 func getWinsize(file *os.File) (winsize, error) {
 	var size winsize
 	err := ioctl(file, syscall.TIOCGWINSZ, unsafe.Pointer(&size))
@@ -72,6 +84,11 @@ func setWinsize(file *os.File, size winsize) error {
 
 // openPTY makes a new pseudo-terminal pair from /dev/ptmx. Neither end
 // becomes this process's controlling terminal.
+//
+// Opening /dev/ptmx makes a new pair and returns its master end; the slave
+// end appears as /dev/pts/N, which is then opened by name. The results are
+// named (master, slave, err), so they are declared at the start of the
+// function like other variables.
 func openPTY() (master, slave *os.File, err error) {
 	masterFD, err := syscall.Open("/dev/ptmx", syscall.O_RDWR|syscall.O_NOCTTY|syscall.O_CLOEXEC, 0)
 	if err != nil {
@@ -102,6 +119,8 @@ func openPTY() (master, slave *os.File, err error) {
 // consoleSocketPair makes the Unix socket a pseudo-terminal's master is sent
 // over. The parent end stays a raw descriptor for sendmsg and recvmsg; the
 // child end is passed to the process that makes the pseudo-terminal.
+// socketpair makes two sockets already connected to each other, like the
+// two ends of a pipe that works both ways.
 func consoleSocketPair() (parent int, child *os.File, err error) {
 	fds, err := syscall.Socketpair(syscall.AF_UNIX, syscall.SOCK_STREAM|syscall.SOCK_CLOEXEC, 0)
 	if err != nil {
@@ -111,6 +130,11 @@ func consoleSocketPair() (parent int, child *os.File, err error) {
 }
 
 // sendFile passes file's descriptor over a Unix socket.
+//
+// A Unix socket can carry open files from one process to another: the
+// message carries the descriptor as "ancillary data" (SCM_RIGHTS, which
+// UnixRights builds), alongside a normal byte of data, and the kernel gives
+// the receiving process a descriptor of its own for the same open file.
 func sendFile(socket, file *os.File) error {
 	conn, err := socket.SyscallConn()
 	if err != nil {
@@ -133,6 +157,8 @@ func sendFile(socket, file *os.File) error {
 // the other end closed the socket without sending one, as init does when it
 // fails to set up. The file is non-blocking, so reads from it can time out.
 func receiveFile(socket int, name string) (*os.File, error) {
+	// data takes the one byte of normal data, and control the ancillary
+	// data, with room for one descriptor (4 bytes).
 	data := make([]byte, 1)
 	control := make([]byte, syscall.CmsgSpace(4))
 	for {
@@ -165,6 +191,11 @@ func receiveFile(socket int, name string) (*os.File, error) {
 // consoleReader reads what a container writes to its pseudo-terminal. Once
 // every process has closed the slave end, reading the master fails with EIO
 // instead of reaching end-of-file, so EIO is turned into io.EOF.
+//
+// Having a Read method with this signature makes consoleReader an
+// io.Reader: Go interfaces are satisfied by having the methods, with no
+// declaration needed, so a consoleReader can go anywhere an io.Reader can,
+// such as copyOutput.
 type consoleReader struct{ master *os.File }
 
 func (r consoleReader) Read(p []byte) (int, error) {
@@ -184,6 +215,13 @@ func makeRaw(terminal *os.File) (func(), error) {
 	if err := ioctl(terminal, syscall.TCGETS, unsafe.Pointer(&saved)); err != nil {
 		return nil, fmt.Errorf("read terminal mode: %w", err)
 	}
+	// A terminal's settings are bit flags in four fields: input (Iflag),
+	// output (Oflag), local behavior such as echo and Ctrl+C (Lflag), and
+	// the character format (Cflag). &^= clears the bits named on the right,
+	// and |= sets them. Turned off here: translating input (such as Enter
+	// to newline), output processing, echoing what is typed, line editing
+	// (ICANON, which holds input until Enter), and signal keys (ISIG). VMIN
+	// 1 and VTIME 0 make a read return as soon as one byte is there.
 	raw := saved
 	raw.Iflag &^= syscall.IGNBRK | syscall.BRKINT | syscall.PARMRK | syscall.ISTRIP | syscall.INLCR | syscall.IGNCR | syscall.ICRNL | syscall.IXON
 	raw.Oflag &^= syscall.OPOST
@@ -205,6 +243,8 @@ func ReadPassword(prompt string) (string, error) {
 	if err := ioctl(os.Stdin, syscall.TCGETS, unsafe.Pointer(&saved)); err != nil {
 		return "", errors.New("standard input is not a terminal to read a password from")
 	}
+	// Echo off, so the password doesn't show, but line editing on, and the
+	// newline still echoed, so the cursor moves on when Enter is pressed.
 	quiet := saved
 	quiet.Lflag &^= syscall.ECHO
 	quiet.Lflag |= syscall.ICANON | syscall.ECHONL
@@ -213,6 +253,8 @@ func ReadPassword(prompt string) (string, error) {
 	}
 	defer ioctl(os.Stdin, syscall.TCSETS, unsafe.Pointer(&saved))
 	fmt.Fprint(os.Stderr, prompt)
+	// Read a byte at a time up to the newline, so nothing after it is read
+	// and lost.
 	var line []byte
 	b := make([]byte, 1)
 	for {
@@ -236,6 +278,8 @@ func ReadPassword(prompt string) (string, error) {
 // terminal in raw mode and sends what is typed to the container. It returns
 // a function that undoes this. The caller copies the container's output.
 func connectTerminal(console *os.File, interactive bool) (func(), error) {
+	// The terminal to copy the size from: runt's input, or else its output,
+	// whichever is a terminal.
 	var source *os.File
 	for _, file := range []*os.File{os.Stdin, os.Stdout} {
 		if isTerminal(file) {
@@ -253,6 +297,11 @@ func connectTerminal(console *os.File, interactive bool) (func(), error) {
 		setWinsize(console, size)
 	}
 	resize()
+	// The kernel sends SIGWINCH when runt's terminal window is resized.
+	// signal.Notify delivers it on the channel winch instead of applying
+	// its default action, and the goroutine resizes the container's
+	// pseudo-terminal each time one comes. "for range winch" loops over
+	// values received from the channel, until it is closed.
 	winch := make(chan os.Signal, 1)
 	signal.Notify(winch, syscall.SIGWINCH)
 	go func() {

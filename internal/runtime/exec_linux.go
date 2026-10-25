@@ -28,6 +28,14 @@ import (
 // runtime starts. runt uses nsenter from util-linux instead, which makes the
 // setns calls and then runs runt again, now inside the container, to drop
 // privileges before the command runs (see ExecInit).
+//
+// The chain of processes, for runt exec web ls:
+//
+//	runt exec  ->  nsenter --target <init's PID> --all -- runt --exec-init ... ls
+//	                  (joins the container's namespaces)
+//	                  ->  runt --exec-init: drops privileges, then becomes ls
+//
+// For how to read the Go here, see doc.go.
 func Exec(ref string, command []string, options ExecOptions) error {
 	if len(command) == 0 {
 		return errors.New("a command is required")
@@ -82,6 +90,11 @@ func Exec(ref string, command []string, options ExecOptions) error {
 		"--", "/proc/self/fd/3", "--exec-init", state.AppArmorProfile, tty,
 	}
 	args = append(args, command...)
+	// exec.Command prepares a program to run, with its arguments. Its
+	// fields set up the new process before Start: Stdin, Stdout, and
+	// Stderr are what it reads and writes, ExtraFiles are more open files
+	// passed on as descriptors 3, 4, and so on, and SysProcAttr holds
+	// Linux-specific settings for how it is made.
 	nsenterCommand := exec.Command(nsenter, args...)
 	if options.Interactive && !options.Tty {
 		nsenterCommand.Stdin = os.Stdin
@@ -120,6 +133,9 @@ func Exec(ref string, command []string, options ExecOptions) error {
 	if options.Tty {
 		extraFiles[1].Close()
 	}
+	// Each signal that arrives on the channel is sent on to the command.
+	// sig is an os.Signal, an interface; sig.(syscall.Signal) takes out the
+	// signal number it holds, which syscall.Kill wants.
 	go func() {
 		for sig := range signals {
 			if pid := childOf(nsenterCommand.Process.Pid); pid > 0 {
@@ -128,6 +144,9 @@ func Exec(ref string, command []string, options ExecOptions) error {
 		}
 	}()
 
+	// output is closed once all of the command's terminal output has been
+	// copied. A chan struct{} carries no values; closing it is the signal,
+	// and <-output waits for it.
 	var output chan struct{}
 	var console *os.File
 	if options.Tty {
@@ -164,6 +183,9 @@ func Exec(ref string, command []string, options ExecOptions) error {
 
 // childOf returns the PID of a child of process parent, or 0 if it has none.
 // nsenter has a single child, which ExecInit replaces with the command.
+// It looks through /proc/<pid>/stat for every process, which gives each
+// one's parent. Sscanf reads values out of a string as a format says, as C's
+// scanf does: %c a character, %d a number.
 func childOf(parent int) int {
 	stats, _ := filepath.Glob("/proc/[0-9]*/stat")
 	for _, path := range stats {
@@ -193,6 +215,8 @@ func childOf(parent int) int {
 // command.
 func ExecInit() error {
 	// Arguments, as built by Exec: --exec-init APPARMOR_PROFILE TTY COMMAND...
+	// os.Args holds the program's own name first, and then its arguments,
+	// so os.Args[4:] is the command and its arguments.
 	if len(os.Args) < 5 {
 		return errors.New("internal exec arguments are incomplete")
 	}
@@ -234,6 +258,9 @@ func ExecInit() error {
 	if err := closeExtraFiles(); err != nil {
 		return err
 	}
+	// syscall.Exec replaces this process with the command: the same
+	// process, with the same PID, namespaces, and restrictions, but running
+	// the command's program. On success it never returns.
 	if err := syscall.Exec(path, command, os.Environ()); err != nil {
 		return &commandError{fmt.Errorf("exec %s: %w", command[0], err)}
 	}
@@ -266,6 +293,8 @@ func useNewTerminal(socket *os.File) error {
 	if _, err := syscall.Setsid(); err != nil {
 		return fmt.Errorf("start session: %w", err)
 	}
+	// dup3 copies a descriptor onto a given number: here the terminal onto
+	// 0, 1, and 2, standard input, output, and error.
 	for fd := 0; fd <= 2; fd++ {
 		if err := syscall.Dup3(int(slave.Fd()), fd, 0); err != nil {
 			return fmt.Errorf("use terminal: %w", err)

@@ -11,6 +11,10 @@ import (
 	"testing"
 )
 
+// Tests for layer_linux.go: unpacking layers, including ones made to try to
+// escape the layer directory. Most of them need root, and skip themselves
+// without it (t.Skip). For how Go tests work, see "Tests" in doc.go.
+
 // tarEntry is one entry of a test layer.
 type tarEntry struct {
 	name     string
@@ -21,6 +25,9 @@ type tarEntry struct {
 	mode     int64
 }
 
+// buildTar makes a tar archive of entries, in memory. tar.Writer writes
+// each entry's header, then its content; Close writes the end-of-archive
+// marker.
 func buildTar(t *testing.T, entries []tarEntry) *bytes.Buffer {
 	t.Helper()
 	var buf bytes.Buffer
@@ -70,6 +77,7 @@ func TestExtractLayer(t *testing.T) {
 		t.Fatal(err)
 	}
 
+	// owner returns a file's owner and group, as stored on disk.
 	owner := func(path string) (int, int) {
 		var stat syscall.Stat_t
 		if err := syscall.Lstat(filepath.Join(root, path), &stat); err != nil {
@@ -91,6 +99,8 @@ func TestExtractLayer(t *testing.T) {
 	if info, err := os.Stat(filepath.Join(root, "usr/bin/su")); err != nil || info.Mode()&os.ModeSetuid == 0 {
 		t.Errorf("usr/bin/su lost its setuid bit: %v, %v", info.Mode(), err)
 	}
+	// Hard links are the same file under two names, so they share an inode
+	// number.
 	var su, sudo syscall.Stat_t
 	syscall.Stat(filepath.Join(root, "usr/bin/su"), &su)
 	syscall.Stat(filepath.Join(root, "usr/bin/sudo"), &sudo)
@@ -124,6 +134,10 @@ func TestExtractLayerSymlinkEscape(t *testing.T) {
 	if os.Geteuid() != 0 {
 		t.Skip("unpacking a layer needs root")
 	}
+	// Three archives, each a different trick: write through a symlink,
+	// make a whiteout through one, and hard-link to a file outside.
+	// [][]tarEntry is a slice of slices: a list of archives, each a list of
+	// entries.
 	uids := IDRange{Base: 100000, Size: 65536}
 	target := t.TempDir()
 	for _, entries := range [][]tarEntry{

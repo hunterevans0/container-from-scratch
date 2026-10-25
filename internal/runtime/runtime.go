@@ -1,7 +1,21 @@
 package runtime
 
+// The types that describe a container and the options of the commands that
+// work with one, shared by every platform (this file has no build
+// constraint). cmd/runt fills in a Config from the command line and hands it
+// to Run or Create (in container_linux.go). For an overview of the package,
+// and how to read Go, see doc.go.
+
 import "time"
 
+// Config is everything runt needs to know to make and run a container, as
+// runt run and runt create take it from their options. The comment on each
+// field says what it means. Fields left unset keep their zero value: "" for
+// strings, false, 0, or nil, which each field's comment explains the meaning
+// of where it matters.
+//
+// A *string, as Entrypoint is, is a pointer to a string: nil means "not
+// given", which is different from "given, and empty". Likewise *User.
 type Config struct {
 	// Rootfs is an unpacked root filesystem. The container sees it through
 	// an overlay with a writable layer of its own, so the directory itself
@@ -84,6 +98,9 @@ const (
 
 // Network is a network containers can be on: the default bridge network, or
 // one made with CreateNetwork, whose containers find each other by name.
+// The text in backquotes after each field is a tag: it gives the field's
+// name in JSON, as networks are saved on disk, and omitempty (or omitzero,
+// for a time) leaves the field out when it is empty.
 type Network struct {
 	Name string `json:"name"`
 	// ID is set on networks made with CreateNetwork.
@@ -95,7 +112,9 @@ type Network struct {
 	Created time.Time `json:"created,omitzero"`
 }
 
-// User is who a command runs as inside the container.
+// User is who a command runs as inside the container: a user ID, a group ID,
+// and any other groups the user is in. uint32 is an unsigned (never
+// negative) 32-bit number, the kernel's type for IDs.
 type User struct {
 	UID            uint32   `json:"uid"`
 	GID            uint32   `json:"gid"`

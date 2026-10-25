@@ -2,18 +2,24 @@
 
 package runtime
 
+// Installing the seccomp filter that seccomp.go builds. The build constraint
+// means: Linux, on either amd64 or arm64, the two architectures with a table
+// of call numbers. For how to read the Go here, see doc.go.
+
 import (
 	"fmt"
 	"syscall"
 	"unsafe"
 )
 
+// Arguments for the seccomp system call, from <linux/seccomp.h>.
 const (
 	seccompSetModeFilter  = 1
 	seccompFilterFlagSync = 1 // SECCOMP_FILTER_FLAG_TSYNC
 )
 
-// sockFprog mirrors struct sock_fprog.
+// sockFprog mirrors struct sock_fprog: how many instructions the program
+// has, and a pointer to the first of them.
 type sockFprog struct {
 	length uint16
 	filter *bpfInstruction
@@ -24,6 +30,9 @@ type sockFprog struct {
 // unprivileged process may only install a filter once no_new_privs is set.
 func installSeccomp() error {
 	program := buildSeccompFilter(nativeSeccompPolicy)
+	// &program[0] is the address of the slice's first instruction. A
+	// slice's elements sit next to each other in memory, as the kernel
+	// expects an array to.
 	fprog := sockFprog{length: uint16(len(program)), filter: &program[0]}
 	// TSYNC applies the filter to every thread of the Go runtime at once.
 	// On failure it can return the ID of a thread that could not be synced

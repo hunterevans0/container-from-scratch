@@ -1,5 +1,9 @@
 package runtime
 
+// Tests for state.go: container IDs, state.json, and finding containers by
+// name or ID. They work in a temporary directory, not /run/runt, so they
+// need no root. For how Go tests work, see "Tests" in doc.go.
+
 import (
 	"regexp"
 	"slices"
@@ -46,6 +50,8 @@ func TestFindContainerAndCheckName(t *testing.T) {
 	if err != nil || len(states) != 3 || states[0].ID != "def333333333" {
 		t.Fatalf("listStates = %v, %v; want 3, newest first", states, err)
 	}
+	// A map literal used as a table of cases: each reference, and the ID
+	// it should find.
 	for ref, want := range map[string]string{"web": "abc111111111", "abc222222222": "abc222222222", "d": "def333333333"} {
 		if state, err := findContainer(root, ref); err != nil || state.ID != want {
 			t.Errorf("findContainer(%q) = %v, %v; want %s", ref, state, err, want)
@@ -95,6 +101,7 @@ func TestStateRoundTrip(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	// %+v in the message prints a struct with its field names.
 	if got.ID != state.ID || got.Status != state.Status || !slices.Equal(got.Command, state.Command) ||
 		got.ExitCode == nil || *got.ExitCode != exitCode || got.Resources.Memory != state.Resources.Memory ||
 		!got.Created.Equal(state.Created) || !got.Started.IsZero() {

@@ -25,6 +25,15 @@ import (
 // architecture. A manifest names the image's configuration and its layers,
 // bottom first. Each layer is a tar archive, usually gzipped, of the files
 // it adds or changes.
+//
+// A digest is a fingerprint of a blob's content: "sha256:" and the SHA-256
+// hash of its bytes, in hex. Naming blobs by digest means a blob's name
+// proves what is in it: runt checks every blob it reads against its digest,
+// so a damaged or tampered one is caught.
+//
+// This file reads layouts; the image store (imagestore_linux.go) is a
+// layout too, and registry.go downloads into it. No build constraint, so the
+// tests run anywhere. For how to read the Go here, see doc.go.
 
 const (
 	mediaTypeImageIndex    = "application/vnd.oci.image.index.v1+json"
@@ -44,7 +53,9 @@ const (
 	maxMetadataSize = 4 << 20
 )
 
-// ociDescriptor points to a blob: its type, digest, and size.
+// ociDescriptor points to a blob: its type, digest, and size. The structs
+// below mirror the JSON documents' layouts, with each field's key in its
+// tag; map[string]string holds a JSON object of any string keys and values.
 type ociDescriptor struct {
 	MediaType   string            `json:"mediaType"`
 	Digest      string            `json:"digest"`
@@ -53,6 +64,7 @@ type ociDescriptor struct {
 	Platform    *ociPlatform      `json:"platform,omitempty"`
 }
 
+// ociPlatform says which operating system and CPU an image is built for.
 type ociPlatform struct {
 	Architecture string `json:"architecture"`
 	OS           string `json:"os"`
@@ -66,6 +78,8 @@ type ociIndex struct {
 	Manifests     []ociDescriptor `json:"manifests"`
 }
 
+// ociManifest is a manifest: the image's configuration blob and its layer
+// blobs.
 type ociManifest struct {
 	SchemaVersion int             `json:"schemaVersion"`
 	MediaType     string          `json:"mediaType,omitempty"`
@@ -104,6 +118,8 @@ type ociImage struct {
 // A colon only starts a tag after the last path separator, so a path like
 // ./a:b/c keeps its colon.
 func splitImageRef(ref string) (layout, tag string) {
+	// LastIndex returns -1 if there is no colon, which is never greater
+	// than LastIndexAny's result, also -1 at the least.
 	colon := strings.LastIndex(ref, ":")
 	if colon > strings.LastIndexAny(ref, `/`+string(filepath.Separator)) {
 		return ref[:colon], ref[colon+1:]
@@ -222,6 +238,8 @@ func (image *ociImage) resolveManifest(desc ociDescriptor, depth int) (ociManife
 		return ociManifest{}, fmt.Errorf("image manifest: %w", err)
 	}
 	// Some layouts leave out the media type, so look at the content too.
+	// json.RawMessage keeps that part of the JSON as it is, undecoded; it
+	// is only checked for being there (non-nil).
 	var probe struct {
 		MediaType string          `json:"mediaType"`
 		Manifests json.RawMessage `json:"manifests"`
@@ -242,6 +260,9 @@ func (image *ociImage) resolveManifest(desc ociDescriptor, depth int) (ociManife
 		if err != nil {
 			return ociManifest{}, err
 		}
+		// resolveManifest calls itself on the chosen entry, which may be
+		// another index. depth counts how far down it is, so a loop of
+		// indexes can't go on forever.
 		return image.resolveManifest(entry, depth+1)
 	}
 	if mediaType != "" && mediaType != mediaTypeImageManifest && mediaType != mediaTypeDockerManifest {
@@ -300,6 +321,8 @@ func (image *ociImage) readBlob(desc ociDescriptor) ([]byte, error) {
 	if desc.Size != 0 && int64(len(data)) != desc.Size {
 		return nil, fmt.Errorf("blob %s is %d bytes, but should be %d", desc.Digest, len(data), desc.Size)
 	}
+	// Sum256 returns the hash as an array of 32 bytes; sum[:] is a slice
+	// of it, which EncodeToString writes as 64 hex digits.
 	if sum := sha256.Sum256(data); "sha256:"+hex.EncodeToString(sum[:]) != desc.Digest {
 		return nil, fmt.Errorf("blob %s does not match its digest", desc.Digest)
 	}
@@ -322,6 +345,9 @@ func layerCompression(mediaType string) (string, error) {
 	return "", fmt.Errorf("unsupported layer media type %q", mediaType)
 }
 
+// readJSONFile reads the JSON file at path into v, which must be a pointer
+// to the variable to fill in. any is the type that can hold a value of any
+// type.
 func readJSONFile(path string, v any) error {
 	data, err := os.ReadFile(path)
 	if err != nil {

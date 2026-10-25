@@ -14,6 +14,14 @@ import (
 	"time"
 )
 
+// Network tests, as feature checks (see the top of features_test.go): the
+// bridge network, published ports, DNS files, and user-defined networks.
+//
+// Most checks have something connect to a "greeting server", which answers
+// each connection with the address it came from. That shows both that the
+// connection got through and what NAT, if any, did to it on the way. For
+// how to read these tests, see the top of isolation_test.go.
+
 const (
 	bridgeName    = "runt0"
 	bridgeGateway = "10.88.0.1"
@@ -34,6 +42,7 @@ const (
 
 // greetingServer is a shell command that serves greetings, with Perl:
 // perl-base is in every Debian and Ubuntu system, and so in the rootfs.
+// fmt.Sprintf fills the port number into the script where %d is.
 var greetingServer = fmt.Sprintf(`exec perl -MIO::Socket::INET -e '
 $s = IO::Socket::INET->new(LocalPort => %d, Listen => 5, ReuseAddr => 1) or die "listen: $!";
 while ($c = $s->accept) { print $c "you are " . $c->peerhost . "\n"; close $c }'`, greetingPort)
@@ -80,7 +89,10 @@ func greetingFromHost(ip string) (string, error) {
 	return greetingAt(net.JoinHostPort(ip, fmt.Sprint(greetingPort)))
 }
 
-// greetingAt connects to a greeting server at address from the host.
+// greetingAt connects to a greeting server at address from the host,
+// trying for up to 5 seconds while the server starts, and returns the line
+// it sends. Inside the loop, err := declares a new err for the read,
+// shadowing the outer one, which only the last failed attempt sets.
 func greetingAt(address string) (string, error) {
 	var err error
 	for deadline := time.Now().Add(5 * time.Second); time.Now().Before(deadline); time.Sleep(100 * time.Millisecond) {
@@ -97,7 +109,9 @@ func greetingAt(address string) (string, error) {
 }
 
 // udpGreetingAt sends datagrams to a UDP greeting server at address from the
-// host until one is answered, and returns the answer.
+// host until one is answered, and returns the answer. UDP doesn't say
+// whether a datagram arrived, so it sends one, waits 300ms for an answer,
+// and tries again, up to 20 times.
 func udpGreetingAt(address string) (string, error) {
 	conn, err := net.Dial("udp4", address)
 	if err != nil {
@@ -130,9 +144,14 @@ func ipCommand(t *testing.T, args ...string) {
 // which the host reaches through a veth pair, with a greeting server at
 // outsideServerIP. The host's end has outsideHostIP, so a connection from
 // a container that the host masquerades comes from there.
+//
+// It uses the ip command: ip netns makes a named network namespace, ip link
+// add ... type veth makes a veth pair with one end moved into it, and
+// ip -n NAMESPACE runs a command on that namespace's interfaces.
 func startOutside(t *testing.T) {
 	t.Helper()
-	// Whatever an earlier run left behind.
+	// Whatever an earlier run left behind. Run's error is ignored: there
+	// usually is nothing to delete.
 	exec.Command("ip", "netns", "del", outsideNamespace).Run()
 	exec.Command("ip", "link", "del", outsideHostEnd).Run()
 	ipCommand(t, "netns", "add", outsideNamespace)
@@ -195,6 +214,8 @@ func TestFeatureNetwork(t *testing.T) {
 		if !found {
 			t.Errorf("%s has addresses %v, want %s/16", bridgeName, addresses, bridgeGateway)
 		}
+		// /sys/class/net/<interface>/master is a symlink to the bridge an
+		// interface is plugged into.
 		for _, id := range []string{idA, idB} {
 			master, err := os.Readlink(filepath.Join("/sys/class/net", hostVeth(id), "master"))
 			if err != nil {
@@ -208,6 +229,8 @@ func TestFeatureNetwork(t *testing.T) {
 
 	t.Run("Addresses", func(t *testing.T) {
 		explain(t, "each container gets an address of its own in %s, held in a reservation file", subnet)
+		// Each case pairs a container's ID with its state. state, with no
+		// field name, is embedded, so s.IPAddress reaches the state's field.
 		for _, s := range []struct {
 			id string
 			state

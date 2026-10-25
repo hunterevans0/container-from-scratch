@@ -2,6 +2,14 @@
 
 package runtime
 
+// cgroups (control groups) are how Linux limits and accounts for the
+// resources a group of processes uses: memory, CPU time, how many processes,
+// disk I/O. In cgroup version 2, they are directories under /sys/fs/cgroup.
+// Making a directory makes a cgroup; writing a number to a file in it, such
+// as memory.max, sets a limit; and every process listed in its cgroup.procs,
+// and their children, is held to it. Each container gets a cgroup of its
+// own, /sys/fs/cgroup/runt/<id>. For how to read the Go here, see doc.go.
+
 import (
 	"errors"
 	"fmt"
@@ -31,6 +39,8 @@ const (
 var cgroupControllers = []string{"cpu", "memory", "pids", "io"}
 
 // cgroupV2 reports whether the unified cgroup v2 hierarchy is mounted.
+// statfs describes the filesystem a path is on, including a number saying
+// what kind of filesystem it is.
 func cgroupV2() bool {
 	var stat syscall.Statfs_t
 	return syscall.Statfs(cgroupRoot, &stat) == nil && stat.Type == cgroup2SuperMagic
@@ -71,6 +81,9 @@ func createCgroup(id string, resources Resources) (string, error) {
 	return dir, nil
 }
 
+// setCgroupLimits writes each limit that is set to its file in the cgroup
+// directory dir. A limit left at zero isn't written, which leaves it
+// unlimited.
 func setCgroupLimits(dir string, resources Resources) error {
 	if resources.Memory > 0 {
 		memory := strconv.FormatInt(resources.Memory, 10)
@@ -85,6 +98,9 @@ func setCgroupLimits(dir string, resources Resources) error {
 		}
 	}
 	if resources.CPUs > 0 {
+		// cpu.max is "QUOTA PERIOD": the cgroup may run for QUOTA
+		// microseconds out of every PERIOD. --cpus 1.5 is a quota of
+		// 150000 out of 100000, one and a half CPUs' worth.
 		quota := int64(math.Round(resources.CPUs * cpuPeriod))
 		// The kernel rejects quotas under 1ms.
 		if quota < 1000 {
@@ -100,7 +116,9 @@ func setCgroupLimits(dir string, resources Resources) error {
 		}
 	}
 	// io.max takes one line per device, such as "8:0 rbps=1048576", and
-	// leaves the keys a line doesn't mention unchanged.
+	// leaves the keys a line doesn't mention unchanged. ioLimits is a slice
+	// of an anonymous struct type, declared right there, pairing each key
+	// with its limits, so one loop can handle all four.
 	ioLimits := []struct {
 		key    string
 		limits []DeviceLimit
@@ -126,7 +144,12 @@ func setCgroupLimits(dir string, resources Resources) error {
 }
 
 // blockDeviceNumber returns the "major:minor" number of the block device at
-// path.
+// path. The kernel knows a device by two numbers: the major number says
+// which driver (8 is SCSI disks), and the minor which device of that
+// driver's (0 is the first, sda). stat on a device file reports them packed
+// together in Rdev, which this unpacks with shifts (>>) and masks (&).
+// S_IFMT picks out the file's type from its mode, which must be S_IFBLK, a
+// block device.
 func blockDeviceNumber(path string) (string, error) {
 	var stat syscall.Stat_t
 	if err := syscall.Stat(path, &stat); err != nil {
@@ -148,7 +171,12 @@ func blockDeviceNumber(path string) (string, error) {
 // namespace, but they can take a moment to leave the cgroup.
 func removeCgroup(dir string) error {
 	// cgroup.kill sends SIGKILL to every process in the cgroup (Linux 5.14+).
+	// Assigning to _ says the error is ignored on purpose: an older kernel
+	// has no cgroup.kill.
 	_ = writeCgroupFile(dir, "cgroup.kill", "1")
+	// A cgroup can only be removed once it is empty; until then rmdir fails
+	// with EBUSY. "for range 50" repeats 50 times, waiting 20ms between
+	// tries, a second in all.
 	var err error
 	for range 50 {
 		if err = syscall.Rmdir(dir); err == nil || errors.Is(err, syscall.ENOENT) {
@@ -162,6 +190,9 @@ func removeCgroup(dir string) error {
 	return fmt.Errorf("remove cgroup %q: %w", dir, err)
 }
 
+// writeCgroupFile writes value to the cgroup file called name in dir, which
+// is how every cgroup setting is made. The error names the file and value,
+// since the kernel's own error ("invalid argument") rarely says which.
 func writeCgroupFile(dir, name, value string) error {
 	path := filepath.Join(dir, name)
 	if err := os.WriteFile(path, []byte(value), 0o644); err != nil {

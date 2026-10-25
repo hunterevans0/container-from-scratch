@@ -9,7 +9,14 @@ import (
 	"testing"
 )
 
-// dnsQuery makes a query asking for records of kind for name.
+// Tests for dns_linux.go: the DNS server's answers, without the parts that
+// need a container (its sockets in the container's namespace). The server
+// is given a pretend list of containers, and pretend upstream servers on
+// local ports. For how Go tests work, see "Tests" in doc.go.
+
+// dnsQuery makes a query asking for records of kind for name, laid out as
+// in the notes at the top of dns_linux.go: the header, then each label of
+// the name after its length, a zero byte, the type, and the class.
 func dnsQuery(id uint16, name string, kind uint16) []byte {
 	query := binary.BigEndian.AppendUint16(nil, id)
 	// RD, and one question.
@@ -32,6 +39,8 @@ type dnsResult struct {
 	address string
 }
 
+// parseReply reads a reply's ID, response code, number of answers, and the
+// last answer's address, which is the reply's last 4 bytes.
 func parseReply(t *testing.T, reply []byte) dnsResult {
 	t.Helper()
 	if len(reply) < 12 || reply[2]&0x80 == 0 {
@@ -48,6 +57,8 @@ func parseReply(t *testing.T, reply []byte) dnsResult {
 	return result
 }
 
+// TestParseDNSQuestion checks reading a query's question, and refusing
+// messages that are short or aren't queries.
 func TestParseDNSQuestion(t *testing.T) {
 	question, err := parseDNSQuestion(dnsQuery(7, "Web.MyNet", dnsTypeA))
 	if err != nil {
@@ -84,9 +95,15 @@ func testDNSServer(upstreams ...string) *dnsServer {
 	}
 }
 
+// TestDNSAnswersContainerNames checks the server's own answers: a
+// container's address, in any case and with the network's name after it,
+// no answers for other types of record, and SERVFAIL when a question it
+// can't answer has nowhere to go.
 func TestDNSAnswersContainerNames(t *testing.T) {
 	s := testDNSServer()
 	for _, name := range []string{"web", "WEB", "web.mynet"} {
+		// Structs can be compared with == when all their fields can; the
+		// parentheses around the literal are needed in an if.
 		got := parseReply(t, s.answer(dnsQuery(42, name, dnsTypeA), false))
 		if got != (dnsResult{id: 42, answers: 1, address: "10.89.0.2"}) {
 			t.Errorf("A for %s: got %+v; want 10.89.0.2", name, got)
@@ -116,6 +133,10 @@ func upstreamReply(query []byte) []byte {
 	return dnsReply(query, question, 0, []net.IP{{192, 0, 2, 1}})
 }
 
+// TestDNSForwardsOverUDP checks that a question about anything else goes to
+// the host's servers, the next one if the first doesn't answer, and their
+// reply comes back. The pretend upstream server listens on a free port
+// (":0" lets the system pick) and answers in a goroutine.
 func TestDNSForwardsOverUDP(t *testing.T) {
 	upstream, err := net.ListenPacket("udp4", "127.0.0.1:0")
 	if err != nil {
@@ -140,6 +161,8 @@ func TestDNSForwardsOverUDP(t *testing.T) {
 	}
 }
 
+// TestDNSForwardsOverTCP checks the same over TCP, with its length before
+// each message.
 func TestDNSForwardsOverTCP(t *testing.T) {
 	upstream, err := net.Listen("tcp4", "127.0.0.1:0")
 	if err != nil {

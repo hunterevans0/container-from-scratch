@@ -34,6 +34,11 @@ import (
 // token server at URL for a token, with the user name and password if there
 // are any, and send that instead. Docker Hub asks for a token even for
 // public images, and hands one out without credentials.
+//
+// Also here: reading and writing stored credentials (runt login and
+// logout). This file has no build constraint, so its tests, which serve a
+// pretend registry from the test itself, run anywhere. For how to read the
+// Go here, see doc.go.
 
 // manifestAccept lists the manifest types runt understands, for the Accept
 // header. A registry answers with the first one it has.
@@ -49,7 +54,9 @@ type registryClient struct {
 	base       string
 	repository string
 	// credentials returns the user name and password to log in with, if
-	// there are any. It is only called when the registry asks.
+	// there are any. It is only called when the registry asks. It is a
+	// field holding a function, so a public image never touches the stored
+	// credentials, and runt login and the tests can supply their own.
 	credentials func() (user, password string)
 	// authorization is the Authorization header to send, once the
 	// registry has asked for one.
@@ -74,6 +81,11 @@ func newRegistryClient(ref imageReference, warnings io.Writer) *registryClient {
 	}
 }
 
+// newHTTPClient makes the HTTP client registry requests go through. It
+// starts from a copy of Go's default transport (the part that opens
+// connections, and handles proxies and TLS), which DefaultTransport holds
+// as an interface; the type assertion takes out the *http.Transport so it
+// can be copied and changed.
 func newHTTPClient() *http.Client {
 	transport := http.DefaultTransport.(*http.Transport).Clone()
 	// Layers can take a long time to download, so there is no limit on a
@@ -101,6 +113,11 @@ func registryURL(host string) string {
 
 // get makes a GET request to the registry, logging in and trying again if
 // the registry asks for credentials.
+//
+// The loop runs at most twice: the first attempt, and if that gets 401
+// Unauthorized, one more with the credentials the challenge asked for.
+// After that, any answer, 401 included, is returned to the caller, whose
+// job it is to close the response's Body.
 func (c *registryClient) get(path string, accept string) (*http.Response, error) {
 	for attempt := 0; ; attempt++ {
 		request, err := http.NewRequest(http.MethodGet, c.base+path, nil)
@@ -139,6 +156,8 @@ func (c *registryClient) authenticate(challenge string) (string, error) {
 		if user == "" {
 			return "", errors.New("the registry needs a user name and password; log in with runt login")
 		}
+		// HTTP Basic authentication: "Basic " and USER:PASSWORD in base64,
+		// an encoding of bytes as letters, digits, + and /.
 		return "Basic " + base64.StdEncoding.EncodeToString([]byte(user+":"+password)), nil
 	case "bearer":
 		token, err := c.fetchToken(params, user, password)
@@ -193,6 +212,9 @@ func (c *registryClient) fetchToken(params map[string]string, user, password str
 	if response.StatusCode != http.StatusOK {
 		return "", fmt.Errorf("get a registry token: %s", response.Status)
 	}
+	// The token server answers with JSON holding the token, under either
+	// name. A json.Decoder reads JSON straight from the response, and
+	// LimitReader stops a server from sending without end.
 	var body struct {
 		Token       string `json:"token"`
 		AccessToken string `json:"access_token"`
@@ -213,6 +235,12 @@ func (c *registryClient) fetchToken(params map[string]string, user, password str
 // Bearer realm="https://auth.docker.io/token",service="registry.docker.io",
 // into its scheme and parameters. Values may be quoted, and quoted values
 // may contain commas.
+//
+// It reads one key=value pair per round of the loop, from the front of
+// rest, and then cuts it off. A quoted value is read a character at a time
+// up to its closing quote, with a backslash meaning "take the next
+// character as it is". The loop has a starting statement and a condition
+// but no step: each round moves rest along itself.
 func parseChallenge(header string) (scheme string, params map[string]string) {
 	scheme, rest, _ := strings.Cut(strings.TrimSpace(header), " ")
 	params = map[string]string{}
@@ -279,6 +307,8 @@ func (c *registryClient) fetchManifest(ref string) (ociDescriptor, []byte, error
 	if response.StatusCode != http.StatusOK {
 		return ociDescriptor{}, nil, registryError(response, "get manifest "+c.repository+":"+ref)
 	}
+	// Read one byte more than allowed, so a manifest that is too big shows
+	// up as too long, rather than being cut short and looking fine.
 	data, err := io.ReadAll(io.LimitReader(response.Body, maxMetadataSize+1))
 	if err != nil {
 		return ociDescriptor{}, nil, fmt.Errorf("read manifest: %w", err)
@@ -331,7 +361,11 @@ func (c *registryClient) fetchBlob(desc ociDescriptor, path string) error {
 	}
 	hash := sha256.New()
 	// One byte more than expected shows that the blob is too large.
+	// MultiWriter writes each piece both to the file and to the hash, so
+	// the digest is worked out as the blob downloads.
 	n, err := io.Copy(io.MultiWriter(file, hash), io.LimitReader(response.Body, desc.Size+1))
+	// Closing a written file can fail too (the data may only reach the disk
+	// then), so its error counts, unless there already was one.
 	if closeErr := file.Close(); err == nil {
 		err = closeErr
 	}
@@ -355,6 +389,7 @@ func (c *registryClient) fetchBlob(desc ociDescriptor, path string) error {
 // registry or "credsStore" for all. runt reads from those too, but runt
 // login always writes to "auths".
 
+// dockerConfigAuth is one registry's entry under "auths".
 type dockerConfigAuth struct {
 	Auth          string `json:"auth,omitempty"`
 	IdentityToken string `json:"identitytoken,omitempty"`
@@ -408,6 +443,8 @@ func storedCredentials(domain string) (user, password string, err error) {
 	if err != nil {
 		return "", "", err
 	}
+	// Decode the three fields runt reads. Errors are ignored: a field
+	// that is missing or malformed simply stays empty.
 	var auths map[string]dockerConfigAuth
 	var helpers map[string]string
 	var store string
@@ -452,6 +489,8 @@ func storedCredentials(domain string) (user, password string, err error) {
 // registry's credentials: it reads the registry's key on its input and
 // prints them as JSON.
 func helperCredentials(name, key string) (user, password string, err error) {
+	// strings.NewReader makes an io.Reader of a string, which becomes the
+	// helper's input. Output runs the program and returns what it printed.
 	command := exec.Command("docker-credential-"+name, "get")
 	command.Stdin = strings.NewReader(key)
 	output, err := command.Output()
@@ -508,6 +547,8 @@ func Login(server, user, password string) (string, error) {
 		return "", err
 	}
 	auth := dockerConfigAuth{Auth: base64.StdEncoding.EncodeToString([]byte(user + ":" + password))}
+	// The anonymous function is the change to make: set this registry's
+	// entry. updateDockerAuths does the reading and writing around it.
 	return path, updateDockerAuths(path, func(auths map[string]json.RawMessage) error {
 		data, err := json.Marshal(auth)
 		auths[credentialKey(domain)] = data
@@ -557,6 +598,9 @@ func loginDomain(server string) (string, error) {
 // updateDockerAuths changes the "auths" entries of config.json, keeping
 // everything else in the file as it was. The file holds passwords, so it
 // is only readable by its owner.
+//
+// json.RawMessage holds a piece of JSON undecoded, so entries and fields
+// runt doesn't understand are written back exactly as they were read.
 func updateDockerAuths(path string, change func(auths map[string]json.RawMessage) error) error {
 	config, err := readDockerConfig(path)
 	if err != nil {

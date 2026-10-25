@@ -16,8 +16,13 @@ import (
 	"time"
 )
 
+// Tests for attach_linux.go: the detach keys, and the supervisor's hub,
+// with real Unix sockets in a temporary directory. For how Go tests work,
+// see "Tests" in doc.go.
+
 // TestDetachFilter checks that Ctrl+P, Ctrl+Q is caught even across reads,
-// and that a Ctrl+P not followed by Ctrl+Q is passed on.
+// and that a Ctrl+P not followed by Ctrl+Q is passed on. "\x10" in a string
+// is the byte 0x10, Ctrl+P, and "\x11" is Ctrl+Q.
 func TestDetachFilter(t *testing.T) {
 	for _, test := range []struct {
 		reads  []string
@@ -49,6 +54,8 @@ func TestDetachFilter(t *testing.T) {
 }
 
 // syncBuffer is a bytes.Buffer safe to write from the hub's goroutines.
+// It stands in for the container's input: an io.Writer, since it has a
+// Write method.
 type syncBuffer struct {
 	mu  sync.Mutex
 	buf bytes.Buffer
@@ -88,7 +95,9 @@ func TestAttachHub(t *testing.T) {
 		defer conn.Close()
 		conns = append(conns, conn)
 	}
-	// Wait until the hub has both.
+	// Wait until the hub has both. The hub accepts them in a goroutine of
+	// its own, so the test checks every 10ms, up to a deadline, rather than
+	// assuming it already has.
 	for deadline := time.Now().Add(5 * time.Second); ; time.Sleep(10 * time.Millisecond) {
 		hub.mu.Lock()
 		n := len(hub.clients)
@@ -121,6 +130,8 @@ func TestAttachHub(t *testing.T) {
 			if err != nil {
 				break
 			}
+			// The exit code is a number in 4 bytes; fmt.Append writes it as
+			// text, "42", to compare with the others.
 			if kind == frameExit {
 				payload = fmt.Append(nil, binary.BigEndian.Uint32(payload))
 			}

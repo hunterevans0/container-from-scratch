@@ -1,7 +1,12 @@
 package runtime
 
+// Tests for ports.go: parsing -p and showing published ports. For how Go
+// tests work, see "Tests" in doc.go.
+
 import "testing"
 
+// TestParsePortMapping checks each form -p takes, and that malformed ones
+// are refused.
 func TestParsePortMapping(t *testing.T) {
 	for _, test := range []struct {
 		spec string
@@ -29,6 +34,7 @@ func TestParsePortMapping(t *testing.T) {
 	}
 }
 
+// TestPortMappingString checks that ports show as docker ps shows them.
 func TestPortMappingString(t *testing.T) {
 	for _, test := range []struct {
 		mapping PortMapping

@@ -1,12 +1,20 @@
 package runtime
 
+// The seccomp policy's system call numbers for 64-bit x86 (amd64). There is
+// no build constraint line: a file name ending in _linux_amd64.go means the
+// same, Linux on amd64 only. Every architecture numbers its system calls
+// differently, hence a file each. For how to read the Go here, see doc.go.
+
+// sysSeccomp is the seccomp system call's own number.
 const sysSeccomp = 317
 
 // sysSetns is setns, which the syscall package doesn't define here.
 const sysSetns = 308
 
 // Syscall numbers from <asm/unistd_64.h>. The denied list follows Docker's
-// default profile for a container without extra capabilities.
+// default profile for a container without extra capabilities. The struct
+// literal names each field it sets; denied is a slice literal of numbers,
+// each commented with the call's name.
 var nativeSeccompPolicy = seccompPolicy{
 	arch: 0xc000003e, // AUDIT_ARCH_X86_64
 	x32:  true,

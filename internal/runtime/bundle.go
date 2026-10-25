@@ -19,6 +19,14 @@ import (
 // LoadBundle). It always creates every namespace and applies its own
 // security settings (capabilities, seccomp, masked paths, no_new_privs), so
 // the fields for those are ignored.
+//
+// The structs below mirror config.json's layout: each field's json tag is
+// its key in the file, and json.Unmarshal fills in the fields whose keys it
+// finds, leaving the rest at their zero values. A field the file may leave
+// out entirely is a pointer (*specProcess, *int64), which stays nil if it
+// is missing, so runt can tell "not given" from "given as zero". This file
+// has no build constraint, so its tests run anywhere. For how to read the Go
+// here, see doc.go.
 
 // runtimeSpec is the part of config.json runt reads and writes.
 type runtimeSpec struct {
@@ -70,6 +78,8 @@ type specNamespace struct {
 	Path string `json:"path,omitempty"`
 }
 
+// specResources uses anonymous struct types, written right in the field
+// declarations, for its parts, since nothing else needs to name them.
 type specResources struct {
 	Memory *struct {
 		Limit *int64 `json:"limit,omitempty"`
@@ -183,6 +193,9 @@ func LoadBundle(config *Config) error {
 	if (config.UIDs.Size == 0) != (config.GIDs.Size == 0) {
 		return fmt.Errorf("bundle %s: give both uidMappings and gidMappings, or neither", dir)
 	}
+	// Limits from the file apply only if none were given on the command
+	// line. Each pointer is checked before it is followed: *p reads the
+	// value p points to, and following a nil pointer would crash.
 	if resources := spec.Linux.Resources; resources != nil && config.Resources.IsZero() {
 		if resources.Memory != nil && resources.Memory.Limit != nil && *resources.Memory.Limit > 0 {
 			config.Resources.Memory = *resources.Memory.Limit
@@ -205,6 +218,8 @@ func LoadBundle(config *Config) error {
 // quota is given, in microseconds.
 const cpuPeriodDefault = 100000
 
+// isStandardMount reports whether destination is one of standardMounts.
+// path.Clean tidies a path, as in /dev/ -> /dev, so either way matches.
 func isStandardMount(destination string) bool {
 	for _, mount := range standardMounts {
 		if path.Clean(destination) == mount.Destination {
@@ -216,6 +231,8 @@ func isStandardMount(destination string) bool {
 
 // specIDRange turns a config.json ID mapping into the single range runt
 // supports.
+// A switch with nothing after the word switch tries each case's condition
+// in turn, like a chain of if and else if.
 func specIDRange(mappings []specIDMapping, field string) (IDRange, error) {
 	switch {
 	case len(mappings) == 0:
@@ -232,6 +249,7 @@ func specIDRange(mappings []specIDMapping, field string) (IDRange, error) {
 // invoking user's /etc/subuid and /etc/subgid ranges.
 func WriteSpec(dir, rootfs string) error {
 	configPath := filepath.Join(dir, "config.json")
+	// Refuse to overwrite one: Stat succeeds if the file is there.
 	if _, err := os.Stat(configPath); err == nil {
 		return fmt.Errorf("%s already exists", configPath)
 	} else if !errors.Is(err, os.ErrNotExist) {

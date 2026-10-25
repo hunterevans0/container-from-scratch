@@ -1,3 +1,19 @@
+// Command runt is a small container runtime, run as runt COMMAND [OPTIONS],
+// as docker is. This file only reads the command line and prints results;
+// the work is done by the runtime package, in internal/runtime (see its
+// doc.go for an overview, and for how to read Go).
+//
+// package main is what makes a Go program, rather than a library: the
+// program starts by calling main, below. os.Args holds the command line:
+// os.Args[0] is the program's own name, os.Args[1] the command (run, ps,
+// and so on), and the rest that command's options and arguments.
+//
+// Each command has a function of its own, which parses its options with the
+// flag package: flags.StringVar(&variable, "name", default, help) defines
+// an option --name (or -name), whose value is stored in variable when
+// flags.Parse reads the arguments; BoolVar and IntVar likewise; flags.Func
+// calls a function with each value instead. What is left after the options
+// is flags.Args().
 package main
 
 import (
@@ -15,6 +31,9 @@ import (
 	"container-from-scratch/internal/runtime"
 )
 
+// main picks the function for the command named first on the command line,
+// and passes it the rest. Each one returns an error, nil on success, which
+// exit turns into runt's exit code.
 func main() {
 	if len(os.Args) < 2 {
 		usage()
@@ -61,7 +80,10 @@ func main() {
 		exit("runt", logout(args))
 	case "network":
 		exit("runt", networkCommand(args))
-	// Internal commands: runt runs itself with these.
+	// Internal commands: runt runs itself with these. Rather than ship
+	// separate programs for the container's init, the background monitor,
+	// and exec's helper, runt starts another copy of itself with one of
+	// these as its command (see container_linux.go and exec_linux.go).
 	case "--init":
 		exit("runt init", runtime.Init())
 	case "--monitor":
@@ -78,7 +100,9 @@ func main() {
 
 // exit ends runt after a command. If the error is the container's command
 // exiting unsuccessfully, runt exits with the same code, like docker run;
-// whatever went wrong has already been reported.
+// whatever went wrong has already been reported. flag.ErrHelp is what
+// parsing returns after printing the help for -h, which isn't a failure.
+// os.Exit ends the program at once, with the given code.
 func exit(prefix string, err error) {
 	if err == nil {
 		return
@@ -93,7 +117,11 @@ func exit(prefix string, err error) {
 	os.Exit(runtime.FailureCode(err))
 }
 
-// containerFlags defines the options run and create share.
+// containerFlags defines the options run and create share. Each option
+// stores its value straight into a field of config, through the field's
+// address (&config.Rootfs), so parsing the command line fills in the
+// container's configuration. ContinueOnError makes Parse return an error
+// for a bad option, rather than exit.
 func containerFlags(name string) (*flag.FlagSet, *runtime.Config) {
 	flags := flag.NewFlagSet(name, flag.ContinueOnError)
 	config := &runtime.Config{}
@@ -102,6 +130,8 @@ func containerFlags(name string) (*flag.FlagSet, *runtime.Config) {
 	flags.StringVar(&config.Bundle, "bundle", "", "OCI runtime bundle directory: config.json and the root filesystem it names")
 	flags.BoolVar(&config.Interactive, "i", false, "connect runt's standard input to the command; in the background, keep its input open for runt attach")
 	flags.BoolVar(&config.Tty, "t", false, "run the command on a pseudo-terminal of its own")
+	// Entrypoint is a pointer, so "not given" (nil) differs from "given as
+	// empty"; the function stores the address of its own copy of the value.
 	flags.Func("entrypoint", "replace the image's entrypoint (\"\" for none), which also drops its default command", func(s string) error {
 		config.Entrypoint = &s
 		return nil
@@ -130,6 +160,9 @@ func containerFlags(name string) (*flag.FlagSet, *runtime.Config) {
 	flags.StringVar(&config.UserSpec, "user", "", "same as -u")
 	flags.StringVar(&config.Name, "name", "", "a name to refer to the container by, besides its ID")
 	flags.StringVar(&config.Network, "network", "", "network to connect the container to: bridge (the default: an address of its own, and NAT to the outside), none (loopback only), or one made with runt network create, where containers find each other by name")
+	// flags.Func registers an option whose value is handed to a function,
+	// here publish, each time it is given, so -p can be repeated: each one
+	// adds a mapping. -p and --publish share the function.
 	publish := func(s string) error {
 		mapping, err := runtime.ParsePortMapping(s)
 		if err != nil {
@@ -143,6 +176,9 @@ func containerFlags(name string) (*flag.FlagSet, *runtime.Config) {
 	flags.StringVar(&config.UsernsUser, "userns-user", "", "user whose /etc/subuid and /etc/subgid ranges to map the container onto (default: the invoking user)")
 	flags.StringVar(&config.AppArmorProfile, "apparmor-profile", "", "loaded AppArmor profile to confine the command with (default: none)")
 	flags.BoolVar(&config.DebugInit, "debug-init", false, "pause the container's init process until a debugger attaches, and print its host PID")
+	// A pointer to config's Resources, so the functions below can set its
+	// fields more briefly. The memory function names its result (err), so
+	// it can assign to it in the same statement as the limit.
 	resources := &config.Resources
 	flags.Func("memory", "memory limit, such as 512m or 1g (the container may also swap this much)", func(s string) (err error) {
 		resources.Memory, err = runtime.ParseBytes(s)
@@ -164,6 +200,10 @@ func containerFlags(name string) (*flag.FlagSet, *runtime.Config) {
 		resources.PidsLimit = limit
 		return nil
 	})
+	// deviceFlag defines one of the four disk limit options, which differ
+	// only in their name, help, and which list they add to. limits is a
+	// pointer to the list, so append's result can be stored back into it
+	// (*limits = ...).
 	deviceFlag := func(name, usage string, limits *[]runtime.DeviceLimit, bytes bool) {
 		flags.Func(name, usage+" (repeatable)", func(s string) error {
 			limit, err := runtime.ParseDeviceLimit(s, bytes)
@@ -181,6 +221,8 @@ func containerFlags(name string) (*flag.FlagSet, *runtime.Config) {
 	return flags, config
 }
 
+// parseContainerFlags reads run's or create's options and command into
+// config, and checks they make sense together.
 func parseContainerFlags(flags *flag.FlagSet, config *runtime.Config, args []string) error {
 	if err := flags.Parse(expandCombinedFlags(flags, args)); err != nil {
 		return err
@@ -221,6 +263,10 @@ func parseContainerFlags(flags *flag.FlagSet, config *runtime.Config, args []str
 // first argument that isn't a flag, so the container's command is left
 // alone.
 func expandCombinedFlags(flags *flag.FlagSet, args []string) []string {
+	// isBool reports whether f is an on/off option, which takes no value.
+	// The flag package marks those with an IsBoolFlag method; the type
+	// assertion to an interface written in place, interface{ IsBoolFlag()
+	// bool }, asks whether the option's value has that method.
 	isBool := func(f *flag.Flag) bool {
 		b, ok := f.Value.(interface{ IsBoolFlag() bool })
 		return ok && b.IsBoolFlag()
@@ -241,6 +287,9 @@ func expandCombinedFlags(flags *flag.FlagSet, args []string) []string {
 			}
 			continue
 		}
+		// Not an option by its whole name: try it as single letters, each
+		// of which must be an on/off option. Ranging over a string gives
+		// each character (a rune) in turn.
 		var letters []string
 		if !strings.HasPrefix(arg, "--") && !hasValue {
 			for _, letter := range name {
@@ -260,6 +309,9 @@ func expandCombinedFlags(flags *flag.FlagSet, args []string) []string {
 	return expanded
 }
 
+// run is runt run: in the foreground, Run, which returns when the container
+// exits; with -d, Create, which returns once it is running. *config passes
+// the Config itself, a copy, rather than the pointer to it.
 func run(args []string) error {
 	flags, config := containerFlags("run")
 	flags.BoolVar(&config.Detach, "d", false, "run the container in the background and print its ID; see its output with runt logs, or connect to it with runt attach")
@@ -277,6 +329,7 @@ func run(args []string) error {
 	return nil
 }
 
+// create is runt create: set a container up, without starting its command.
 func create(args []string) error {
 	flags, config := containerFlags("create")
 	if err := parseContainerFlags(flags, config, args); err != nil {
@@ -290,6 +343,8 @@ func create(args []string) error {
 	return nil
 }
 
+// start is runt start. flags.Bool, unlike BoolVar, makes the variable
+// itself and returns a pointer to it, so its value is read as *attach.
 func start(args []string) error {
 	flags := flag.NewFlagSet("start", flag.ContinueOnError)
 	attach := flags.Bool("a", false, "attach to the container's output, and wait for it to exit")
@@ -306,6 +361,7 @@ func start(args []string) error {
 	return runtime.Attach(flags.Arg(0), runtime.AttachOptions{Stdin: *interactive, SigProxy: true, Start: true})
 }
 
+// attach is runt attach.
 func attach(args []string) error {
 	flags := flag.NewFlagSet("attach", flag.ContinueOnError)
 	noStdin := flags.Bool("no-stdin", false, "don't send runt's input to the container")
@@ -319,6 +375,10 @@ func attach(args []string) error {
 	return runtime.Attach(flags.Arg(0), runtime.AttachOptions{Stdin: !*noStdin, SigProxy: *sigProxy})
 }
 
+// stop is runt stop. The anonymous function stops one container; it can
+// use timeout, from stop, since it is defined inside it. A time.Duration
+// counts nanoseconds, so seconds are converted by multiplying by
+// time.Second.
 func stop(args []string) error {
 	flags := flag.NewFlagSet("stop", flag.ContinueOnError)
 	timeout := flags.Int("t", 10, "seconds to wait after SIGTERM before sending SIGKILL")
@@ -330,6 +390,7 @@ func stop(args []string) error {
 	})
 }
 
+// kill is runt kill.
 func kill(args []string) error {
 	flags := flag.NewFlagSet("kill", flag.ContinueOnError)
 	signal := flags.String("s", "KILL", "signal to send, by name (TERM, SIGUSR1) or number")
@@ -345,6 +406,7 @@ func kill(args []string) error {
 	})
 }
 
+// rm is runt rm.
 func rm(args []string) error {
 	flags := flag.NewFlagSet("rm", flag.ContinueOnError)
 	force := flags.Bool("f", false, "kill the container first if it is running")
@@ -357,7 +419,9 @@ func rm(args []string) error {
 }
 
 // eachContainer runs action on every container named in refs, printing each
-// one it succeeds for, as Docker does, and reporting the others.
+// one it succeeds for, as Docker does, and reporting the others. action is
+// a function passed in by the caller, such as runtime.Start, or an
+// anonymous function wrapping a call with more arguments.
 func eachContainer(refs []string, action func(ref string) error) error {
 	if len(refs) == 0 {
 		return errors.New("at least one container name or ID is required")
@@ -377,6 +441,9 @@ func eachContainer(refs []string, action func(ref string) error) error {
 	return nil
 }
 
+// execCommand is runt exec. (exec alone isn't used as the name, so as not to
+// be confused with the os/exec package.) The first argument after the
+// options is the container, and the rest the command.
 func execCommand(args []string) error {
 	flags := flag.NewFlagSet("exec", flag.ContinueOnError)
 	var options runtime.ExecOptions
@@ -396,6 +463,7 @@ func execCommand(args []string) error {
 	return runtime.Exec(args[0], command, options)
 }
 
+// spec is runt spec, which writes a starting config.json for a bundle.
 func spec(args []string) error {
 	flags := flag.NewFlagSet("spec", flag.ContinueOnError)
 	bundle := flags.String("bundle", ".", "directory to write config.json in")
@@ -409,6 +477,7 @@ func spec(args []string) error {
 	return runtime.WriteSpec(*bundle, *rootfs)
 }
 
+// pull is runt pull.
 func pull(args []string) error {
 	flags := flag.NewFlagSet("pull", flag.ContinueOnError)
 	if err := flags.Parse(args); err != nil {
@@ -420,6 +489,7 @@ func pull(args []string) error {
 	return runtime.Pull(flags.Arg(0), os.Stdout)
 }
 
+// images is runt images, which lists the image store as a table.
 func images(args []string) error {
 	flags := flag.NewFlagSet("images", flag.ContinueOnError)
 	quiet := flags.Bool("q", false, "show only image IDs")
@@ -434,6 +504,8 @@ func images(args []string) error {
 	if err != nil {
 		return err
 	}
+	// With -q, each ID once, even for an image with several names: seen is
+	// a set of the IDs printed so far.
 	if *quiet {
 		seen := map[string]bool{}
 		for _, image := range list {
@@ -444,6 +516,8 @@ func images(args []string) error {
 		}
 		return nil
 	}
+	// A tabwriter lines up tab-separated columns, padding each with spaces
+	// to its widest entry plus 3, once Flush is called.
 	table := tabwriter.NewWriter(os.Stdout, 0, 0, 3, ' ', 0)
 	header := "REPOSITORY\tTAG\tIMAGE ID\tCREATED\tSIZE"
 	if *digests {
@@ -477,6 +551,8 @@ func shortID(id string) string {
 	return id
 }
 
+// rmi is runt rmi, which removes each image named, reporting the ones it
+// can't.
 func rmi(args []string) error {
 	flags := flag.NewFlagSet("rmi", flag.ContinueOnError)
 	force := flags.Bool("f", false, "remove an image that has several names, or that containers were made from")
@@ -499,6 +575,9 @@ func rmi(args []string) error {
 	return nil
 }
 
+// login is runt login. The password comes from -p, from standard input with
+// --password-stdin, or else from a prompt, typed without being shown.
+// *password = ... sets the variable flags.String made, through its pointer.
 func login(args []string) error {
 	flags := flag.NewFlagSet("login", flag.ContinueOnError)
 	user := flags.String("u", "", "user name")
@@ -544,6 +623,8 @@ func login(args []string) error {
 	return nil
 }
 
+// logout is runt logout. flags.Arg(0) is "" if no registry was given,
+// which means Docker Hub.
 func logout(args []string) error {
 	flags := flag.NewFlagSet("logout", flag.ContinueOnError)
 	if err := flags.Parse(args); err != nil {
@@ -564,6 +645,7 @@ func logout(args []string) error {
 	return nil
 }
 
+// logs is runt logs.
 func logs(args []string) error {
 	flags := flag.NewFlagSet("logs", flag.ContinueOnError)
 	var options runtime.LogOptions
@@ -579,6 +661,8 @@ func logs(args []string) error {
 	return runtime.Logs(flags.Arg(0), options, os.Stdout, os.Stderr)
 }
 
+// ps is runt ps, which lists containers as a table, a row each, with its
+// columns separated by tabs for the tabwriter to line up.
 func ps(args []string) error {
 	flags := flag.NewFlagSet("ps", flag.ContinueOnError)
 	all := flags.Bool("a", false, "show stopped containers too")
@@ -607,6 +691,10 @@ func ps(args []string) error {
 	return table.Flush()
 }
 
+// networkCommand runs runt network and its subcommands, create, ls, and rm,
+// which args[0] names. The work is in the runtime package (see
+// internal/runtime/networks_linux.go); this only reads the options and
+// prints the results.
 func networkCommand(args []string) error {
 	const usage = "usage: runt network create [--subnet CIDR] NAME | ls | rm NAME ..."
 	if len(args) == 0 {
@@ -636,6 +724,8 @@ func networkCommand(args []string) error {
 		if err != nil {
 			return err
 		}
+		// A tabwriter lines up tab-separated columns, padding each to its
+		// widest entry, once Flush is called.
 		table := tabwriter.NewWriter(os.Stdout, 0, 0, 3, ' ', 0)
 		fmt.Fprintln(table, "NETWORK ID\tNAME\tSUBNET\tBRIDGE")
 		for _, network := range networks {
@@ -646,11 +736,15 @@ func networkCommand(args []string) error {
 		if len(args) == 1 {
 			return errors.New("usage: runt network rm NAME ...")
 		}
+		// eachContainer, made for rm and the like, works for networks too:
+		// it calls RemoveNetwork for each name, and reports each one.
 		return eachContainer(args[1:], runtime.RemoveNetwork)
 	}
 	return errors.New(usage)
 }
 
+// statusText is a container's STATUS as runt ps shows it, as docker ps
+// does: Created, Up 5 minutes, or Exited (0) 2 hours ago.
 func statusText(state *runtime.State, now time.Time) string {
 	switch state.Status {
 	case runtime.StatusCreated:
@@ -664,6 +758,8 @@ func statusText(state *runtime.State, now time.Time) string {
 	return fmt.Sprintf("Exited (%d) %s ago", *state.ExitCode, humanDuration(now.Sub(state.Finished)))
 }
 
+// shortCommand is a container's command for runt ps: at most 30 characters,
+// in quotes. strconv.Quote adds the quotes, and escapes anything unprintable.
 func shortCommand(command []string) string {
 	text := strings.Join(command, " ")
 	if len(text) > 30 {
@@ -672,6 +768,9 @@ func shortCommand(command []string) string {
 	return strconv.Quote(text)
 }
 
+// humanDuration is a duration in the largest whole unit that fits, as in
+// "3 minutes", for CREATED and STATUS. plural is a small helper for "1
+// minute" but "2 minutes".
 func humanDuration(d time.Duration) string {
 	plural := func(n int, unit string) string {
 		if n == 1 {
@@ -693,6 +792,8 @@ func humanDuration(d time.Duration) string {
 	}
 }
 
+// usage prints the list of commands. The text is one raw string, between
+// backquotes, which keeps its line breaks as written.
 func usage() {
 	fmt.Fprint(os.Stderr, `usage: runt COMMAND [OPTIONS]
 

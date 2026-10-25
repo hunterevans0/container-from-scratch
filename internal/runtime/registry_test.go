@@ -15,6 +15,11 @@ import (
 	"testing"
 )
 
+// Tests for registry.go: talking to a registry, and stored credentials. The
+// registry is a pretend one, served by the test itself on a local port with
+// httptest, so the tests need no internet. For how Go tests work, see
+// "Tests" in doc.go.
+
 // testRegistry is a registry for tests. Like Docker Hub, it hands out tokens
 // for pulling, checking a user name and password if it has one, and sends
 // blob requests on to another path, as a registry would to a CDN.
@@ -33,6 +38,10 @@ type testRegistry struct {
 
 const testToken = "test-token"
 
+// newTestRegistry starts the registry. httptest.NewServer serves HTTP on a
+// free local port, calling the handler it is given for each request:
+// http.HandlerFunc turns the method r.serve into one. The server is shut
+// down when the test ends.
 func newTestRegistry(t *testing.T) *testRegistry {
 	r := &testRegistry{t: t, blobs: map[string][]byte{}, types: map[string]string{}, tags: map[string]string{}}
 	r.server = httptest.NewServer(http.HandlerFunc(r.serve))
@@ -45,6 +54,10 @@ func (r *testRegistry) host() string {
 	return strings.TrimPrefix(r.server.URL, "http://")
 }
 
+// serve answers one request, as a registry would, by its path: the token
+// server, the "CDN" blobs are redirected to, and, once the request carries
+// a token, the API's manifests and blobs. What is written to w is the
+// response; req is the request.
 func (r *testRegistry) serve(w http.ResponseWriter, req *http.Request) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
@@ -109,6 +122,8 @@ func (r *testRegistry) blob(mediaType string, data []byte) ociDescriptor {
 	return ociDescriptor{MediaType: mediaType, Digest: digest, Size: int64(len(data))}
 }
 
+// jsonBlob stores v, encoded as JSON, and remembers the media type of
+// manifests and indexes, to send as their Content-Type.
 func (r *testRegistry) jsonBlob(mediaType string, v any) ociDescriptor {
 	data, err := json.Marshal(v)
 	if err != nil {
@@ -154,6 +169,7 @@ func (r *testRegistry) multiPlatform(marker string) ociDescriptor {
 	}})
 }
 
+// tag points tag at the manifest or index desc describes.
 func (r *testRegistry) tag(tag string, desc ociDescriptor) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
@@ -253,6 +269,7 @@ func TestRegistryClient(t *testing.T) {
 func TestStoredCredentials(t *testing.T) {
 	dir := t.TempDir()
 	t.Setenv("DOCKER_CONFIG", dir)
+	// "Ym9iOmh1bnRlcjI=" is base64 for bob:hunter2.
 	config := `{"auths":{"https://index.docker.io/v1/":{"auth":"Ym9iOmh1bnRlcjI="},"ghcr.io":{}},"psFormat":"table {{.ID}}"}`
 	if err := os.WriteFile(filepath.Join(dir, "config.json"), []byte(config), 0o600); err != nil {
 		t.Fatal(err)

@@ -8,6 +8,19 @@
 // range, so a process in one is the same host user as a process in the
 // other. Their own files are kept apart by a writable layer each
 // (filesystem_test.go), but a shared bind mount would be open to both.
+//
+// Reading these tests if you don't know Go: see the guide in
+// internal/runtime/doc.go, including its "Tests" section. In short, each
+// TestSomething function is a test; t.Run runs a named part of one (a
+// subtest); t.Fatalf fails and stops it, t.Errorf fails and carries on;
+// t.Cleanup registers something to undo when it ends; and t.Skip skips it.
+// The build constraint "integration && linux" means these files are only
+// compiled with -tags integration, on Linux, which make integration passes.
+// They drive runt as a user would, running the built binary with
+// exec.Command and checking its output and the files it leaves in /run/runt.
+//
+// This file has the helpers the other files share (runtTester and its
+// methods), and the test that containers can't reach each other.
 package integration
 
 import (
@@ -23,6 +36,9 @@ import (
 )
 
 // state is the part of /run/runt/<id>/state.json these tests read.
+// json.Unmarshal fills in the fields whose tags match keys in the file, and
+// ignores the rest. Ports is a slice of an anonymous struct type, declared
+// in place.
 type state struct {
 	Status    string `json:"status"`
 	Pid       int    `json:"pid"`
@@ -44,7 +60,9 @@ func envOr(key, fallback string) string {
 	return fallback
 }
 
-// runtTester runs runt commands for one test.
+// runtTester runs runt commands for one test. Its methods (functions with
+// r *runtTester before their name) are how the tests start containers and
+// run commands in them.
 type runtTester struct {
 	t      *testing.T
 	binary string
@@ -72,7 +90,9 @@ func newRuntTester(t *testing.T) *runtTester {
 	return &runtTester{t: t, binary: binary, rootfs: rootfs}
 }
 
-// runt runs runt with args and returns its combined output.
+// runt runs runt with args and returns its combined output: stdout and
+// stderr together. args ...string takes any number of arguments, which
+// arrive as a slice; args... passes them on one by one.
 func (r *runtTester) runt(args ...string) (string, error) {
 	output, err := exec.Command(r.binary, args...).CombinedOutput()
 	return string(output), err
@@ -95,6 +115,8 @@ func (r *runtTester) startWith(name string, options []string, command ...string)
 	if err != nil {
 		r.t.Fatalf("runt %s: %v\n%s", strings.Join(args, " "), err, output)
 	}
+	// runt run -d prints the container's ID. Wait, checking every 50ms,
+	// until its state says it is running.
 	id := strings.TrimSpace(output)
 	deadline := time.Now().Add(5 * time.Second)
 	for readState(r.t, id).Status != "running" {
@@ -147,6 +169,8 @@ func TestContainersAreIsolated(t *testing.T) {
 	idB := r.start("runt-iso-b", "/bin/sleep", "3002")
 	b := readState(t, idB)
 
+	// Each t.Run is a subtest, given a name and an anonymous function. Its
+	// t is the subtest's own, which shadows (hides) the outer one inside it.
 	t.Run("cannot see processes", func(t *testing.T) {
 		script := `cat /proc/[0-9]*/cmdline | tr '\0' ' '`
 		output, err := r.exec("runt-iso-a", script)

@@ -15,6 +15,9 @@ import (
 // An image's configuration says how to run it, with the same defaults a
 // Dockerfile's ENTRYPOINT, CMD, ENV, WORKDIR, and USER set. Options on the
 // command line override them, as with docker run.
+//
+// This file has no build constraint, so its tests run anywhere. For how to
+// read the Go here, see doc.go.
 
 // defaultPath is the PATH a container gets if its image doesn't set one, as
 // in Docker.
@@ -43,6 +46,9 @@ func applyImageConfig(config *Config, image *ociImage) error {
 	if len(config.Command) > 0 {
 		cmd = config.Command
 	}
+	// Starting from an empty slice ([]string{}) makes a new list, rather
+	// than adding cmd onto the image's own entrypoint slice and changing
+	// it.
 	config.Command = append(append([]string{}, entrypoint...), cmd...)
 	if len(config.Command) == 0 {
 		return errors.New("the image has no default command; give one after the options")
@@ -70,6 +76,8 @@ func applyImageConfig(config *Config, image *ociImage) error {
 	return checkCwd(config.Cwd)
 }
 
+// checkCwd rejects a working directory that isn't an absolute path, since
+// there is nothing for a relative one to be relative to.
 func checkCwd(cwd string) error {
 	if cwd != "" && !path.IsAbs(cwd) {
 		return fmt.Errorf("the working directory %q must be an absolute path", cwd)
@@ -112,7 +120,8 @@ func mergeEnv(env, overrides []string) []string {
 // says it means. The files come from the image, so they are read with care:
 // only regular files, and only so much of them.
 
-// maxAccountFile caps how much of /etc/passwd or /etc/group is read.
+// maxAccountFile caps how much of /etc/passwd or /etc/group is read: 16 <<
+// 20 is 16 times 2 to the 20th, 16MB.
 const maxAccountFile = 16 << 20
 
 // passwdEntry is a line of /etc/passwd.
@@ -131,7 +140,10 @@ type groupEntry struct {
 }
 
 // openAccountFile opens /etc/passwd or /etc/group, or returns nil if there
-// isn't one.
+// isn't one. An image could make either something other than a file, such
+// as a FIFO that would block reading forever, or a link to /dev/zero that
+// never ends, hence the check. io.ReadCloser is an interface for anything
+// that can be read and closed, as an *os.File can.
 func openAccountFile(name string) (io.ReadCloser, error) {
 	file, err := os.Open(name)
 	if errors.Is(err, os.ErrNotExist) {
@@ -156,6 +168,9 @@ func readAccountFile(name string, entry func(fields []string)) error {
 		return err
 	}
 	defer file.Close()
+	// LimitReader stops after maxAccountFile bytes. A Scanner reads a line
+	// at a time; Buffer lets a line be up to 1MB, rather than its default
+	// 64KB.
 	scanner := bufio.NewScanner(io.LimitReader(file, maxAccountFile))
 	scanner.Buffer(make([]byte, 64*1024), 1<<20)
 	for scanner.Scan() {
@@ -168,6 +183,10 @@ func readAccountFile(name string, entry func(fields []string)) error {
 	return scanner.Err()
 }
 
+// readPasswd reads /etc/passwd's entries. The anonymous function is called
+// for each line, and adds to entries, a variable of readPasswd's, which it
+// can reach because it is defined inside readPasswd. A line that doesn't
+// parse is skipped (return, in the anonymous function, ends only it).
 func readPasswd(name string) ([]passwdEntry, error) {
 	var entries []passwdEntry
 	err := readAccountFile(name, func(fields []string) {
@@ -184,6 +203,7 @@ func readPasswd(name string) ([]passwdEntry, error) {
 	return entries, err
 }
 
+// readGroup reads /etc/group's entries, as readPasswd does /etc/passwd's.
 func readGroup(name string) ([]groupEntry, error) {
 	var entries []groupEntry
 	err := readAccountFile(name, func(fields []string) {
@@ -221,6 +241,7 @@ func resolveUser(spec string, passwd []passwdEntry, groups []groupEntry) (user U
 	uid, numeric := parseID(userPart)
 	var gid int
 	found := false
+	// Several variables can be set at once, a, b = x, y.
 	for _, entry := range passwd {
 		if (numeric && entry.uid == uid) || (!numeric && entry.name == userPart) {
 			uid, gid, home, name, found = entry.uid, entry.gid, entry.home, entry.name, true
@@ -262,7 +283,9 @@ func resolveUser(spec string, passwd []passwdEntry, groups []groupEntry) (user U
 	return user, home, nil
 }
 
-// parseID parses a numeric user or group ID.
+// parseID parses a numeric user or group ID. ParseUint with 31 bits accepts
+// only numbers that fit in 31 bits, so the ID can't be negative as an int,
+// or overflow it.
 func parseID(s string) (int, bool) {
 	id, err := strconv.ParseUint(s, 10, 31)
 	return int(id), err == nil

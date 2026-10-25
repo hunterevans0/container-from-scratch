@@ -1,5 +1,11 @@
 package runtime
 
+// Resource limits (--memory, --cpus, --pids-limit, and the disk I/O limits):
+// their types, and parsing the options' values. Applying them, through the
+// container's cgroup, is in cgroup_linux.go. This file has no build
+// constraint, so the parsing works, and is tested, anywhere. For how to read
+// the Go here, see doc.go.
+
 import (
 	"fmt"
 	"strconv"
@@ -39,6 +45,12 @@ type DeviceLimit struct {
 
 // ParseBytes parses a size such as "512m", "1g", or "1048576". Units are
 // powers of 1024 and may end in an optional "b", as in Docker ("512mb").
+//
+// It strips the "b", then looks at the last character for a unit: k, m, g,
+// or t, each 1024 times the one before, written as 1 << 10 (1 shifted left
+// 10 bits, which is 2 to the 10th power, 1024) and so on. What is left must
+// be a whole number. text[len(text)-1] is the last byte of the string, and
+// text[:len(text)-1] everything before it.
 func ParseBytes(s string) (int64, error) {
 	text := strings.ToLower(strings.TrimSpace(s))
 	text = strings.TrimSuffix(text, "b")
@@ -58,10 +70,14 @@ func ParseBytes(s string) (int64, error) {
 			text = text[:len(text)-1]
 		}
 	}
+	// ParseInt reads a number written in base 10 that fits in 64 bits.
 	value, err := strconv.ParseInt(text, 10, 64)
 	if err != nil || value <= 0 {
 		return 0, fmt.Errorf("invalid size %q: want a positive number with an optional unit (k, m, g, t)", s)
 	}
+	// 1<<63-1 is the largest number an int64 can hold. If value times the
+	// unit would be bigger, the multiplication would overflow, wrapping
+	// round to a wrong (even negative) number, so it is refused instead.
 	if value > (1<<63-1)/multiplier {
 		return 0, fmt.Errorf("size %q is too large", s)
 	}
@@ -69,7 +85,9 @@ func ParseBytes(s string) (int64, error) {
 }
 
 // ParseDeviceLimit parses "PATH:RATE", such as "/dev/sda:1mb". With bytes
-// set, RATE may have a size unit; otherwise it is a plain count.
+// set, RATE may have a size unit; otherwise it is a plain count. The bytes
+// form is for --device-read-bps and --device-write-bps (bytes per second),
+// and the count for the -iops options (operations per second).
 func ParseDeviceLimit(s string, bytes bool) (DeviceLimit, error) {
 	path, rateText, ok := strings.Cut(s, ":")
 	if !ok || path == "" || rateText == "" {

@@ -1,5 +1,9 @@
 package runtime
 
+// Tests for imageconfig.go: combining an image's defaults with the command
+// line, and looking users up in /etc/passwd and /etc/group. For how Go
+// tests work, see "Tests" in doc.go.
+
 import (
 	"os"
 	"path/filepath"
@@ -17,6 +21,8 @@ func TestApplyImageConfig(t *testing.T) {
 	defaults.Env = []string{"PATH=/image/bin", "A=1", "B=2"}
 	defaults.WorkingDir = "/app"
 	defaults.User = "app"
+	// Config.Entrypoint is a *string, so the cases need variables to point
+	// at: &empty and &other.
 	empty := ""
 	other := "/other"
 
@@ -36,6 +42,7 @@ func TestApplyImageConfig(t *testing.T) {
 		{"-e, -w, -u, -t", Config{SetEnv: []string{"B=3", "C=4"}, Cwd: "/work", UserSpec: "0:0", Tty: true},
 			Config{Command: []string{"/entry", "default", "args"}, Env: []string{"PATH=/image/bin", "A=1", "B=3", "TERM=xterm", "C=4"}, Cwd: "/work", UserSpec: "0:0", Tty: true}},
 	} {
+		// A copy of the case's config, since applyImageConfig changes it.
 		config := test.config
 		if err := applyImageConfig(&config, image); err != nil {
 			t.Errorf("%s: %v", test.name, err)
@@ -70,6 +77,8 @@ func TestApplyImageConfig(t *testing.T) {
 // TestResolveUser checks user specifications against an /etc/passwd and
 // /etc/group.
 func TestResolveUser(t *testing.T) {
+	// The files' contents are raw strings, between backquotes, which can
+	// span lines.
 	dir := t.TempDir()
 	passwdPath := filepath.Join(dir, "passwd")
 	groupPath := filepath.Join(dir, "group")
@@ -137,6 +146,8 @@ audio:x:29:app,other
 	}
 }
 
+// TestMergeEnv checks that -e settings replace every earlier setting of the
+// same variable, and add the ones that are new.
 func TestMergeEnv(t *testing.T) {
 	got := mergeEnv([]string{"A=1", "B=2", "A=3"}, []string{"A=x", "C=y", "B="})
 	if want := []string{"A=x", "B=", "A=x", "C=y"}; !slices.Equal(got, want) {

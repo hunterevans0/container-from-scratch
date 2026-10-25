@@ -20,6 +20,11 @@ import (
 	"testing"
 )
 
+// Filesystem tests: each container's own writable layer, running an OCI
+// image built by the test, and running an OCI runtime bundle. Also the
+// helpers that build image layouts, which features_test.go uses too. For
+// how to read these tests, see the top of isolation_test.go.
+
 // TestWritableLayerPerContainer checks that two containers started from the
 // same rootfs each write to a layer of their own: neither sees the other's
 // files, the rootfs itself is left alone, and runt rm deletes the layer.
@@ -65,12 +70,16 @@ func TestWritableLayerPerContainer(t *testing.T) {
 	}
 }
 
-// layoutBuilder writes an OCI image layout for the tests.
+// layoutBuilder writes an OCI image layout for the tests. The JSON documents
+// are built as map[string]any, a JSON object with values of any type, so the
+// tests can write exactly the fields they want, including ones runt would
+// reject.
 type layoutBuilder struct {
 	t   *testing.T
 	dir string
 }
 
+// newLayoutBuilder makes an empty layout in a temporary directory.
 func newLayoutBuilder(t *testing.T) *layoutBuilder {
 	t.Helper()
 	b := &layoutBuilder{t: t, dir: t.TempDir()}
@@ -83,7 +92,8 @@ func newLayoutBuilder(t *testing.T) *layoutBuilder {
 
 // baseLayer is the rootfs as an uncompressed layer, plus /srv/old, made once
 // for every test that needs an image, since tarring the rootfs takes a
-// while. TestMain removes it.
+// while. TestMain removes it. sync.Once runs the function given to its Do
+// only the first time, however many tests call it.
 var baseLayer struct {
 	once   sync.Once
 	dir    string
@@ -124,6 +134,7 @@ func (b *layoutBuilder) addBaseLayer(r *runtTester) (map[string]any, string) {
 	if baseLayer.path == "" {
 		b.t.Fatal("making the base layer failed in an earlier test")
 	}
+	// A hard link puts the one big file into this layout without copying it.
 	if err := os.Link(baseLayer.path, filepath.Join(b.dir, "blobs/sha256", baseLayer.digest)); err != nil {
 		b.t.Fatal(err)
 	}
@@ -177,7 +188,9 @@ func tagged(desc map[string]any, tag string) map[string]any {
 }
 
 // TestMain removes the base layer, and what runt unpacked of it, once every
-// test is done with them.
+// test is done with them. A package's TestMain, if it has one, runs instead
+// of its tests: m.Run runs them all and returns the exit code, and the
+// code after it is the cleanup.
 func TestMain(m *testing.M) {
 	code := m.Run()
 	if baseLayer.dir != "" {
@@ -201,6 +214,7 @@ func (b *layoutBuilder) blob(mediaType string, data []byte) map[string]any {
 	return map[string]any{"mediaType": mediaType, "digest": "sha256:" + encoded, "size": len(data)}
 }
 
+// jsonBlob stores v, encoded as JSON, as a blob.
 func (b *layoutBuilder) jsonBlob(mediaType string, v any) map[string]any {
 	b.t.Helper()
 	data, err := json.Marshal(v)
@@ -210,6 +224,7 @@ func (b *layoutBuilder) jsonBlob(mediaType string, v any) map[string]any {
 	return b.blob(mediaType, data)
 }
 
+// writeJSON writes v, encoded as JSON, as the layout's file called name.
 func (b *layoutBuilder) writeJSON(name string, v any) {
 	b.t.Helper()
 	data, err := json.Marshal(v)
@@ -226,6 +241,10 @@ func (b *layoutBuilder) writeJSON(name string, v any) {
 // it, plus extra entries.
 func tarRootfs(t *testing.T, rootfs string, uidBase, gidBase int, out io.Writer, extra func(*tar.Writer)) {
 	t.Helper()
+	// WalkDir calls the function for every file and directory under
+	// rootfs, parents before their contents, which is the order a tar
+	// archive needs. FileInfoHeader makes a tar header from a file's
+	// details; the owner is then shifted back down by the ID range's base.
 	archive := tar.NewWriter(out)
 	err := filepath.WalkDir(rootfs, func(path string, entry fs.DirEntry, err error) error {
 		if err != nil {
@@ -277,6 +296,7 @@ func tarRootfs(t *testing.T, rootfs string, uidBase, gidBase int, out io.Writer,
 	}
 }
 
+// addFile adds a regular file called name, holding content, to archive.
 func addFile(t *testing.T, archive *tar.Writer, name, content string) {
 	t.Helper()
 	header := &tar.Header{Name: name, Typeflag: tar.TypeReg, Mode: 0o644, Size: int64(len(content))}
@@ -302,7 +322,8 @@ func TestImage(t *testing.T) {
 	// The base layer, uncompressed: the rootfs, plus /srv/old.
 	base, baseDiff := b.addBaseLayer(r)
 
-	// The top layer, gzipped.
+	// The top layer, gzipped: built in memory as a tar archive, whose hash
+	// is its diff ID, then compressed, whose hash is its digest.
 	var topTar strings.Builder
 	archive := tar.NewWriter(&topTar)
 	addFile(t, archive, "runt-image-test", "from-layer-2\n")
@@ -322,6 +343,8 @@ func TestImage(t *testing.T) {
 	// The unpacked layers are shared by every container from the image;
 	// remove the top one once this test is done with it (TestMain removes
 	// the base).
+	// top["digest"] is an any, since top is a map[string]any; .(string)
+	// takes out the string it holds.
 	store := fmt.Sprintf("/var/lib/runt/layers/%d-%d", rootStat.Uid, rootStat.Gid)
 	t.Cleanup(func() {
 		os.RemoveAll(filepath.Join(store, strings.TrimPrefix(top["digest"].(string), "sha256:")))

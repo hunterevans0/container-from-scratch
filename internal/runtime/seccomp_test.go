@@ -1,12 +1,20 @@
 package runtime
 
+// Tests for seccomp.go: rather than install the filter, which would be
+// permanent and need Linux, the test runs the BPF program itself, in a
+// small interpreter, and checks the verdict for each kind of call. For how
+// Go tests work, see "Tests" in doc.go.
+
 import (
 	"encoding/binary"
 	"testing"
 )
 
 // runFilter interprets program the way the kernel would for one syscall and
-// returns the verdict.
+// returns the verdict. It fakes struct seccomp_data in a byte slice, then
+// steps through the instructions: pc is the program counter, the index of
+// the instruction to run, and a jump adds jt or jf to it (on top of the
+// loop's own pc++).
 func runFilter(t *testing.T, program []bpfInstruction, arch, nr uint32, arg0 uint64) uint32 {
 	t.Helper()
 	// struct seccomp_data: nr, arch, instruction pointer, six arguments.
@@ -40,6 +48,7 @@ func runFilter(t *testing.T, program []bpfInstruction, arch, nr uint32, arg0 uin
 			pc += int(instruction.jf)
 		}
 	}
+	// t.Fatal stops the test, but Go still needs a return statement here.
 	t.Fatal("ran off the end of the filter")
 	return 0
 }
@@ -99,6 +108,7 @@ func TestSeccompFilter(t *testing.T) {
 		{"personality ADDR_NO_RANDOMIZE", arch, personality, 0x40000, eperm},
 		{"personality READ_IMPLIES_EXEC", arch, personality, 0x400000, eperm},
 	}
+	// %#x in the messages prints a number in hex with a 0x prefix.
 	program := buildSeccompFilter(policy)
 	for _, test := range tests {
 		if got := runFilter(t, program, test.arch, test.nr, test.arg0); got != test.want {

@@ -1,5 +1,11 @@
 package runtime
 
+// The seccomp policy's system call numbers for 64-bit ARM (arm64). The file
+// name ending in _linux_arm64.go limits it to Linux on arm64, as a build
+// constraint would. See seccomp_linux_amd64.go for amd64's, and doc.go for
+// how to read the Go here.
+
+// sysSeccomp is the seccomp system call's own number.
 const sysSeccomp = 277
 
 // sysSetns is setns, which the syscall package doesn't define here.

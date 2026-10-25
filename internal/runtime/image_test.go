@@ -1,5 +1,9 @@
 package runtime
 
+// Tests for image.go: reading OCI image layouts. The tests build small
+// layouts of their own, in temporary directories, with testLayout. For how
+// Go tests work, see "Tests" in doc.go.
+
 import (
 	"crypto/sha256"
 	"encoding/hex"
@@ -11,12 +15,15 @@ import (
 	"testing"
 )
 
-// testLayout builds an OCI image layout in a temporary directory.
+// testLayout builds an OCI image layout in a temporary directory. It keeps
+// the test's t, so its methods can fail the test themselves.
 type testLayout struct {
 	t   *testing.T
 	dir string
 }
 
+// newTestLayout makes an empty layout: the blobs directory and the
+// oci-layout file.
 func newTestLayout(t *testing.T) *testLayout {
 	t.Helper()
 	dir := t.TempDir()
@@ -40,6 +47,7 @@ func (l *testLayout) blob(mediaType string, data []byte) ociDescriptor {
 	return ociDescriptor{MediaType: mediaType, Digest: "sha256:" + encoded, Size: int64(len(data))}
 }
 
+// jsonBlob stores v, encoded as JSON, as a blob.
 func (l *testLayout) jsonBlob(mediaType string, v any) ociDescriptor {
 	l.t.Helper()
 	data, err := json.Marshal(v)
@@ -65,6 +73,8 @@ func (l *testLayout) image(marker string) ociDescriptor {
 	})
 }
 
+// index writes index.json, listing entries. The ... makes index variadic:
+// it takes any number of descriptors, which arrive as a slice.
 func (l *testLayout) index(entries ...ociDescriptor) {
 	l.t.Helper()
 	data, err := json.Marshal(ociIndex{SchemaVersion: 2, MediaType: mediaTypeImageIndex, Manifests: entries})
@@ -76,6 +86,8 @@ func (l *testLayout) index(entries ...ociDescriptor) {
 	}
 }
 
+// tagged returns desc with a tag. desc is passed by value, a copy, so
+// changing it doesn't change the caller's.
 func tagged(desc ociDescriptor, tag string) ociDescriptor {
 	desc.Annotations = map[string]string{annotationRefName: tag}
 	return desc
@@ -99,6 +111,9 @@ func layerMarker(t *testing.T, image *ociImage) string {
 // the only image or the one tagged latest, follows a multi-platform index to
 // this machine's architecture, and refuses blobs that don't match their
 // digest.
+//
+// Each image's single layer holds a word (its "marker"), so which image was
+// opened can be told by reading the layer.
 func TestOpenImage(t *testing.T) {
 	l := newTestLayout(t)
 	other := "arm64"

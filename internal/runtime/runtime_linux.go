@@ -18,9 +18,29 @@ import (
 	"unsafe"
 )
 
+// The container's side: Init, the container's first process (PID 1 inside
+// it), which builds the container's view of the system from within, and
+// then runs the command and stays with it. It is runt itself, run again
+// with --init by the supervisor (see supervise in container_linux.go), in
+// new namespaces. Also here: turning errors into exit codes for main, and
+// the steps of setupContainer: hostname, network, mounts, /proc, /sys,
+// /dev, pivot_root, and the security restrictions.
+//
+// A namespace gives the processes in it their own copy of one part of the
+// system: a mount namespace its own set of mounts, a PID namespace its own
+// process numbers (starting from 1), a network namespace its own
+// interfaces, and so on. Init starts out in new, empty namespaces and fills
+// them in.
+//
+// For how to read the Go here, see doc.go.
+
 // ExitCode returns the exit code to pass on when err is a process exiting
 // unsuccessfully: the container's command for Init, init for Run, or the
 // container for Attach.
+//
+// errors.As looks through err (and any errors it wraps) for one of the
+// given type, and if it finds one, stores it in the variable it is given a
+// pointer to. So each "if errors.As(...)" asks "is this, deep down, a ...?"
 func ExitCode(err error) (int, bool) {
 	var status statusError
 	if errors.As(err, &status) {
@@ -39,6 +59,8 @@ func ExitCode(err error) (int, bool) {
 
 // exitStatus returns a process's exit code, or 128 plus the signal number if
 // a signal killed it, as shells report it.
+// Sys returns the operating system's own form of the exit status, which on
+// Linux is a syscall.WaitStatus; the ", ok" type assertion checks that.
 func exitStatus(process *os.ProcessState) int {
 	if status, ok := process.Sys().(syscall.WaitStatus); ok {
 		return waitStatusCode(status)
@@ -46,6 +68,7 @@ func exitStatus(process *os.ProcessState) int {
 	return process.ExitCode()
 }
 
+// waitStatusCode is exitStatus for a status from the wait system call.
 func waitStatusCode(status syscall.WaitStatus) int {
 	if status.Signaled() {
 		return 128 + int(status.Signal())
@@ -98,6 +121,9 @@ func closeExtraFiles() error {
 	if err != nil {
 		return fmt.Errorf("list open files: %w", err)
 	}
+	// /proc/self/fd has an entry per open descriptor, named by its number.
+	// Marking one close-on-exec makes the kernel close it when the process
+	// runs another program, so the command never sees it.
 	for _, entry := range entries {
 		if fd, err := strconv.Atoi(entry.Name()); err == nil && fd > 2 {
 			syscall.CloseOnExec(fd)
@@ -111,7 +137,8 @@ func closeExtraFiles() error {
 const debugInitEnv = "RUNT_DEBUG_INIT"
 
 // waitForDebugger blocks until a tracer such as Delve attaches to this
-// process.
+// process. /proc/self/status has a TracerPid line, which is 0 until a
+// debugger attaches.
 func waitForDebugger() error {
 	for {
 		status, err := os.ReadFile("/proc/self/status")
@@ -184,6 +211,11 @@ type initConfig struct {
 //     then "started" once the command is running, or "error MESSAGE".
 //   - 5, the configuration pipe, with an initConfig.
 //   - 6, with Tty, a Unix socket to send the pseudo-terminal's master on.
+//
+// A file descriptor is the number a process knows an open file (or pipe,
+// or socket) by. 0, 1, and 2 are standard input, output, and error; the
+// supervisor's ExtraFiles become 3 and up. os.NewFile wraps a descriptor
+// number in an *os.File, to read and write it like any other file.
 func Init() error {
 	// None of these should leak into the command.
 	for fd := 3; fd <= 5; fd++ {
@@ -221,6 +253,8 @@ func Init() error {
 		return err
 	}
 	fmt.Fprintln(status, "ready")
+	// Reading the FIFO waits until a byte is written to it: by the
+	// supervisor straight away for runt run, or by runt start later.
 	if _, err := start.Read(make([]byte, 1)); err != nil {
 		return fmt.Errorf("wait for start: %w", err)
 	}
@@ -282,6 +316,10 @@ func Init() error {
 	fmt.Fprintln(status, "started")
 	status.Close()
 
+	// From here until the command exits, init's only job is to be PID 1:
+	// wait for signals, and either reap exited children (SIGCHLD) or pass
+	// the signal on to the command. select waits on both channels at once,
+	// and runs the case for whichever has a value first.
 	for {
 		select {
 		case <-children:
@@ -353,6 +391,10 @@ func prepareCommand(config *initConfig) error {
 // status if the command was among them.
 func reapChildren(command int) (status syscall.WaitStatus, exited bool) {
 	for {
+		// wait4(-1, ..., WNOHANG): collect any one child that has exited,
+		// without waiting if none has. The results are named in the
+		// function's signature, so a bare "return status, exited" returns
+		// what has been found so far.
 		var current syscall.WaitStatus
 		pid, err := syscall.Wait4(-1, &current, syscall.WNOHANG, nil)
 		if errors.Is(err, syscall.EINTR) {
@@ -373,6 +415,12 @@ func reapChildren(command int) (status syscall.WaitStatus, exited bool) {
 // init down, all before the command is started. With config.Tty it returns
 // the slave end of the container's pseudo-terminal, having sent the master
 // on consoleSocket.
+//
+// syscall.Mount(source, target, fstype, flags, data) is the mount system
+// call: mount the filesystem source, of type fstype, at target, with flags
+// (MS_ constants combined with |) and filesystem-specific options in data.
+// A bind mount (MS_BIND) makes an existing file or directory appear at a
+// second place.
 func setupContainer(config initConfig, consoleSocket *os.File) (*os.File, error) {
 	rootfs := config.Rootfs
 	// This runs before /proc is replaced, so it still reads the host's.
@@ -575,6 +623,9 @@ func mountSys(rootfs string) error {
 // approach (rootless runc and Podman do the same).
 var hostDevices = []string{"null", "zero", "full", "random", "urandom", "tty"}
 
+// devSymlinks are the links every /dev has: name, and where it points.
+// /proc/self/fd/N is the calling process's own descriptor N, so /dev/stdout
+// leads to whatever the process's standard output is.
 var devSymlinks = map[string]string{
 	"fd":     "/proc/self/fd",
 	"stdin":  "/proc/self/fd/0",
@@ -648,12 +699,16 @@ func bringUpLoopback() error {
 	defer syscall.Close(fd)
 
 	// struct ifreq: a 16-byte interface name followed by a 24-byte union,
-	// whose first field is the flags.
+	// whose first field is the flags. The struct type is declared right in
+	// the var statement, since nothing else uses it; _ names padding that
+	// is never read.
 	var ifr struct {
 		name  [syscall.IFNAMSIZ]byte
 		flags uint16
 		_     [22]byte
 	}
+	// Read the interface's flags (SIOCGIFFLAGS), set IFF_UP, and write them
+	// back (SIOCSIFFLAGS).
 	copy(ifr.name[:], "lo")
 	if _, _, errno := syscall.Syscall(syscall.SYS_IOCTL, uintptr(fd), syscall.SIOCGIFFLAGS, uintptr(unsafe.Pointer(&ifr))); errno != 0 {
 		return fmt.Errorf("read loopback flags: %w", errno)

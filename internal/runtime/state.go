@@ -1,5 +1,11 @@
 package runtime
 
+// Container state: each container's ID, and the state.json in its directory
+// under /run/runt that records what it is and how it is doing. Every runt
+// command that names a container (ps, stop, rm, logs, exec, and so on) finds
+// it here. No build constraint, so the tests run anywhere. For how to read
+// the Go here, see doc.go.
+
 import (
 	"crypto/rand"
 	"encoding/hex"
@@ -67,7 +73,10 @@ type State struct {
 	Finished        time.Time `json:"finished,omitzero"`
 }
 
-// newID returns a random 12-character hex ID, the length Docker shows.
+// newID returns a random 12-character hex ID, the length Docker shows. Six
+// random bytes, each written as two hex digits. crypto/rand reads from the
+// kernel's secure random number source. [6]byte is an array, a fixed-size
+// list, and id[:] a slice of all of it, which Read fills.
 func newID() (string, error) {
 	var id [6]byte
 	if _, err := rand.Read(id[:]); err != nil {
@@ -96,6 +105,8 @@ func createStateDir(root, id string) error {
 // saveState writes state.json. It writes a temporary file and renames it, so
 // a reader never sees a partly written file.
 func saveState(root string, state *State) error {
+	// MarshalIndent turns the struct into JSON, indented with two spaces
+	// for people to read.
 	data, err := json.MarshalIndent(state, "", "  ")
 	if err != nil {
 		return err
@@ -146,6 +157,8 @@ func listStates(root string) ([]*State, error) {
 		}
 		states = append(states, state)
 	}
+	// sort.Slice sorts with a function that says whether element i belongs
+	// before element j: here, whether it was created later.
 	sort.Slice(states, func(i, j int) bool { return states[i].Created.After(states[j].Created) })
 	return states, nil
 }
@@ -160,6 +173,8 @@ func findContainer(root, ref string) (*State, error) {
 	if err != nil {
 		return nil, err
 	}
+	// An exact name or ID wins at once; otherwise, collect the containers
+	// whose ID starts with ref, and accept only if there is just one.
 	var matches []*State
 	for _, state := range states {
 		if state.ID == ref || state.Name == ref {
@@ -179,6 +194,12 @@ func findContainer(root, ref string) (*State, error) {
 	}
 }
 
+// validName is the pattern a container's (or network's) name must match: a
+// letter or digit, then any number of letters, digits, and _.- characters. It
+// is a regular expression, compiled once, when runt starts; MustCompile
+// would stop the program if the pattern itself were malformed. The
+// backquotes make a raw string, in which backslashes and the like mean
+// themselves.
 var validName = regexp.MustCompile(`^[a-zA-Z0-9][a-zA-Z0-9_.-]*$`)
 
 // checkName rejects a name that is malformed, looks like an ID, or is

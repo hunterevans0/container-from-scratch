@@ -13,6 +13,10 @@ import (
 	"testing"
 )
 
+// Image tests: an image's configuration, and pulling from a registry served
+// by the test itself. For how to read these tests, see the top of
+// isolation_test.go.
+
 // TestImageConfig runs an image whose configuration sets the command,
 // environment, working directory, and user, first as it is and then with
 // each one overridden on the command line.
@@ -58,6 +62,10 @@ func TestImageConfig(t *testing.T) {
 // layoutRegistry serves an OCI image layout as a registry repository named
 // runt-test/app, wanting a user name and password, as a private registry
 // does.
+//
+// httptest.NewServer serves HTTP on a free local port, calling the
+// anonymous function for each request: w is where the response is written,
+// and req the request. http.ServeFile sends a file as the response.
 func layoutRegistry(t *testing.T, layout string) *httptest.Server {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
 		if user, password, _ := req.BasicAuth(); user != "runt" || password != "secret" {
@@ -118,6 +126,8 @@ func TestPull(t *testing.T) {
 	if output, err := r.runt("pull", image); err == nil || !strings.Contains(output, "runt login") {
 		t.Errorf("runt pull without logging in: %v\n%s", err, output)
 	}
+	// The password goes in on runt login's standard input, as a user would
+	// pipe it.
 	login := exec.Command(r.binary, "login", "-u", "runt", "--password-stdin", host)
 	login.Stdin = strings.NewReader("secret\n")
 	if output, err := login.CombinedOutput(); err != nil || !strings.Contains(string(output), "Login Succeeded") {
@@ -167,6 +177,7 @@ func TestPull(t *testing.T) {
 
 // listsImage reports whether runt images output has a row for repository and
 // tag.
+// strings.Lines yields the output a line at a time to the loop.
 func listsImage(output, repository, tag string) bool {
 	for line := range strings.Lines(output) {
 		if fields := strings.Fields(line); len(fields) > 1 && fields[0] == repository && fields[1] == tag {

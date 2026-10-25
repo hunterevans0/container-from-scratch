@@ -7,6 +7,12 @@ import (
 	"testing"
 )
 
+// Tests for portmap_linux.go that need no root: reading published ports'
+// rules back from iptables -S. For how Go tests work, see "Tests" in
+// doc.go.
+
+// TestParseDNATRule checks reading a rule's host address, protocol, port,
+// and container address, and its words, which removing it takes.
 func TestParseDNATRule(t *testing.T) {
 	line := "-A RUNT -d 127.0.0.1/32 ! -i runt+ -p tcp -m tcp --dport 8080 -j DNAT --to-destination 10.88.0.2:80"
 	rule, ok := parseDNATRule(line)

@@ -2,6 +2,13 @@
 
 package runtime
 
+// Two of the protections init applies before running the container's
+// command (see setupContainer in runtime_linux.go): hiding or freezing parts
+// of /proc and /sys that would let the container learn about or change the
+// host, and no_new_privs. The others are in capabilities_linux.go,
+// seccomp_linux.go, and apparmor_linux.go. For how to read the Go here, see
+// doc.go.
+
 import (
 	"errors"
 	"fmt"
@@ -55,6 +62,10 @@ func protectPaths() error {
 
 // maskPath covers a file with /dev/null and a directory with an empty
 // read-only tmpfs. Paths this kernel does not have are skipped.
+//
+// Mounting something over a path hides whatever was there, for every
+// process in the container's mount namespace: reading the file reads
+// /dev/null (nothing), and listing the directory lists the empty tmpfs.
 func maskPath(path string) error {
 	info, err := os.Stat(path)
 	if errors.Is(err, os.ErrNotExist) {
@@ -73,6 +84,7 @@ func maskPath(path string) error {
 // own, and then remounts that read-only. A bind mount ignores MS_RDONLY the
 // first time, hence the two steps.
 func readonlyPath(path string) error {
+	// MS_REC makes the bind mount take any mounts under path along too.
 	err := syscall.Mount(path, path, "", syscall.MS_BIND|syscall.MS_REC, "")
 	if errors.Is(err, syscall.ENOENT) {
 		return nil
@@ -80,16 +92,23 @@ func readonlyPath(path string) error {
 	if err != nil {
 		return err
 	}
+	// The flags are bits, combined with |. uintptr(...) converts them to
+	// the type Mount takes. nosuid, nodev, and noexec are repeated because
+	// the kernel refuses a remount that would drop them.
 	flags := uintptr(syscall.MS_BIND | syscall.MS_REMOUNT | syscall.MS_RDONLY | syscall.MS_NOSUID | syscall.MS_NODEV | syscall.MS_NOEXEC)
 	return syscall.Mount("", path, "", flags, "")
 }
 
+// prSetNoNewPrivs is PR_SET_NO_NEW_PRIVS, which the syscall package doesn't
+// define, from <linux/prctl.h>. prctl is a system call with many uses, each
+// picked by its first argument.
 const prSetNoNewPrivs = 38
 
 // setNoNewPrivs makes exec stop granting privileges: setuid and setgid bits
 // and file capabilities are ignored from here on, in this process and all its
 // descendants. It is per thread, so it goes through AllThreadsSyscall like
-// the capability calls.
+// the capability calls. AllThreadsSyscall6 is the form for system calls
+// that take up to six arguments.
 func setNoNewPrivs() error {
 	if _, _, errno := syscall.AllThreadsSyscall6(syscall.SYS_PRCTL, prSetNoNewPrivs, 1, 0, 0, 0, 0); errno != 0 {
 		return fmt.Errorf("set no_new_privs: %w", errno)

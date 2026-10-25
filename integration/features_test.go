@@ -11,6 +11,11 @@ package integration
 // make features FEATURE=Registry. They run with make integration too. Like
 // the other integration tests, they need root and make rootfs, but not the
 // internet: registries are served from this process, on localhost.
+//
+// Each feature is one TestFeatureX function, and each of its checks a
+// subtest, run with t.Run(name, func(t *testing.T) { ... }). The network
+// features are in network_test.go. For how to read these tests, see the top
+// of isolation_test.go.
 
 import (
 	"archive/tar"
@@ -45,6 +50,11 @@ import (
 
 // explain prints what a test shows: the heading of a feature, or a line for
 // one of its checks.
+//
+// format and args are as for fmt.Printf: args ...any takes any number of
+// values of any type. A subtest's name is its test's name, a slash, and its
+// own, so a slash says this is a check rather than a feature's heading. The
+// cleanup runs once the test is over, when whether it passed is known.
 func explain(t *testing.T, format string, args ...any) {
 	text := fmt.Sprintf(format, args...)
 	check := strings.Contains(t.Name(), "/")
@@ -69,7 +79,8 @@ func observe(format string, args ...any) {
 }
 
 // nonce makes file contents, and so layer digests, unique to this run, so
-// that layers unpacked by an earlier run are never reused.
+// that layers unpacked by an earlier run are never reused. It is the time
+// now, in nanoseconds, written in base 36 (digits and letters) to be short.
 var nonce = strconv.FormatInt(time.Now().UnixNano(), 36)
 
 const imageStoreDir = "/var/lib/runt/images"
@@ -78,6 +89,8 @@ const imageStoreDir = "/var/lib/runt/images"
 // pairs. Names starting with .wh. are whiteouts, as in any OCI layer.
 func makeTar(t *testing.T, files ...string) []byte {
 	t.Helper()
+	// files alternates names and contents, so the loop takes them two at a
+	// time: files[i] and files[i+1].
 	var buf bytes.Buffer
 	archive := tar.NewWriter(&buf)
 	for i := 0; i+1 < len(files); i += 2 {
@@ -116,12 +129,17 @@ func (b *layoutBuilder) blobFile(desc map[string]any) string {
 	return filepath.Join(b.dir, "blobs/sha256", hexDigest(desc))
 }
 
+// hexDigest is a descriptor's digest without its sha256: prefix. The
+// descriptor is a map of any values, so .(string) takes out the string.
 func hexDigest(desc map[string]any) string {
 	return strings.TrimPrefix(desc["digest"].(string), "sha256:")
 }
 
 // withPlatform returns a copy of a manifest's descriptor with the platform an
 // image index entry gives.
+//
+// Maps are shared, not copied, when assigned, so it copies desc's entries
+// into a new map before adding to it.
 func withPlatform(desc map[string]any, architecture string) map[string]any {
 	entry := map[string]any{}
 	for key, value := range desc {
@@ -163,13 +181,17 @@ func (r *runtTester) removeUnpackedAtEnd(layer map[string]any) {
 func (r *runtTester) runOnce(name string, args ...string) (string, error) {
 	r.t.Helper()
 	r.removeAtEnd(name)
+	// The arguments: run --name NAME, then args. append(a, b...) joins the
+	// two lists, and the final ... passes the result as separate arguments.
 	output, err := r.runt(append([]string{"run", "--name", name}, args...)...)
 	r.runt("rm", "-f", name)
 	return output, err
 }
 
 // mustSucceed fails the test if a runt command failed or its output lacks any
-// of wants, and returns the output.
+// of wants, and returns the output. It is how most checks look at a
+// command's result: mustSucceed(t, "what was done", output, err, "text the
+// output must contain", ...).
 func mustSucceed(t *testing.T, what string, output string, err error, wants ...string) string {
 	t.Helper()
 	if err != nil {
@@ -202,6 +224,8 @@ func overlayMount(t *testing.T, id string) map[string]string {
 	if err != nil {
 		t.Fatal(err)
 	}
+	// Each line of /proc/self/mounts is: what is mounted, where, the
+	// filesystem type, and its options, separated by commas.
 	target := filepath.Join("/var/lib/runt/containers", id, "rootfs")
 	for _, line := range strings.Split(string(data), "\n") {
 		fields := strings.Fields(line)
@@ -618,6 +642,8 @@ func writeFeatureBundle(t *testing.T, r *runtTester) (string, map[string]any) {
 	return dir, spec
 }
 
+// saveBundle writes spec back as the bundle's config.json, after a check
+// has changed it.
 func saveBundle(t *testing.T, dir string, spec map[string]any) {
 	t.Helper()
 	data, err := json.Marshal(spec)
@@ -657,6 +683,9 @@ const (
 	registryLoginToken = "runt-feature-login-token"
 )
 
+// newTestRegistry starts a registry serving layout, on a free local port,
+// with httptest.NewServer, which calls reg.serve for each request. It stops
+// when the test ends.
 func newTestRegistry(t *testing.T, layout, auth string) *testRegistry {
 	reg := &testRegistry{layout: layout, auth: auth, tags: map[string]string{}, corrupt: map[string]bool{}}
 	reg.server = httptest.NewServer(http.HandlerFunc(reg.serve))
@@ -684,6 +713,8 @@ func (reg *testRegistry) requests() []string {
 	return log
 }
 
+// authorized reports whether req carries the credentials the registry's
+// kind of authentication wants.
 func (reg *testRegistry) authorized(req *http.Request) bool {
 	switch reg.auth {
 	case "basic":
@@ -698,6 +729,10 @@ func (reg *testRegistry) authorized(req *http.Request) bool {
 	return true
 }
 
+// serve answers one request: it logs it, then plays the token server, or
+// challenges a request without the right credentials (401 and a
+// WWW-Authenticate header), or serves a manifest or blob from the layout.
+// What is written to w is the response.
 func (reg *testRegistry) serve(w http.ResponseWriter, req *http.Request) {
 	scheme, _, _ := strings.Cut(req.Header.Get("Authorization"), " ")
 	reg.mu.Lock()
@@ -764,6 +799,7 @@ func (reg *testRegistry) serve(w http.ResponseWriter, req *http.Request) {
 		json.Unmarshal(data, &probe)
 		w.Header().Set("Content-Type", probe.MediaType)
 	}
+	// Corrupt a copy: ^= 1 flips the lowest bit of the middle byte.
 	if reg.corrupt[digest] {
 		data = append([]byte{}, data...)
 		data[len(data)/2] ^= 1
@@ -825,6 +861,7 @@ func storeHasBlob(desc map[string]any) bool {
 }
 
 // requested reports whether any request in log contains text.
+// slices.ContainsFunc asks the function about each element in turn.
 func requested(log []string, text string) bool {
 	return slices.ContainsFunc(log, func(request string) bool { return strings.Contains(request, text) })
 }
@@ -1041,6 +1078,8 @@ func runtLogin(t *testing.T, r *runtTester, host, password string) {
 	mustSucceed(t, "runt login", string(output), err, "Login Succeeded")
 }
 
+// writeFile writes content to path with permissions mode, and stops the
+// test if it can't.
 func writeFile(t *testing.T, path, content string, mode os.FileMode) {
 	t.Helper()
 	if err := os.WriteFile(path, []byte(content), mode); err != nil {
@@ -1048,6 +1087,8 @@ func writeFile(t *testing.T, path, content string, mode os.FileMode) {
 	}
 }
 
+// shortHex is the first 12 hex digits of a blob's digest, as runt images
+// shows an image ID.
 func shortHex(desc map[string]any) string {
 	return hexDigest(desc)[:12]
 }

@@ -27,10 +27,21 @@ import (
 //
 // Both directions carry frames: a byte for the type, a 4-byte big-endian
 // length, and that much payload.
+//
+// Frames are needed because one connection carries several kinds of data
+// at once: the container's stdout and stderr, which must stay apart, and
+// terminal sizes as well as typed input. The length says where each frame
+// ends and the next begins.
+//
+// The supervisor's side is the attachHub: one goroutine accepting
+// connections, and two per client, one receiving its input and one sending
+// it output. The client's side is Attach. For how to read the Go here, see
+// doc.go.
 
 const attachSocketName = "attach.sock"
 
-// Frame types.
+// Frame types. 'i' and the like are characters, which in Go are numbers
+// (the character's code), so they fit in the frame's type byte.
 const (
 	// frameStdin is input for the command (client to supervisor).
 	frameStdin = 'i'
@@ -54,6 +65,7 @@ const maxFrame = 64 * 1024
 // without stopping it: Ctrl+P, Ctrl+Q, as in Docker.
 var detachKeys = []byte{0x10, 0x11}
 
+// encodeFrame makes a frame: the type byte, the length, and the payload.
 func encodeFrame(kind byte, payload []byte) []byte {
 	frame := make([]byte, 5+len(payload))
 	frame[0] = kind
@@ -62,6 +74,10 @@ func encodeFrame(kind byte, payload []byte) []byte {
 	return frame
 }
 
+// readFrame reads the next frame. io.ReadFull keeps reading until it has
+// filled the buffer, since a frame can arrive in pieces. The length is
+// checked before the payload's buffer is made, so a bad length can't make
+// it allocate gigabytes.
 func readFrame(r *bufio.Reader) (kind byte, payload []byte, err error) {
 	var header [5]byte
 	if _, err := io.ReadFull(r, header[:]); err != nil {
@@ -80,6 +96,10 @@ func readFrame(r *bufio.Reader) (kind byte, payload []byte, err error) {
 
 // attachHub is the supervisor's end: it accepts connections and passes data
 // between them and the container.
+//
+// Several goroutines use it at once, so the fields after mu are only read
+// or changed while holding mu, a mutex. clients is a map used as a set: a
+// client is connected if it is a key in the map.
 type attachHub struct {
 	listener *net.UnixListener
 	path     string
@@ -97,11 +117,13 @@ type attachHub struct {
 	writers sync.WaitGroup
 }
 
+// attachClient is one connected runt attach.
 type attachClient struct {
 	conn net.Conn
 	// frames are the encoded frames waiting to be sent. Sending never
 	// blocks the container: a client that falls this far behind is
-	// disconnected.
+	// disconnected. It is a buffered channel, a queue with room for 1024
+	// frames (see accept): sending to it waits only once it is full.
 	frames chan []byte
 }
 
@@ -114,11 +136,16 @@ func listenAttach(path string) (*attachHub, error) {
 	}
 	// Removing the socket is up to close.
 	listener.SetUnlinkOnClose(false)
+	// map[*attachClient]bool{} makes an empty map, ready to use. (A map
+	// declared without one is nil, which can be read from but not added
+	// to.)
 	hub := &attachHub{listener: listener, path: path, clients: map[*attachClient]bool{}}
 	go hub.accept()
 	return hub, nil
 }
 
+// accept takes each new connection, adds it to clients, and starts its two
+// goroutines, until the listener is closed.
 func (hub *attachHub) accept() {
 	for {
 		conn, err := hub.listener.Accept()
@@ -141,6 +168,8 @@ func (hub *attachHub) accept() {
 }
 
 // send writes a client's frames to it until the hub drops it or closes.
+// "for frame := range client.frames" receives each frame from the channel
+// in turn, and ends once the channel is closed and empty.
 func (hub *attachHub) send(client *attachClient) {
 	defer hub.writers.Done()
 	defer client.conn.Close()
@@ -181,7 +210,9 @@ func (hub *attachHub) receive(client *attachClient) {
 	}
 }
 
-// drop disconnects a client.
+// drop disconnects a client. Both of its goroutines may call it, so it only
+// acts if the client is still in clients: closing a channel twice would
+// crash the program.
 func (hub *attachHub) drop(client *attachClient) {
 	hub.mu.Lock()
 	defer hub.mu.Unlock()
@@ -207,6 +238,9 @@ func (hub *attachHub) broadcast(kind byte, payload []byte) {
 	}
 	frame := encodeFrame(kind, payload)
 	for client := range hub.clients {
+		// A select with a default case never waits: it queues the frame if
+		// the channel has room, and otherwise takes the default, dropping
+		// the client, which has fallen too far behind.
 		select {
 		case client.frames <- frame:
 		default:
@@ -224,6 +258,9 @@ func (hub *attachHub) output(kind byte) io.Writer {
 	return hubWriter{hub, kind}
 }
 
+// hubWriter is an io.Writer (it has a Write method) that broadcasts what is
+// written as frames of kind. slices.Chunk splits p into pieces of at most
+// maxFrame bytes, so no frame is too big.
 type hubWriter struct {
 	hub  *attachHub
 	kind byte
@@ -264,6 +301,10 @@ func (hub *attachHub) close(exitCode int) {
 	}
 	hub.mu.Unlock()
 
+	// Wait for the senders to finish, or five seconds, whichever comes
+	// first. A select waits for whichever of its cases can go ahead first:
+	// done is closed when the goroutine's Wait returns, and time.After
+	// delivers a value on its channel when the time is up.
 	done := make(chan struct{})
 	go func() {
 		hub.writers.Wait()
@@ -276,7 +317,8 @@ func (hub *attachHub) close(exitCode int) {
 }
 
 // statusError is a container's exit code, passed on by runt attach and runt
-// start -a as their own.
+// start -a as their own. It is an int with an Error method, which makes it
+// an error, so it can be returned as one and recognized again by ExitCode.
 type statusError int
 
 func (e statusError) Error() string { return fmt.Sprintf("container exited with code %d", int(e)) }
@@ -308,6 +350,9 @@ func Attach(ref string, options AttachOptions) error {
 		return fmt.Errorf("attach to container %s: %w", state.ID, err)
 	}
 	defer conn.Close()
+	// send writes a frame to the supervisor. Input and terminal sizes are
+	// sent from different goroutines, so a mutex keeps their frames from
+	// interleaving.
 	var sendMu sync.Mutex
 	send := func(kind byte, payload []byte) error {
 		sendMu.Lock()
@@ -361,6 +406,9 @@ func Attach(ref string, options AttachOptions) error {
 		}()
 	}
 
+	// detached is set by the input goroutine when Ctrl+P, Ctrl+Q is typed,
+	// and read by the loop below once the connection closes, to tell a
+	// detach from a lost connection.
 	var detachedMu sync.Mutex
 	detached := false
 	if stdin {
@@ -399,6 +447,8 @@ func Attach(ref string, options AttachOptions) error {
 		}
 	}
 
+	// Print the container's output as it comes, until the exit code comes,
+	// or the connection ends.
 	reader := bufio.NewReader(conn)
 	for {
 		kind, payload, err := readFrame(reader)
@@ -427,7 +477,10 @@ func Attach(ref string, options AttachOptions) error {
 }
 
 // detachFilter watches input for detachKeys. A partial match is held back
-// until the next key shows whether it completes the sequence.
+// until the next key shows whether it completes the sequence. matched is
+// how many keys of the sequence have been seen in a row so far; it carries
+// over from one chunk of input to the next, since the two keys may arrive
+// in separate reads.
 type detachFilter struct {
 	matched int
 }
