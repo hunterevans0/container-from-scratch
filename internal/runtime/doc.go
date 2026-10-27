@@ -44,6 +44,9 @@
 //   - reference.go: image names, such as alpine:3.20.
 //   - imageconfig.go: an image's default command, environment, and user.
 //   - bundle.go: OCI runtime bundles (--bundle) and runt spec.
+//   - mounts.go, mounts_linux.go: bind mounts, volumes, and tmpfs mounts
+//     on top of the root filesystem (-v, --tmpfs).
+//   - volumes_linux.go: named volumes (runt volume create, ls, and rm).
 //
 // Networking:
 //

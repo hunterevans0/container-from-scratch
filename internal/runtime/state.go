@@ -65,6 +65,9 @@ type State struct {
 	Network   string        `json:"network,omitempty"`
 	IPAddress string        `json:"ipAddress,omitempty"`
 	Ports     []PortMapping `json:"ports,omitempty"`
+	// Mounts are the container's bind mounts, volumes, and tmpfs mounts,
+	// as given (see Mount, in runtime.go).
+	Mounts []Mount `json:"mounts,omitempty"`
 	// AppArmorProfile confines the command and anything run with exec.
 	AppArmorProfile string    `json:"apparmorProfile,omitempty"`
 	Resources       Resources `json:"resources"`

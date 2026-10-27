@@ -58,9 +58,9 @@ The steps between `runt` and a Docker-like container runtime. Each stage builds 
 
 ## Stage 7: Storage
 
-- [ ] Bind mounts (`-v /host/path:/container/path`).
-- [ ] Named volumes that survive after the container is removed.
-- [ ] tmpfs mounts (in-memory folders).
+- [x] Bind mounts (`-v /host/path:/container/path`), read-only with `:ro`. The supervisor stages each one on the host, where init (an unprivileged host user) couldn't reach it, and init mounts it in place before `pivot_root`, following symlinks only within the container. Bundles' `config.json` can list bind and tmpfs mounts too.
+- [x] Named volumes that survive after the container is removed: `-v NAME:/path`, and `runt volume create`, `ls`, and `rm`. Kept in `/var/lib/runt/volumes/<name>/_data`, and filled from the image when empty, as Docker does.
+- [x] tmpfs mounts (in-memory folders): `--tmpfs /path[:size=SIZE,mode=MODE,...]`, `nosuid,nodev,noexec` by default.
 
 ## Stage 8: Building images
 
@@ -85,4 +85,4 @@ The steps between `runt` and a Docker-like container runtime. Each stage builds 
 
 ## Suggested next steps
 
-With images pulled from registries and run with their own configuration, published ports, DNS, and networks whose containers find each other by name, most images and small multi-container setups work as they do in Docker. What they miss most now is storage: bind mounts and volumes (Stage 7) are small by comparison and make containers useful for real work, such as a database whose data outlives its container. For building images, `buildah` can fill the gap until Stage 8, writing OCI layouts that `--image` runs.
+With images pulled from registries and run with their own configuration, published ports, DNS, networks whose containers find each other by name, and volumes for data that outlives a container, most images and small multi-container setups work as they do in Docker. One gap in storage remains: a bind-mounted directory is only writable by the container if it belongs to the container's ID range, since container root isn't host root. Idmapped mounts (`mount_setattr` with `MOUNT_ATTR_IDMAP`, as Podman's `:idmap` uses) would fix that. After that, building images (Stage 8) is the largest missing piece; `buildah` can fill the gap until then, writing OCI layouts that `--image` runs.

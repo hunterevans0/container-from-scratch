@@ -59,6 +59,9 @@ type Config struct {
 	Network string
 	// Ports are the container's ports to publish on the host.
 	Ports []PortMapping
+	// Mounts are bind mounts, volumes, and tmpfs mounts to make in the
+	// container, on top of its root filesystem (see mounts.go).
+	Mounts []Mount
 	// Name is an optional name to refer to the container by, besides its ID.
 	Name string
 	// UsernsUser is the user whose /etc/subuid and /etc/subgid ranges the
@@ -110,6 +113,43 @@ type Network struct {
 	Bridge  string    `json:"bridge,omitempty"`
 	Subnet  string    `json:"subnet,omitempty"`
 	Created time.Time `json:"created,omitzero"`
+}
+
+// Kinds of Mount.
+const (
+	// MountBind makes a file or directory on the host appear in the
+	// container.
+	MountBind = "bind"
+	// MountVolume makes a volume, a directory runt keeps for the purpose,
+	// appear in the container. It outlives the container.
+	MountVolume = "volume"
+	// MountTmpfs mounts a new, empty filesystem in memory, which goes when
+	// the container stops.
+	MountTmpfs = "tmpfs"
+)
+
+// Mount is something to mount in the container, at Destination, from -v,
+// --tmpfs, or a bundle's config.json. It is saved in state.json, so runt
+// volume rm can tell whether a container uses a volume.
+type Mount struct {
+	// Type is MountBind, MountVolume, or MountTmpfs.
+	Type string `json:"type"`
+	// Source is the host path for a bind mount, the volume's name for a
+	// volume, and empty for tmpfs.
+	Source      string `json:"source,omitempty"`
+	Destination string `json:"destination"`
+	// Options are as mount(8) writes them: ro, nosuid, nodev, and noexec,
+	// for any kind; nocopy, for a volume not to be filled from the image;
+	// and size= and mode=, for tmpfs.
+	Options []string `json:"options,omitempty"`
+}
+
+// Volume is a volume made with CreateVolume, or by a container that named
+// it with -v. Its files are in Mountpoint.
+type Volume struct {
+	Name       string    `json:"name"`
+	Mountpoint string    `json:"mountpoint"`
+	Created    time.Time `json:"created"`
 }
 
 // User is who a command runs as inside the container: a user ID, a group ID,

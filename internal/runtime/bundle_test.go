@@ -101,8 +101,17 @@ func TestLoadBundleRejects(t *testing.T) {
 	// A table whose cases are functions: each name maps to an edit that
 	// makes config.json ask for something runt can't do.
 	for name, edit := range map[string]func(spec map[string]any){
-		"bind mount": func(spec map[string]any) {
-			spec["mounts"] = []map[string]any{{"destination": "/data", "type": "bind", "source": "/srv"}}
+		"overlay mount": func(spec map[string]any) {
+			spec["mounts"] = []map[string]any{{"destination": "/data", "type": "overlay", "source": "overlay"}}
+		},
+		"shared bind mount": func(spec map[string]any) {
+			spec["mounts"] = []map[string]any{{"destination": "/data", "type": "bind", "source": "/srv", "options": []string{"rbind", "rshared"}}}
+		},
+		"bind mount without a source": func(spec map[string]any) {
+			spec["mounts"] = []map[string]any{{"destination": "/data", "type": "bind"}}
+		},
+		"mount in /proc": func(spec map[string]any) {
+			spec["mounts"] = []map[string]any{{"destination": "/proc/sys", "type": "bind", "source": "/srv"}}
 		},
 		"namespace path": func(spec map[string]any) {
 			spec["linux"].(map[string]any)["namespaces"] = []map[string]any{{"type": "network", "path": "/proc/1/ns/net"}}
@@ -129,5 +138,37 @@ func TestLoadBundleRejects(t *testing.T) {
 	}
 	if !strings.HasPrefix(config.Rootfs, config.Bundle) {
 		t.Errorf("rootfs %q is not inside bundle %q", config.Rootfs, config.Bundle)
+	}
+	if len(config.Mounts) != 0 {
+		t.Errorf("the standard mounts became mounts of the container's own: %+v", config.Mounts)
+	}
+}
+
+// TestLoadBundleMounts checks that bind and tmpfs mounts in config.json,
+// after the standard ones, become the container's mounts, with a relative
+// source taken from the bundle.
+func TestLoadBundleMounts(t *testing.T) {
+	dir := writeBundle(t, func(spec map[string]any) {
+		// The standard mounts WriteSpec wrote, a []any once decoded, with
+		// two more.
+		spec["mounts"] = append(spec["mounts"].([]any),
+			map[string]any{"destination": "/data", "type": "bind", "source": "data", "options": []string{"rbind", "ro", "rprivate"}},
+			map[string]any{"destination": "/scratch", "type": "tmpfs", "source": "tmpfs", "options": []string{"nosuid", "size=1m"}},
+		)
+	})
+	config := Config{Bundle: dir}
+	if err := LoadBundle(&config); err != nil {
+		t.Fatal(err)
+	}
+	want := []Mount{
+		{Type: MountBind, Source: filepath.Join(dir, "data"), Destination: "/data", Options: []string{"ro"}},
+		{Type: MountTmpfs, Destination: "/scratch", Options: []string{"nosuid", "size=1048576"}},
+	}
+	// slices.EqualFunc compares two lists with a function of our own, here
+	// one that compares two Mounts field by field.
+	if !slices.EqualFunc(config.Mounts, want, func(a, b Mount) bool {
+		return a.Type == b.Type && a.Source == b.Source && a.Destination == b.Destination && slices.Equal(a.Options, b.Options)
+	}) {
+		t.Errorf("mounts = %+v; want %+v", config.Mounts, want)
 	}
 }

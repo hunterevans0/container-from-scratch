@@ -26,6 +26,7 @@
 - OCI image layouts (`--image`) and OCI runtime bundles (`--bundle`, with `runt spec` to write a `config.json`)
 - `pull` from Docker Hub and other registries (with `login`), a local image store with `images` and `rmi`, and each image's default command, environment, working directory, and user
 - published ports (`-p 8080:80`), an `/etc/resolv.conf` and `/etc/hosts` in every container, and networks of your own (`runt network create`), apart from each other, whose containers find each other by name
+- bind mounts and named volumes (`-v`), which outlive their containers (`runt volume`), and in-memory tmpfs mounts (`--tmpfs`)
 
 This is educational code, not a production container runtime. It currently requires Linux and root privileges for `run`.
 
@@ -75,9 +76,9 @@ The rootfs itself never changes: whatever the shell writes or deletes goes to a 
 
 ## Integration tests
 
-`make test` only runs tests that don't start containers (the layer-unpacking tests also skip themselves unless run as root). `make integration` builds `runt` and runs the tests in [integration/](integration/), which start real containers with `sudo`. They check that containers can't reach each other (one tries to see the other's processes, kill it by its host PID, and move itself into its cgroup) and don't see each other's files. They also cover init reaping orphans, terminals for `run -it`, `run -dt`, and `exec -it`, signals reaching `exec`'d commands, `attach` (and detaching from it) and `start -ai`, an OCI image built from the rootfs, an image's configuration and the options that override it, a bundle made with `runt spec`, the bridge network, published ports, `/etc/resolv.conf` and `/etc/hosts`, and networks made with `runt network create`. One test serves an image from a registry of its own on localhost, which wants a password, and logs in, pulls, runs, and removes it. They need the rootfs from `make rootfs`, but not the internet: the network tests stand a network namespace in for it.
+`make test` only runs tests that don't start containers (the layer-unpacking tests also skip themselves unless run as root). `make integration` builds `runt` and runs the tests in [integration/](integration/), which start real containers with `sudo`. They check that containers can't reach each other (one tries to see the other's processes, kill it by its host PID, and move itself into its cgroup) and don't see each other's files. They also cover init reaping orphans, terminals for `run -it`, `run -dt`, and `exec -it`, signals reaching `exec`'d commands, `attach` (and detaching from it) and `start -ai`, an OCI image built from the rootfs, an image's configuration and the options that override it, a bundle made with `runt spec`, the bridge network, published ports, `/etc/resolv.conf` and `/etc/hosts`, networks made with `runt network create`, bind mounts, volumes, and tmpfs mounts. One test serves an image from a registry of its own on localhost, which wants a password, and logs in, pulls, runs, and removes it. They need the rootfs from `make rootfs`, but not the internet: the network tests stand a network namespace in for it.
 
-`make features` runs only the feature checks, in [integration/features_test.go](integration/features_test.go) and [integration/network_test.go](integration/network_test.go): a test for each image, filesystem, and network feature (`Layers`, `OCIFormats`, `Registry`, `ImageStore`, `ImageConfig`, `Network`, `Ports`, `DNS`, `UserNetworks`), with a subtest per check, each printing a line saying what it shows. Checks that pass print nothing else; one that fails is marked, with the details after its feature. `make features FEATURE=Registry` runs one of them, and `FEATURE=Registry/BasicAuth` one check.
+`make features` runs only the feature checks, in [integration/features_test.go](integration/features_test.go), [integration/network_test.go](integration/network_test.go), and [integration/storage_test.go](integration/storage_test.go): a test for each image, filesystem, network, and storage feature (`Layers`, `OCIFormats`, `Registry`, `ImageStore`, `ImageConfig`, `Network`, `Ports`, `DNS`, `UserNetworks`, `BindMounts`, `Volumes`, `Tmpfs`), with a subtest per check, each printing a line saying what it shows. Checks that pass print nothing else; one that fails is marked, with the details after its feature. `make features FEATURE=Registry` runs one of them, and `FEATURE=Registry/BasicAuth` one check.
 
 ## Debugging with breakpoints
 
@@ -296,8 +297,9 @@ sudo ./runt attach box         # its terminal; Ctrl+P, Ctrl+Q detaches and leave
 | `rmi [-f] IMAGE...` | Remove images from the store. |
 | `login [-u USER] [--password-stdin] [REGISTRY]` / `logout [REGISTRY]` | Store or remove credentials for a registry, Docker Hub by default. |
 | `network create [--subnet CIDR] NAME` / `network ls` / `network rm NAME...` | Make, list, or remove [networks](#user-defined-networks) whose containers find each other by name. |
+| `volume create NAME` / `volume ls [-q]` / `volume rm NAME...` | Make, list, or remove [volumes](#volumes). |
 
-`run` and `create` take the container's filesystem from one of `--rootfs PATH` (a root filesystem directory), `--image IMAGE` (an [image](#images) from the store, pulled if need be, or an OCI image layout), or `--bundle DIR` (an [OCI runtime bundle](#oci-runtime-bundles), whose `config.json` also gives the command). They also take `--network bridge|none|NAME` and `-p [[HOSTIP:]HOSTPORT:]PORT[/udp]` (repeatable; see [Networking](#networking)), `-e NAME=VALUE` (repeatable), `-w DIR`, and `-u USER[:GROUP]`, as `docker run` does, and with an image, `--entrypoint` (see [Image configuration](#image-configuration)).
+`run` and `create` take the container's filesystem from one of `--rootfs PATH` (a root filesystem directory), `--image IMAGE` (an [image](#images) from the store, pulled if need be, or an OCI image layout), or `--bundle DIR` (an [OCI runtime bundle](#oci-runtime-bundles), whose `config.json` also gives the command). They also take `--network bridge|none|NAME` and `-p [[HOSTIP:]HOSTPORT:]PORT[/udp]` (repeatable; see [Networking](#networking)), `-v HOSTPATH|VOLUME:PATH[:ro]` and `--tmpfs PATH[:OPTIONS]` (repeatable; see [Storage](#storage)), `-e NAME=VALUE` (repeatable), `-w DIR`, and `-u USER[:GROUP]`, as `docker run` does, and with an image, `--entrypoint` (see [Image configuration](#image-configuration)).
 
 `CONTAINER` is the name given with `--name`, the full ID, or enough of the start of the ID to be unique. Options go before the other arguments, as in `logs -f web`. Single-letter options combine, as in `-it` or `-dt`.
 
@@ -305,7 +307,7 @@ sudo ./runt attach box         # its terminal; Ctrl+P, Ctrl+Q detaches and leave
 
 Each container gets a random 12-character hex ID and a directory `/run/runt/<id>/`:
 
-- `state.json`: the rootfs or image, command, limits, cgroup, network, address and published ports, timestamps, and status. The status moves from `created` (set up, with the host PID of its init) to `running` and then `stopped` (with the exit code).
+- `state.json`: the rootfs or image, command, limits, cgroup, network, address and published ports, mounts, timestamps, and status. The status moves from `created` (set up, with the host PID of its init) to `running` and then `stopped` (with the exit code).
 - `container.log`: the container's output, one JSON object per line, in the format of Docker's `json-file` log driver.
 - `start.fifo`: what a created container's init waits on (see below).
 - `attach.sock`: the Unix socket `runt attach` connects to, while the container runs.
@@ -389,6 +391,79 @@ With `--rootfs`, the rootfs directory is the only layer underneath. With `--imag
 `runt` mounts the overlay as host root before it starts init, so the mount is visible on the host while the container runs (`mount | grep runt`). It's mounted `nodev`, so a device file in an image can't be used to reach the host's disks. After the container stops, `runt` unmounts it. The writable layer stays until `runt rm`, as Docker keeps a stopped container's changes. Inspect it in `upper/`, where deleted files show up as character devices with device number 0/0.
 
 The container's directory is mode `0710` with group container root (host gid 100000, usually), because init runs as container root and has to reach `rootfs/`. Other host users can't look in.
+
+## Storage
+
+Three kinds of mount go on top of the container's root filesystem, with Docker's options:
+
+```bash
+sudo ./runt run -it --rootfs /var/lib/runt/rootfs -v "$PWD":/src -- /bin/bash
+sudo ./runt run -d --name db -e POSTGRES_PASSWORD=secret -v pgdata:/var/lib/postgresql/data --image postgres:16
+sudo ./runt run -it --image alpine:3.20 --tmpfs /scratch:size=64m -- /bin/sh
+```
+
+| Option | Mounts | Lasts |
+| --- | --- | --- |
+| `-v /host/path:/path[:ro]` | a file or directory on the host (a bind mount) | as long as the host's files |
+| `-v NAME:/path[:ro]` | a [volume](#volumes), made if it doesn't exist | until `runt volume rm` |
+| `--tmpfs /path[:OPTIONS]` | an empty filesystem in memory | until the container stops |
+
+A `-v` source that starts with `/`, `./`, or `../` is a host path (a relative one is from where `runt` runs); anything else is a volume's name. Both repeat, and mix: mounts are made parent first, so `--tmpfs /data/cache` goes inside `-v data:/data`, whatever order they're given in. A bind mount takes whatever is mounted inside its source along with it, as Docker's do. Its source must exist: Docker would make an empty directory, which a container in a user namespace couldn't write to anyway, so `runt` refuses, as Podman does.
+
+A mount point the root filesystem doesn't have is made in the container's writable layer (a [bundle](#oci-runtime-bundles)'s root filesystem, which `runt` doesn't change, must already have it). A file mounted at `/etc/hosts` or `/etc/resolv.conf` replaces `runt`'s own, as with Docker. Mounts can't go at `/`, or in `/proc` or `/sys`, which `runt` makes itself. A read-only root filesystem (a bundle's `root.readonly`) leaves the mounts on it writable, as Docker's `--read-only` does.
+
+Not supported: anonymous volumes (`-v /path` on its own, and an image's `VOLUME`s), `--mount`, and SELinux labels (`:z`).
+
+### Bind mounts and the user namespace
+
+Container root is an unprivileged host user (100000, usually), so it can do with a bind-mounted host directory only what any other user could. Files owned by host users outside the container's [range](#user-namespace-id-range) show up as owned by `nobody`, and container root can read or write them only as far as their permissions let everyone. To give a container a directory it can write to, give the directory to container root:
+
+```bash
+mkdir data && sudo chown 100000:100000 data
+sudo ./runt run --rootfs /var/lib/runt/rootfs -v ./data:/data -- /bin/sh -c 'echo hi > /data/hi'
+```
+
+Docker doesn't have this problem, because its container root is host root (unless `userns-remap` is on). Podman and newer runc solve it with idmapped mounts (`-v dir:/path:idmap`), which show the host's owners shifted into the container's range without changing the files. `runt` doesn't do that yet.
+
+### Volumes
+
+A volume is a directory `runt` keeps for containers to mount, which outlives them, as a database's files should outlive the container running it. `-v NAME:/path` makes the volume `NAME` the first time it's used; `runt volume create NAME` makes one ahead of time (and, like `docker volume create`, does nothing if it exists).
+
+```bash
+sudo ./runt volume create pgdata
+sudo ./runt volume ls             # name, age, and where its files are; -q for names only
+sudo ./runt volume rm pgdata
+```
+
+Each volume is a directory `/var/lib/runt/volumes/<name>/`, as in Docker's `/var/lib/docker/volumes`, with its files in `_data/` and its name and creation time in `volume.json`. `_data` belongs to container root of whoever made the volume: the container's [ID range](#user-namespace-id-range), or for `runt volume create`, the invoking user's. A container mapped onto another range sees its files as owned by `nobody`.
+
+**Filled from the image.** When a container mounts an empty volume at a directory its image has, `runt` first copies the image's files there into the volume, with their owners and permissions, and gives the volume the directory's own: so `-v pgdata:/var/lib/postgresql/data` starts with whatever the image put there, owned by the image's `postgres` user. This is what Docker does. `-v NAME:/path:nocopy` leaves the volume empty. A volume with anything in it already is never filled again. A bundle's root filesystem isn't copied from, since other containers using it could be changing it under `runt`.
+
+**In use.** `runt volume rm` refuses a volume that a container, even a stopped one, mounts, until `runt rm` removes the container, as Docker does. `runt rm` itself never removes volumes. A lock file, `/var/lib/runt/volumes/.lock`, keeps a volume from being removed while a container that uses it is starting.
+
+### tmpfs mounts
+
+`--tmpfs /path` mounts an empty [tmpfs](https://docs.kernel.org/filesystems/tmpfs.html), a filesystem in memory, whose files are gone when the container stops and never reach its writable layer. It suits scratch space and secrets that shouldn't touch the disk. Options, separated by commas, as in `--tmpfs /run:size=64m,mode=755,exec`:
+
+| Option | Meaning | Default |
+| --- | --- | --- |
+| `size=SIZE` | the most it holds, with `k`, `m`, or `g` as for `--memory` | half the host's memory (the kernel's default) |
+| `mode=MODE` | permissions of its root directory, in octal | `1777`, as `/tmp` |
+| `ro` / `rw` | read-only, or not | `rw` |
+| `noexec` / `exec` | whether programs on it can be run | `noexec` |
+| `nosuid` / `suid`, `nodev` / `dev` | whether setuid bits and device files work | `nosuid`, `nodev` |
+
+The defaults are Docker's. What a tmpfs holds counts against the container's `--memory` limit, since the kernel charges its pages to the cgroup that wrote them.
+
+### How mounts are made
+
+Init could make a tmpfs on its own, but not a bind mount: it runs as container root, an unprivileged host user, who usually can't get to a directory such as `/home/you/project` (mode `0750`). So the supervisor, as host root, does the part that needs the host:
+
+1. It makes any volumes that don't exist yet (filling them from the image), and bind-mounts each bind mount's and volume's source onto a staging directory of the container's own, `/run/runt-mounts/<id>/<n>`. The container's directory there is mode `0710`, with group container root, as its filesystem directory is. A `:ro` mount is made read-only here.
+2. Init is cloned with a copy of the host's mounts, staging ones included. Before `pivot_root`, and after it has made `/dev` (so a mount can go inside that), it bind-mounts each staging directory to its place in the container's root filesystem, and mounts each tmpfs. Its copy of a read-only mount came from the host, so the kernel locks it read-only: the container couldn't make it writable even with the capabilities to try.
+3. Once init says it's ready, the supervisor unmounts the staging directories. Init's copies are in its own mount namespace, and stay. `runt rm` cleans up after a monitor that was killed before then.
+
+Mounting before `pivot_root` means a symlink in the image would be followed on the host: an image whose `/data` is a link to `/etc` could get `-v x:/data` mounted over the host's `/etc` (runc's CVE-2021-30465 was of this kind). So init follows every symlink on the way to a mount point itself, with the container's root as `/`, and makes missing directories only once it knows where they really are. Then it opens the mount point, checks through `/proc/self/fd` that it's still inside the container's root, and mounts onto `/proc/self/fd/N` rather than onto its path, so nothing can swap the path in between. runc does the same, with its `securejoin` library.
 
 ## Images
 
@@ -483,8 +558,9 @@ As with runc, the container uses the bundle's root filesystem directory itself, 
 - `hostname`
 - `linux.uidMappings` and `linux.gidMappings`, each a single range starting at container ID 0. Without them, `runt` uses `/etc/subuid` and `/etc/subgid` as usual, and `runt spec` writes yours in.
 - `linux.resources`: `memory.limit`, `cpu.quota` and `cpu.period`, and `pids.limit`
+- `mounts`: bind mounts (`type` `bind`, or the option `bind` or `rbind`), with a `source` relative to the bundle or absolute, and the options `ro`, `nosuid`, `nodev`, and `noexec`; and `tmpfs` mounts, with the options `--tmpfs` takes (see [Storage](#storage)), and only those, without `--tmpfs`'s defaults. Mount points must already exist in the root filesystem. `runt` makes its standard mounts (`/proc`, `/dev`, `/sys`, and those under them) its own way, whatever the file says about them.
 
-Options on the command line, such as `--memory`, win over the file's. `runt` always creates every namespace and applies its own security settings (capabilities, seccomp, masked paths, `no_new_privs`), so it ignores the fields for those. It refuses a `config.json` that asks for something it can't do, rather than quietly running the container differently. That includes mounts other than its standard ones (`/proc`, `/dev`, `/sys`, and those under them), and namespaces given by path to join.
+Options on the command line, such as `--memory`, win over the file's, and `-v` and `--tmpfs` add mounts to its. `runt` always creates every namespace and applies its own security settings (capabilities, seccomp, masked paths, `no_new_privs`), so it ignores the fields for those. It refuses a `config.json` that asks for something it can't do, rather than quietly running the container differently. That includes other kinds of mount, other mount options (such as `rshared`), and namespaces given by path to join.
 
 ## AppArmor (optional)
 

@@ -13,6 +13,7 @@ import (
 	"os/exec"
 	"os/signal"
 	"path/filepath"
+	"slices"
 	"strings"
 	"sync"
 	"syscall"
@@ -213,7 +214,8 @@ func Monitor() error {
 //  2. Make the state directory, and from there on, the cleanups: each step
 //     that makes something defers its undoing, so a failure at any later
 //     step, or the container's exit, undoes everything in reverse order.
-//  3. Mount the overlay, make the cgroup, join the network.
+//  3. Mount the overlay, stage the bind mounts and volumes, make the cgroup,
+//     join the network.
 //  4. Make the pipes and FIFO init uses, and connect its input and output.
 //  5. Start init, in new namespaces and the cgroup, and make its veth pair.
 //  6. Send init its configuration, and wait for "ready".
@@ -291,6 +293,9 @@ func supervise(config Config, foreground, autoStart bool, ready func(id string, 
 	if config.Network == NetworkNone && len(config.Ports) > 0 {
 		return errors.New("publishing ports needs a network, and --network none has none")
 	}
+	if config.Mounts, err = sortMounts(config.Mounts); err != nil {
+		return err
+	}
 
 	id, err := newID()
 	if err != nil {
@@ -328,6 +333,7 @@ func supervise(config Config, foreground, autoStart bool, ready func(id string, 
 		AppArmorProfile: config.AppArmorProfile,
 		Resources:       config.Resources,
 		Network:         config.Network,
+		Mounts:          config.Mounts,
 		Created:         time.Now(),
 	}
 	if image != nil {
@@ -357,6 +363,34 @@ func supervise(config Config, foreground, autoStart bool, ready func(id string, 
 				warn(err)
 			}
 		}()
+	}
+
+	// Bind mounts and volumes, mounted on the host for init to mount in
+	// the container (see mounts_linux.go). New volumes are filled from the
+	// image, but not from a bundle's root filesystem, which other
+	// containers may be changing as runt reads it. The volumes stay locked
+	// until the state, which lists them, is saved, so runt volume rm can't
+	// remove one in between. unstage runs once init is ready, or else when
+	// supervise returns.
+	var mounts []Mount
+	unlockVolumes := func() {}
+	unstage := func() {}
+	if len(config.Mounts) > 0 {
+		if slices.ContainsFunc(config.Mounts, func(m Mount) bool { return m.Type == MountVolume }) {
+			if unlockVolumes, err = lockVolumes(true); err != nil {
+				return err
+			}
+			defer unlockVolumes()
+		}
+		unstage = sync.OnceFunc(func() {
+			if err := unstageMounts(id); err != nil {
+				warn(err)
+			}
+		})
+		defer unstage()
+		if mounts, err = stageMounts(id, config.Mounts, rootfs, layers != nil, uids, gids); err != nil {
+			return err
+		}
 	}
 
 	cgroupFD := -1
@@ -596,6 +630,15 @@ func supervise(config Config, foreground, autoStart bool, ready func(id string, 
 			command.Process.Signal(sig)
 		}
 	}()
+	// /etc/hosts and /etc/resolv.conf, which init mounts into the container
+	// (see etc_linux.go), unless the container mounts its own there, as
+	// with -v ./hosts:/etc/hosts. Docker leaves those alone too.
+	etc := etcFiles(config.Hostname, network)
+	for path := range etc {
+		if mountCovers(config.Mounts, path) {
+			delete(etc, path)
+		}
+	}
 	// The configuration goes to init as JSON, written to the pipe init
 	// reads as its descriptor 5. Closing the pipe after tells init it has
 	// all of it.
@@ -612,9 +655,8 @@ func supervise(config Config, foreground, autoStart bool, ready func(id string, 
 		UserSpec:        config.UserSpec,
 		Tty:             config.Tty,
 		Network:         networkConfig,
-		// /etc/hosts and /etc/resolv.conf, which init mounts into the
-		// container (see etc_linux.go).
-		EtcFiles: etcFiles(config.Hostname, network),
+		EtcFiles:        etc,
+		Mounts:          mounts,
 	})
 	configW.Close()
 	if err != nil {
@@ -627,6 +669,7 @@ func supervise(config Config, foreground, autoStart bool, ready func(id string, 
 		warn(err)
 	}
 	unlockImages()
+	unlockVolumes()
 	if config.DebugInit {
 		// Inside its PID namespace init sees itself as PID 1, so only the
 		// parent can report the PID a host debugger needs.
@@ -711,6 +754,9 @@ func supervise(config Config, foreground, autoStart bool, ready func(id string, 
 		}
 		return setupErr
 	}
+	// Init has made its mounts, in a mount namespace of its own, so the
+	// host's staging mounts can go.
+	unstage()
 	keepState = true
 	if autoStart {
 		// Init reads this, and then runs the command. Writing it only now,
@@ -976,6 +1022,11 @@ func Remove(ref string, force bool) error {
 	// The writable layer goes before the state directory; see
 	// pruneContainerFS.
 	if err := removeContainerFS(state.ID); err != nil {
+		return fmt.Errorf("remove container %s: %w", state.ID, err)
+	}
+	// The monitor normally unmounts these once init is ready. This catches
+	// one that died before then.
+	if err := unstageMounts(state.ID); err != nil {
 		return fmt.Errorf("remove container %s: %w", state.ID, err)
 	}
 	if err := os.RemoveAll(stateDir(StateRoot, state.ID)); err != nil {

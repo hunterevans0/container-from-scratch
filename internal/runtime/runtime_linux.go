@@ -195,6 +195,10 @@ type initConfig struct {
 	// EtcFiles are files to mount over the container's own, by path and
 	// content: /etc/hosts and /etc/resolv.conf (see mountEtcFiles).
 	EtcFiles map[string]string `json:"etcFiles,omitempty"`
+	// Mounts are the bind and tmpfs mounts to make, in order, each bind
+	// mount from a staging directory the supervisor made (see
+	// mounts_linux.go).
+	Mounts []Mount `json:"mounts,omitempty"`
 }
 
 // Init is the container's init process: runt run (or create) clones it into
@@ -474,6 +478,12 @@ func setupContainer(config initConfig, consoleSocket *os.File) (*os.File, error)
 	if err := setupDev(rootfs); err != nil {
 		return nil, err
 	}
+	// -v and --tmpfs mounts, after /dev so that one can go inside it, and
+	// before pivot_root, while the supervisor's staging directories are
+	// still in sight.
+	if err := makeMounts(rootfs, config.Mounts, config.DirectRootfs); err != nil {
+		return nil, err
+	}
 	if err := pivotRoot(rootfs); err != nil {
 		return nil, err
 	}
@@ -492,9 +502,11 @@ func setupContainer(config initConfig, consoleSocket *os.File) (*os.File, error)
 			return nil, err
 		}
 	}
+	// Only the root itself: mounts on top of it, such as volumes, stay
+	// writable, as with Docker.
 	if config.ReadonlyRootfs {
-		if err := remountRootReadonly(); err != nil {
-			return nil, err
+		if err := remountBind("/", syscall.MS_RDONLY); err != nil {
+			return nil, fmt.Errorf("make root read-only: %w", err)
 		}
 	}
 
@@ -548,24 +560,6 @@ func setupConsole(socket *os.File) (*os.File, error) {
 		return nil, err
 	}
 	return slave, nil
-}
-
-// remountRootReadonly makes "/" read-only. A remount has to repeat the
-// nosuid, nodev, and noexec flags the mount already has: the kernel locks
-// them on mounts that came from a more privileged user namespace, and
-// refuses a remount that would clear them.
-func remountRootReadonly() error {
-	var stat syscall.Statfs_t
-	if err := syscall.Statfs("/", &stat); err != nil {
-		return fmt.Errorf("read root mount flags: %w", err)
-	}
-	// ST_NOSUID, ST_NODEV, and ST_NOEXEC have the same values as the MS_
-	// flags.
-	locked := uintptr(stat.Flags) & (syscall.MS_NOSUID | syscall.MS_NODEV | syscall.MS_NOEXEC)
-	if err := syscall.Mount("", "/", "", syscall.MS_BIND|syscall.MS_REMOUNT|syscall.MS_RDONLY|locked, ""); err != nil {
-		return fmt.Errorf("make root read-only: %w", err)
-	}
-	return nil
 }
 
 // pivotRoot makes rootfs the new "/" and detaches the host's root filesystem,

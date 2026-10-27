@@ -80,6 +80,8 @@ func main() {
 		exit("runt", logout(args))
 	case "network":
 		exit("runt", networkCommand(args))
+	case "volume":
+		exit("runt", volumeCommand(args))
 	// Internal commands: runt runs itself with these. Rather than ship
 	// separate programs for the container's init, the background monitor,
 	// and exec's helper, runt starts another copy of itself with one of
@@ -173,6 +175,25 @@ func containerFlags(name string) (*flag.FlagSet, *runtime.Config) {
 	}
 	flags.Func("p", "publish a container port on the host, [[HOSTIP:]HOSTPORT:]CONTAINERPORT[/udp], as in 8080:80 (repeatable)", publish)
 	flags.Func("publish", "same as -p", publish)
+	// -v and --tmpfs work as -p does: each one adds a mount.
+	volume := func(s string) error {
+		mount, err := runtime.ParseVolume(s)
+		if err != nil {
+			return err
+		}
+		config.Mounts = append(config.Mounts, mount)
+		return nil
+	}
+	flags.Func("v", "mount a host path or a volume in the container, SOURCE:DESTINATION[:ro], as in /srv/site:/site or pgdata:/var/lib/postgresql/data (repeatable)", volume)
+	flags.Func("volume", "same as -v", volume)
+	flags.Func("tmpfs", "mount an empty in-memory filesystem in the container, DESTINATION[:OPTIONS], as in /run:size=64m (repeatable)", func(s string) error {
+		mount, err := runtime.ParseTmpfs(s)
+		if err != nil {
+			return err
+		}
+		config.Mounts = append(config.Mounts, mount)
+		return nil
+	})
 	flags.StringVar(&config.UsernsUser, "userns-user", "", "user whose /etc/subuid and /etc/subgid ranges to map the container onto (default: the invoking user)")
 	flags.StringVar(&config.AppArmorProfile, "apparmor-profile", "", "loaded AppArmor profile to confine the command with (default: none)")
 	flags.BoolVar(&config.DebugInit, "debug-init", false, "pause the container's init process until a debugger attaches, and print its host PID")
@@ -743,6 +764,60 @@ func networkCommand(args []string) error {
 	return errors.New(usage)
 }
 
+// volumeCommand runs runt volume and its subcommands, create, ls, and rm,
+// which args[0] names, as networkCommand does for networks (see
+// internal/runtime/volumes_linux.go for the work).
+func volumeCommand(args []string) error {
+	const usage = "usage: runt volume create NAME | ls [-q] | rm NAME ..."
+	if len(args) == 0 {
+		return errors.New(usage)
+	}
+	switch args[0] {
+	case "create":
+		if len(args) != 2 {
+			return errors.New("usage: runt volume create NAME")
+		}
+		volume, err := runtime.CreateVolume(args[1])
+		if err != nil {
+			return err
+		}
+		fmt.Println(volume.Name)
+		return nil
+	case "ls", "list":
+		flags := flag.NewFlagSet("volume ls", flag.ContinueOnError)
+		quiet := flags.Bool("q", false, "show only volume names")
+		if err := flags.Parse(args[1:]); err != nil {
+			return err
+		}
+		if flags.NArg() != 0 {
+			return errors.New("usage: runt volume ls [-q]")
+		}
+		volumes, err := runtime.ListVolumes()
+		if err != nil {
+			return err
+		}
+		if *quiet {
+			for _, volume := range volumes {
+				fmt.Println(volume.Name)
+			}
+			return nil
+		}
+		table := tabwriter.NewWriter(os.Stdout, 0, 0, 3, ' ', 0)
+		fmt.Fprintln(table, "VOLUME NAME\tCREATED\tMOUNTPOINT")
+		now := time.Now()
+		for _, volume := range volumes {
+			fmt.Fprintf(table, "%s\t%s ago\t%s\n", volume.Name, humanDuration(now.Sub(volume.Created)), volume.Mountpoint)
+		}
+		return table.Flush()
+	case "rm", "remove":
+		if len(args) == 1 {
+			return errors.New("usage: runt volume rm NAME ...")
+		}
+		return eachContainer(args[1:], runtime.RemoveVolume)
+	}
+	return errors.New(usage)
+}
+
 // statusText is a container's STATUS as runt ps shows it, as docker ps
 // does: Created, Up 5 minutes, or Exited (0) 2 hours ago.
 func statusText(state *runtime.State, now time.Time) string {
@@ -826,10 +901,16 @@ Networks:
   network ls                                  list networks
   network rm NAME ...                         remove networks
 
+Volumes:
+  volume create NAME                          make a volume, which outlives the containers using it
+  volume ls [-q]                              list volumes
+  volume rm NAME ...                          remove volumes no container uses
+
 OPTIONS for run and create: one of
   --rootfs PATH  --image IMAGE  --bundle DIR (whose config.json gives the command)
 and any of
   --name NAME  --network bridge|none|NAME  -p [[HOSTIP:]HOSTPORT:]PORT[/udp]
+  -v HOSTPATH|VOLUME:PATH[:ro]  --tmpfs PATH[:size=SIZE,mode=MODE,...]
   --userns-user NAME  --apparmor-profile NAME
   -e NAME=VALUE  -w DIR  -u USER[:GROUP]  --entrypoint COMMAND
   --memory SIZE  --cpus N  --pids-limit N  --device-{read,write}-{bps,iops} PATH:RATE

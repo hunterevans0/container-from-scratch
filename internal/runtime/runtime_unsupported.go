@@ -45,6 +45,9 @@ func HumanSize(int64) string                         { return "" }
 func CreateNetwork(string, string) (*Network, error) { return nil, errUnsupported }
 func ListNetworks() ([]Network, error)               { return nil, errUnsupported }
 func RemoveNetwork(string) error                     { return errUnsupported }
+func CreateVolume(string) (*Volume, error)           { return nil, errUnsupported }
+func ListVolumes() ([]Volume, error)                 { return nil, errUnsupported }
+func RemoveVolume(string) error                      { return errUnsupported }
 
 // ImageSummary describes an image in the store. On Linux it is defined in
 // imagestore_linux.go; it is needed here too because ListImages returns it.

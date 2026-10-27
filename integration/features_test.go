@@ -602,14 +602,14 @@ func TestFeatureOCIFormats(t *testing.T) {
 	})
 
 	t.Run("BundleRejectsWhatRuntCantDo", func(t *testing.T) {
-		explain(t, "a config.json asking for a bind mount of / or the host's network namespace is refused")
+		explain(t, "a config.json asking for an overlay mount or the host's network namespace is refused")
 		r := newRuntTester(t)
 		dir, spec := writeFeatureBundle(t, r)
 		mounts := spec["mounts"].([]any)
-		spec["mounts"] = append(mounts, map[string]any{"destination": "/mnt/host", "type": "bind", "source": "/", "options": []string{"rbind"}})
+		spec["mounts"] = append(mounts, map[string]any{"destination": "/mnt/host", "type": "overlay", "source": "overlay"})
 		saveBundle(t, dir, spec)
 		output, err := r.runOnce("runt-feature-bundle-bad", "--bundle", dir)
-		mustFail(t, "a bind mount of the host's /", output, err, "mount at /mnt/host is not supported")
+		mustFail(t, "an overlay mount", output, err, `mount at /mnt/host: type "overlay" is not supported`)
 
 		dir, spec = writeFeatureBundle(t, r)
 		linux := spec["linux"].(map[string]any)

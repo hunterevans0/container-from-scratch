@@ -7,6 +7,7 @@ import (
 	"os"
 	"path"
 	"path/filepath"
+	"slices"
 	"strings"
 )
 
@@ -117,11 +118,12 @@ var standardMounts = []specMount{
 //   - linux.uidMappings and gidMappings, each a single range starting at
 //     container ID 0. Without them runt uses /etc/subuid and /etc/subgid.
 //   - linux.resources: memory.limit, cpu.quota and period, and pids.limit.
+//   - mounts: bind mounts and tmpfs mounts (see bundleMount), besides the
+//     standard ones runt makes anyway.
 //
-// mounts may only list the mounts runt makes anyway, and
-// linux.namespaces can't name an existing namespace to join; runt rejects
-// a config.json that asks for either, rather than quietly running the
-// container differently.
+// Other kinds of mount, and linux.namespaces naming an existing namespace
+// to join, runt rejects, rather than quietly running the container
+// differently.
 func LoadBundle(config *Config) error {
 	dir, err := filepath.Abs(config.Bundle)
 	if err != nil {
@@ -143,10 +145,17 @@ func LoadBundle(config *Config) error {
 	if spec.Process.Cwd != "" && !path.IsAbs(spec.Process.Cwd) {
 		return fmt.Errorf("bundle %s: process.cwd %q must be absolute", dir, spec.Process.Cwd)
 	}
+	// runt makes the standard mounts its own way; the rest it makes as -v
+	// and --tmpfs would.
 	for _, mount := range spec.Mounts {
-		if !isStandardMount(mount.Destination) {
-			return fmt.Errorf("bundle %s: mount at %s is not supported; runt only makes its standard mounts (/proc, /dev, /sys, ...)", dir, mount.Destination)
+		if isStandardMount(mount.Destination) {
+			continue
 		}
+		m, err := bundleMount(dir, mount)
+		if err != nil {
+			return fmt.Errorf("bundle %s: mount at %s: %w", dir, mount.Destination, err)
+		}
+		config.Mounts = append(config.Mounts, m)
 	}
 
 	config.Bundle = dir
@@ -227,6 +236,48 @@ func isStandardMount(destination string) bool {
 		}
 	}
 	return false
+}
+
+// bundleOptions are the options runt takes on a bind mount in config.json.
+// It always makes them as bind does with rbind, and private, so those
+// options change nothing.
+var bundleOptions = []string{"bind", "rbind", "private", "rprivate", "rw", "ro", "nosuid", "nodev", "noexec"}
+
+// bundleMount turns a mount in config.json, other than the standard ones,
+// into a Mount: a bind mount (type bind, or an option bind or rbind), whose
+// source is relative to the bundle or absolute, or a tmpfs. Their options
+// are as in mount(8). Unlike with --tmpfs, a tmpfs has only the options it
+// lists.
+func bundleMount(dir string, mount specMount) (Mount, error) {
+	m := Mount{Destination: mount.Destination}
+	switch {
+	case mount.Type == "tmpfs":
+		options, err := tmpfsOptions(nil, mount.Options)
+		if err != nil {
+			return Mount{}, err
+		}
+		m.Type, m.Options = MountTmpfs, options
+	case mount.Type == "bind" || slices.Contains(mount.Options, "bind") || slices.Contains(mount.Options, "rbind"):
+		if mount.Source == "" {
+			return Mount{}, errors.New("a bind mount needs a source")
+		}
+		m.Type, m.Source = MountBind, mount.Source
+		if !filepath.IsAbs(m.Source) {
+			m.Source = filepath.Join(dir, m.Source)
+		}
+		for _, option := range mount.Options {
+			if !slices.Contains(bundleOptions, option) {
+				return Mount{}, fmt.Errorf("unsupported option %q", option)
+			}
+			// rw and the rest are runt's anyway.
+			if flag, ok := mountFlagOptions[option]; ok && flag.on {
+				m.Options = append(m.Options, option)
+			}
+		}
+	default:
+		return Mount{}, fmt.Errorf("type %q is not supported; runt makes bind and tmpfs mounts, besides its standard ones (/proc, /dev, /sys, ...)", mount.Type)
+	}
+	return m, checkDestination(m)
 }
 
 // specIDRange turns a config.json ID mapping into the single range runt
