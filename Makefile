@@ -3,7 +3,7 @@ ROOTFS ?= /var/lib/runt/rootfs
 # Empty means the user running sudo.
 USERNS_USER ?=
 
-.PHONY: build build-debug test integration features vet hello rootfs apparmor shell debug debug-init debug-attach-init debug-integration clean
+.PHONY: build build-debug test integration features vet hello hello-image rootfs apparmor shell debug debug-init debug-attach-init debug-integration clean
 
 # CGO_ENABLED=0: dropping capabilities uses syscall.AllThreadsSyscall, which
 # does not work in a cgo binary.
@@ -35,6 +35,12 @@ vet:
 
 hello:
 	go run ./cmd/runt hello
+
+# A hello world image, called hello: a static Go binary in an image FROM
+# scratch (see examples/hello). Run it with sudo ./runt run --image hello.
+hello-image: build
+	CGO_ENABLED=0 go build -o examples/hello/hello ./examples/hello
+	sudo ./runt build -t hello examples/hello
 
 rootfs:
 	sudo USERNS_USER=$(USERNS_USER) scripts/make-rootfs.sh $(ROOTFS)
