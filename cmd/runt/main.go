@@ -74,6 +74,14 @@ func main() {
 		exit("runt", images(args))
 	case "rmi":
 		exit("runt", rmi(args))
+	case "tag":
+		exit("runt", tag(args))
+	case "build":
+		exit("runt", build(args))
+	case "push":
+		exit("runt", push(args))
+	case "builder":
+		exit("runt", builderCommand(args))
 	case "login":
 		exit("runt", login(args))
 	case "logout":
@@ -596,6 +604,90 @@ func rmi(args []string) error {
 	return nil
 }
 
+// tag is runt tag, which gives an image another name.
+func tag(args []string) error {
+	flags := flag.NewFlagSet("tag", flag.ContinueOnError)
+	if err := flags.Parse(args); err != nil {
+		return err
+	}
+	if flags.NArg() != 2 {
+		return errors.New("usage: runt tag SOURCE TARGET")
+	}
+	return runtime.Tag(flags.Arg(0), flags.Arg(1))
+}
+
+// build is runt build, which builds an image from a Dockerfile. -t and
+// --build-arg can be given more than once, so each is a flags.Func adding
+// to a list (or map) rather than a single value.
+func build(args []string) error {
+	flags := flag.NewFlagSet("build", flag.ContinueOnError)
+	options := runtime.BuildOptions{BuildArgs: map[string]string{}}
+	addTag := func(s string) error {
+		options.Tags = append(options.Tags, s)
+		return nil
+	}
+	flags.Func("t", "name the image, NAME[:TAG], as in app:1.0 (repeatable)", addTag)
+	flags.Func("tag", "same as -t", addTag)
+	flags.StringVar(&options.Dockerfile, "f", "", "the Dockerfile (default: Dockerfile in the context; - for standard input)")
+	flags.StringVar(&options.Dockerfile, "file", "", "same as -f")
+	flags.Func("build-arg", "set an ARG, NAME=VALUE, or NAME to take its value from runt's environment (repeatable)", func(s string) error {
+		name, value, hasValue := strings.Cut(s, "=")
+		if !hasValue {
+			// As with -e, a name alone takes runt's own value, and is left
+			// out if there is none.
+			var ok bool
+			if value, ok = os.LookupEnv(name); !ok {
+				return nil
+			}
+		}
+		if name == "" {
+			return fmt.Errorf("invalid build argument %q", s)
+		}
+		options.BuildArgs[name] = value
+		return nil
+	})
+	flags.StringVar(&options.Target, "target", "", "build up to this stage, by name, and make it the image")
+	flags.BoolVar(&options.NoCache, "no-cache", false, "run every step, rather than reuse what earlier builds made")
+	flags.BoolVar(&options.Pull, "pull", false, "pull every image FROM names, even if runt's store has it")
+	flags.StringVar(&options.Network, "network", "", "network for RUN steps: bridge (the default), none, or one made with runt network create")
+	flags.StringVar(&options.UsernsUser, "userns-user", "", "user whose /etc/subuid and /etc/subgid ranges to map RUN steps onto (default: the invoking user)")
+	if err := flags.Parse(args); err != nil {
+		return err
+	}
+	if flags.NArg() != 1 {
+		return errors.New("usage: runt build [-t NAME[:TAG]] [-f DOCKERFILE] [OPTIONS] CONTEXT")
+	}
+	options.Context = flags.Arg(0)
+	_, err := runtime.Build(options, os.Stdout)
+	return err
+}
+
+// push is runt push.
+func push(args []string) error {
+	flags := flag.NewFlagSet("push", flag.ContinueOnError)
+	if err := flags.Parse(args); err != nil {
+		return err
+	}
+	if flags.NArg() != 1 {
+		return errors.New("usage: runt push NAME[:TAG]")
+	}
+	return runtime.Push(flags.Arg(0), os.Stdout)
+}
+
+// builderCommand runs runt builder prune, which empties runt build's cache.
+func builderCommand(args []string) error {
+	if len(args) != 1 || args[0] != "prune" {
+		return errors.New("usage: runt builder prune")
+	}
+	entries, reclaimed, err := runtime.PruneBuildCache()
+	if err != nil {
+		return err
+	}
+	fmt.Printf("Deleted %d build cache entries\n", entries)
+	fmt.Printf("Total reclaimed space: %s\n", runtime.HumanSize(reclaimed))
+	return nil
+}
+
 // login is runt login. The password comes from -p, from standard input with
 // --password-stdin, or else from a prompt, typed without being shown.
 // *password = ... sets the variable flags.String made, through its pointer.
@@ -889,9 +981,15 @@ Containers:
   hello                                       print a greeting
 
 Images:
+  build [-t NAME[:TAG]] [-f DOCKERFILE] [--build-arg NAME=VALUE] [--target STAGE]
+        [--no-cache] [--pull] [--network NETWORK] CONTEXT
+                                              build an image from a Dockerfile
   pull IMAGE                                  download an image from a registry
+  push NAME[:TAG]                             upload an image to its registry
+  tag SOURCE TARGET                           give an image another name
   images [-q] [--digests]                     list the images in runt's image store
   rmi [-f] IMAGE ...                          remove images from the store
+  builder prune                               empty runt build's cache
   login [-u USER] [--password-stdin] [REGISTRY]
                                               store credentials for a registry (default Docker Hub)
   logout [REGISTRY]                           remove them

@@ -27,6 +27,7 @@
 - `pull` from Docker Hub and other registries (with `login`), a local image store with `images` and `rmi`, and each image's default command, environment, working directory, and user
 - published ports (`-p 8080:80`), an `/etc/resolv.conf` and `/etc/hosts` in every container, and networks of your own (`runt network create`), apart from each other, whose containers find each other by name
 - bind mounts and named volumes (`-v`), which outlive their containers (`runt volume`), and in-memory tmpfs mounts (`--tmpfs`)
+- `build` from a Dockerfile, each step run in a temporary container and saved as a layer, with multi-stage builds, `.dockerignore`, and a build cache; and `tag` and `push` to send images to a registry
 
 This is educational code, not a production container runtime. It currently requires Linux and root privileges for `run`.
 
@@ -76,9 +77,9 @@ The rootfs itself never changes: whatever the shell writes or deletes goes to a 
 
 ## Integration tests
 
-`make test` only runs tests that don't start containers (the layer-unpacking tests also skip themselves unless run as root). `make integration` builds `runt` and runs the tests in [integration/](integration/), which start real containers with `sudo`. They check that containers can't reach each other (one tries to see the other's processes, kill it by its host PID, and move itself into its cgroup) and don't see each other's files. They also cover init reaping orphans, terminals for `run -it`, `run -dt`, and `exec -it`, signals reaching `exec`'d commands, `attach` (and detaching from it) and `start -ai`, an OCI image built from the rootfs, an image's configuration and the options that override it, a bundle made with `runt spec`, the bridge network, published ports, `/etc/resolv.conf` and `/etc/hosts`, networks made with `runt network create`, bind mounts, volumes, and tmpfs mounts. One test serves an image from a registry of its own on localhost, which wants a password, and logs in, pulls, runs, and removes it. They need the rootfs from `make rootfs`, but not the internet: the network tests stand a network namespace in for it.
+`make test` only runs tests that don't start containers (the layer-unpacking tests also skip themselves unless run as root). `make integration` builds `runt` and runs the tests in [integration/](integration/), which start real containers with `sudo`. They check that containers can't reach each other (one tries to see the other's processes, kill it by its host PID, and move itself into its cgroup) and don't see each other's files. They also cover init reaping orphans, terminals for `run -it`, `run -dt`, and `exec -it`, signals reaching `exec`'d commands, `attach` (and detaching from it) and `start -ai`, an OCI image built from the rootfs, an image's configuration and the options that override it, a bundle made with `runt spec`, the bridge network, published ports, `/etc/resolv.conf` and `/etc/hosts`, networks made with `runt network create`, bind mounts, volumes, and tmpfs mounts, and building, caching, tagging, and pushing images. One test serves an image from a registry of its own on localhost, which wants a password, and logs in, pulls, runs, and removes it. They need the rootfs from `make rootfs`, but not the internet: the network tests stand a network namespace in for it. The build tests empty `runt build`'s cache when they are done (`runt builder prune`), since it would otherwise keep their base image's layers.
 
-`make features` runs only the feature checks, in [integration/features_test.go](integration/features_test.go), [integration/network_test.go](integration/network_test.go), and [integration/storage_test.go](integration/storage_test.go): a test for each image, filesystem, network, and storage feature (`Layers`, `OCIFormats`, `Registry`, `ImageStore`, `ImageConfig`, `Network`, `Ports`, `DNS`, `UserNetworks`, `BindMounts`, `Volumes`, `Tmpfs`), with a subtest per check, each printing a line saying what it shows. Checks that pass print nothing else; one that fails is marked, with the details after its feature. `make features FEATURE=Registry` runs one of them, and `FEATURE=Registry/BasicAuth` one check.
+`make features` runs only the feature checks, in [integration/features_test.go](integration/features_test.go), [integration/network_test.go](integration/network_test.go), [integration/storage_test.go](integration/storage_test.go), and [integration/build_test.go](integration/build_test.go): a test for each image, filesystem, network, storage, and build feature (`Layers`, `OCIFormats`, `Registry`, `ImageStore`, `ImageConfig`, `Network`, `Ports`, `DNS`, `UserNetworks`, `BindMounts`, `Volumes`, `Tmpfs`, `Build`, `Cache`, `Push`), with a subtest per check, each printing a line saying what it shows. Checks that pass print nothing else; one that fails is marked, with the details after its feature. `make features FEATURE=Registry` runs one of them, and `FEATURE=Registry/BasicAuth` one check.
 
 ## Debugging with breakpoints
 
@@ -540,6 +541,77 @@ The first time an image is run, from the store or a layout, `runt` unpacks each 
 - skips device files and extended attributes. The one extended attribute images use, `security.capability`, has no effect under `no_new_privs`.
 
 `runt rmi` removes unpacked layers that are no longer needed (see [The image store](#the-image-store)).
+
+## Building images
+
+```bash
+sudo ./runt build -t hello:1.0 ./hello          # ./hello holds the Dockerfile and the files it copies
+sudo ./runt build -t app --build-arg VERSION=2 -f build/Dockerfile .
+sudo ./runt run --image hello:1.0
+```
+
+`runt build CONTEXT` builds an image from `CONTEXT/Dockerfile` (or `-f FILE`, or `-f -` for standard input), as Docker's classic builder does: a step at a time, with output like `docker build`'s. The context is the directory `COPY` and `ADD` take files from. The image goes into the store under each `-t` name. Without one, it has no name, and `runt images` shows it as `<none>`, to run by its ID.
+
+For example, a program built in one stage and copied into a small image in another:
+
+```dockerfile
+FROM ubuntu:24.04 AS build
+RUN apt-get update && apt-get install -y gcc
+COPY hello.c /src/
+RUN gcc -static -o /hello /src/hello.c
+
+FROM scratch
+COPY --from=build /hello /hello
+CMD ["/hello"]
+```
+
+### Dockerfiles
+
+| Instruction | What `runt build` does |
+| --- | --- |
+| `FROM IMAGE [AS NAME]` | starts a stage from an image (pulled if the store doesn't have it, or always with `--pull`), an earlier stage, or `scratch`, which has no files. `--platform` must be this machine's. |
+| `RUN` | runs a command in a container made from the image so far, and adds what it changed as a layer |
+| `COPY [--from=STAGE] [--chown=USER:GROUP] [--chmod=MODE]` | copies files from the context, or from an earlier stage or an image, as a new layer |
+| `ADD` | `COPY`, except that it unpacks a local tar archive (plain, gzip, or bzip2), and downloads a URL (`--checksum=sha256:...` to check it) |
+| `CMD`, `ENTRYPOINT`, `ENV`, `WORKDIR`, `USER` | set the defaults `runt run` applies (see [Image configuration](#image-configuration)). `ENTRYPOINT` clears a `CMD` inherited from the base image. |
+| `ARG NAME[=DEFAULT]` | a variable `--build-arg` sets, for the instructions after it and `RUN`'s environment, but not the image's. Before the first `FROM`, it is only for `FROM` lines. `TARGETARCH` and the other platform variables BuildKit predefines are there too. |
+| `SHELL`, `LABEL`, `EXPOSE`, `VOLUME`, `STOPSIGNAL`, `HEALTHCHECK`, `MAINTAINER` | are recorded in the image's configuration, as Docker records them, for whatever runs it. `runt` itself doesn't make anonymous volumes or run health checks, and `runt stop` always sends `SIGTERM`. |
+
+Parsing follows Docker's rules: instructions in any case, `\` at the end of a line to continue it (or `` ` `` with an `# escape=` directive), `#` comments, the JSON "exec form" (`CMD ["/hello"]`) and the shell form (`CMD /hello`, run with `/bin/sh -c` or `SHELL`'s shell), and `$NAME`, `${NAME}`, `${NAME:-default}`, `${NAME:+alternative}`, and quotes in the arguments of the instructions Docker puts variables into (not `RUN`, `CMD`, or `ENTRYPOINT`, whose shell does that itself).
+
+`.dockerignore` in the context lists files `COPY` and `ADD` can't see: `*`, `?`, and `**` wildcards, `!` exceptions, and the last matching line wins.
+
+Not supported: `ONBUILD`, BuildKit's `RUN --mount`, `--network`, and `--security`, here-documents (`RUN <<EOF`), building for other platforms, and contexts that are URLs or archives. `# syntax=` directives are ignored, since `runt` reads the Dockerfile itself.
+
+### How each step runs
+
+- `RUN` makes a container from the image so far, with `runt`'s own supervisor, as `runt run` would: on the bridge network (or `--network`), in the image's working directory, as its user, with its environment and the `ARG` values. When the command exits, the container's writable layer holds everything it changed. That becomes a layer: each file is written to a tar archive with its owner shifted back down out of the user namespace's range, and overlayfs's whiteouts (a 0/0 device for a deleted file, the `trusted.overlay.opaque` attribute for a directory whose earlier contents are hidden) are turned into OCI's (`.wh.NAME` and `.wh..wh..opq`). The archive is gzipped as it is written, and both its digests worked out on the way. Then the container is removed. If the command fails, so does the build, and the container is removed anyway.
+- `COPY` and `ADD` mount the image's filesystem on the host, as a container's would be, copy the files into it, and make the writable layer a layer in the same way. Paths in the context, in a stage, and in the image are each followed with that directory as `/`, so neither `..` nor a symbolic link (an image's `/app` pointing at `/etc`, say) can lead a copy onto the host.
+- The other instructions only change the image's configuration, and add no layer.
+
+Overlay mounts are made with `redirect_dir=off` and `metacopy=off`, so the writable layer always holds a renamed directory's or a changed file's whole content, rather than a pointer to the copy underneath, which wouldn't make sense in a layer of its own.
+
+Each step's image goes into the store, with a line in the image's history. Each build has a directory of its own under `/var/lib/runt/builds/` for the layers it makes before they go into the store, removed when it finishes; one left by a build that died is removed by the next.
+
+### The build cache
+
+A step that was run before isn't run again. Every step's image is recorded in `/var/lib/runt/build-cache.json` under a key: a digest of the previous step's key, the instruction, the `ARG` values in scope, and, for `COPY` and `ADD`, the files' names, permissions, and contents (not their times, so touching a file doesn't count). The first key comes from the base image's digest. A key so stands for everything that went into the image, and when a later build reaches a step whose key the cache has, it takes that image instead ("Using cache"). Building the same thing twice gives the same image ID.
+
+Once a step misses, so does every step after it. So a changed file reruns the `COPY` that takes it and the steps after it, but not the ones before. A different `--build-arg` reruns the steps after its `ARG`, since `RUN` sees it in its environment, as in Docker. `--no-cache` runs every step.
+
+The cache keeps its images' blobs and unpacked layers, even after `runt rmi` removes the image they made. `runt builder prune` empties it and removes what only it needed.
+
+### Tagging and pushing
+
+```bash
+sudo ./runt tag hello:1.0 localhost:5000/hello:1.0
+sudo ./runt login localhost:5000
+sudo ./runt push localhost:5000/hello:1.0
+```
+
+`runt tag SOURCE TARGET` gives an image another name. The name says where `runt push` sends it: `localhost:5000/hello:1.0` goes to the registry on `localhost:5000`, as the repository `hello`, tagged `1.0`, and `myname/hello` to Docker Hub.
+
+`runt push` uploads the blobs first, then the manifest, so the registry never has a manifest naming blobs it hasn't got. For each blob, it asks the registry whether it has it already (`HEAD`), as it will a base image's layers, and if not, starts an upload (`POST`), which the registry answers with a location, and sends the whole blob there (`PUT`), where the registry checks it against its digest. Last, it sends the manifest under the tag (`PUT`). The registry's token is asked for with `pull,push` scope, using the credentials from `runt login`.
 
 ## OCI runtime bundles
 

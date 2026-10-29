@@ -64,10 +64,10 @@ The steps between `runt` and a Docker-like container runtime. Each stage builds 
 
 ## Stage 8: Building images
 
-- [ ] Dockerfile parser (`FROM`, `RUN`, `COPY`, `CMD`, `ENV`, ...).
-- [ ] Builder that runs each step in a temporary container and saves the result as a layer.
-- [ ] Build cache to skip unchanged steps.
-- [ ] Push images to a registry.
+- [x] Dockerfile parser (`FROM`, `RUN`, `COPY`, `CMD`, `ENV`, ...). Every instruction but `ONBUILD`, with continuation lines, the `escape` directive, exec and shell forms, `$VAR` and `${VAR:-default}` with quotes, `ARG` before and after `FROM`, multi-stage builds, and `.dockerignore`. BuildKit's own additions (`RUN --mount`, here-documents) aren't supported.
+- [x] Builder that runs each step in a temporary container and saves the result as a layer. `RUN` runs in a container made with runt's own supervisor, and its writable layer, overlayfs whiteouts and all, becomes an OCI layer; `COPY` and `ADD` copy into a mounted overlay, following paths only within the context, stage, or image.
+- [x] Build cache to skip unchanged steps. Each step's image is kept under a key chained from the previous step's, with the `ARG` values and the copied files' contents; `--no-cache` and `runt builder prune`.
+- [x] Push images to a registry. `runt push` uploads the blobs the registry lacks, then the manifest, with a `pull,push` token; `runt tag` names an image for it.
 
 ## Stage 9: Daemon and API
 
@@ -85,4 +85,4 @@ The steps between `runt` and a Docker-like container runtime. Each stage builds 
 
 ## Suggested next steps
 
-With images pulled from registries and run with their own configuration, published ports, DNS, networks whose containers find each other by name, and volumes for data that outlives a container, most images and small multi-container setups work as they do in Docker. One gap in storage remains: a bind-mounted directory is only writable by the container if it belongs to the container's ID range, since container root isn't host root. Idmapped mounts (`mount_setattr` with `MOUNT_ATTR_IDMAP`, as Podman's `:idmap` uses) would fix that. After that, building images (Stage 8) is the largest missing piece; `buildah` can fill the gap until then, writing OCI layouts that `--image` runs.
+With images built from Dockerfiles, pushed to and pulled from registries, and run with their own configuration, published ports, DNS, networks whose containers find each other by name, and volumes for data that outlives a container, the whole cycle of making and running an image works as it does in Docker. One gap in storage remains: a bind-mounted directory is only writable by the container if it belongs to the container's ID range, since container root isn't host root. Idmapped mounts (`mount_setattr` with `MOUNT_ATTR_IDMAP`, as Podman's `:idmap` uses) would fix that. The builder's way of turning a writable layer into an image layer is most of `runt commit` (Stage 10) already. After that, a daemon (Stage 9) is the largest missing piece.

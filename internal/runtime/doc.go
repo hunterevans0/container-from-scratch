@@ -39,14 +39,27 @@
 //     read-only layers under a writable layer of its own.
 //   - layer_linux.go: unpacking an image's layers.
 //   - image.go: reading OCI image layouts.
-//   - imagestore_linux.go: runt's image store (pull, images, rmi).
-//   - registry.go: downloading images from registries, and runt login.
+//   - imagestore_linux.go: runt's image store (pull, push, images, tag,
+//     rmi), and runt build's cache.
+//   - registry.go: downloading images from registries and uploading them,
+//     and runt login.
 //   - reference.go: image names, such as alpine:3.20.
 //   - imageconfig.go: an image's default command, environment, and user.
 //   - bundle.go: OCI runtime bundles (--bundle) and runt spec.
 //   - mounts.go, mounts_linux.go: bind mounts, volumes, and tmpfs mounts
 //     on top of the root filesystem (-v, --tmpfs).
 //   - volumes_linux.go: named volumes (runt volume create, ls, and rm).
+//
+// Building images:
+//
+//   - dockerfile.go: reading a Dockerfile into stages and instructions.
+//   - dockerfile_words.go: quotes and variables in instructions' arguments.
+//   - dockerignore.go: .dockerignore's patterns.
+//   - build_linux.go: runt build, a step at a time, and its cache keys.
+//   - buildcopy_linux.go: COPY and ADD's files, from the context or a
+//     stage, into an image's filesystem.
+//   - buildlayer_linux.go: turning a container's writable layer into an
+//     image layer.
 //
 // Networking:
 //

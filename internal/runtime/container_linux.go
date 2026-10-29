@@ -237,13 +237,16 @@ func supervise(config Config, foreground, autoStart bool, ready func(id string, 
 	// container's state, which lists the layers it uses, is saved, so runt
 	// rmi can't remove them in between.
 	unlockImages := func() {}
-	if config.Image != "" {
+	if config.Image != "" || config.image != nil {
 		if unlockImages, err = defaultImageStore().lock(false); err != nil {
 			return err
 		}
 		defer unlockImages()
-		if image, err = openImageRef(config.Image); err != nil {
-			return err
+		image = config.image
+		if image == nil {
+			if image, err = openImageRef(config.Image); err != nil {
+				return err
+			}
 		}
 		if err := applyImageConfig(&config, image); err != nil {
 			return err

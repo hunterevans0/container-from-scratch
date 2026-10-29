@@ -5,6 +5,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -34,6 +35,10 @@ type testRegistry struct {
 	types     map[string]string // manifest digest to media type
 	tags      map[string]string // tag to manifest digest
 	blobPulls int
+	// scopes are the scopes tokens were asked for, and uploads the
+	// digests of the blobs pushed, in order.
+	scopes  []string
+	uploads []string
 }
 
 const testToken = "test-token"
@@ -68,6 +73,7 @@ func (r *testRegistry) serve(w http.ResponseWriter, req *http.Request) {
 			http.Error(w, "bad credentials", http.StatusUnauthorized)
 			return
 		}
+		r.scopes = append(r.scopes, req.URL.Query().Get("scope"))
 		json.NewEncoder(w).Encode(map[string]string{"token": testToken})
 		return
 	case strings.HasPrefix(req.URL.Path, "/cdn/"):
@@ -87,6 +93,9 @@ func (r *testRegistry) serve(w http.ResponseWriter, req *http.Request) {
 		return
 	}
 	if req.URL.Path == "/v2/" {
+		return
+	}
+	if r.servePush(w, req) {
 		return
 	}
 	repo, rest, ok := strings.Cut(strings.TrimPrefix(req.URL.Path, "/v2/"), "/manifests/")
@@ -110,6 +119,54 @@ func (r *testRegistry) serve(w http.ResponseWriter, req *http.Request) {
 		return
 	}
 	http.NotFound(w, req)
+}
+
+// servePush answers the requests of a push, and reports whether req was one:
+// HEAD of a blob, POST to start an upload, which is sent on to /upload/
+// with a query of its own that must come back, PUT of the blob there, and
+// PUT of a manifest. The caller holds r.mu.
+func (r *testRegistry) servePush(w http.ResponseWriter, req *http.Request) bool {
+	const prefix = "/v2/test/app/"
+	switch {
+	case req.Method == http.MethodHead && strings.HasPrefix(req.URL.Path, prefix+"blobs/"):
+		if _, ok := r.blobs[strings.TrimPrefix(req.URL.Path, prefix+"blobs/")]; !ok {
+			w.WriteHeader(http.StatusNotFound)
+		}
+	case req.Method == http.MethodPost && req.URL.Path == prefix+"blobs/uploads/":
+		w.Header().Set("Location", fmt.Sprintf("/upload/%d?state=kept", len(r.uploads)))
+		w.WriteHeader(http.StatusAccepted)
+	case req.Method == http.MethodPut && strings.HasPrefix(req.URL.Path, "/upload/"):
+		data, _ := io.ReadAll(req.Body)
+		sum := sha256.Sum256(data)
+		digest := req.URL.Query().Get("digest")
+		if digest != "sha256:"+hex.EncodeToString(sum[:]) || req.URL.Query().Get("state") != "kept" || req.ContentLength != int64(len(data)) {
+			http.Error(w, "bad upload", http.StatusBadRequest)
+			return true
+		}
+		r.blobs[digest] = data
+		r.uploads = append(r.uploads, digest)
+		w.WriteHeader(http.StatusCreated)
+	case req.Method == http.MethodPut && strings.HasPrefix(req.URL.Path, prefix+"manifests/"):
+		data, _ := io.ReadAll(req.Body)
+		var manifest ociManifest
+		json.Unmarshal(data, &manifest)
+		for _, blob := range append(manifest.Layers, manifest.Config) {
+			if _, ok := r.blobs[blob.Digest]; !ok {
+				http.Error(w, "manifest blob unknown", http.StatusBadRequest)
+				return true
+			}
+		}
+		sum := sha256.Sum256(data)
+		digest := "sha256:" + hex.EncodeToString(sum[:])
+		r.blobs[digest] = data
+		r.types[digest] = req.Header.Get("Content-Type")
+		r.tags[strings.TrimPrefix(req.URL.Path, prefix+"manifests/")] = digest
+		w.Header().Set("Docker-Content-Digest", digest)
+		w.WriteHeader(http.StatusCreated)
+	default:
+		return false
+	}
+	return true
 }
 
 // blob stores data and returns its descriptor.
@@ -261,6 +318,59 @@ func TestRegistryClient(t *testing.T) {
 	}
 	if user, _, err := storedCredentials(r.host()); err != nil || user != "" {
 		t.Errorf("credentials after logout: %q, %v", user, err)
+	}
+}
+
+// TestRegistryPush uploads a blob and a manifest, asking for a token that
+// allows pushing, and checks the registry has them after.
+func TestRegistryPush(t *testing.T) {
+	r := newTestRegistry(t)
+	ref, err := parseReference(r.host() + "/test/app:pushed")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("DOCKER_CONFIG", t.TempDir())
+	client := newRegistryClient(ref, os.Stderr)
+	client.push = true
+
+	layer := []byte("a layer to push")
+	sum := sha256.Sum256(layer)
+	desc := ociDescriptor{MediaType: mediaTypeLayer, Digest: "sha256:" + hex.EncodeToString(sum[:]), Size: int64(len(layer))}
+	path := filepath.Join(t.TempDir(), "layer")
+	if err := os.WriteFile(path, layer, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if exists, err := client.hasBlob(desc); err != nil || exists {
+		t.Fatalf("hasBlob before the upload = %v, %v", exists, err)
+	}
+	if err := client.uploadBlob(desc, path); err != nil {
+		t.Fatalf("uploadBlob: %v", err)
+	}
+	if exists, err := client.hasBlob(desc); err != nil || !exists {
+		t.Errorf("hasBlob after the upload = %v, %v", exists, err)
+	}
+	if len(r.scopes) == 0 || r.scopes[0] != "repository:test/app:pull,push" {
+		t.Errorf("token scopes = %q; want pull,push", r.scopes)
+	}
+
+	config := r.jsonBlob(mediaTypeImageConfig, map[string]string{"os": "linux"})
+	manifest, err := json.Marshal(ociManifest{SchemaVersion: 2, MediaType: mediaTypeImageManifest, Config: config, Layers: []ociDescriptor{desc}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	manifestSum := sha256.Sum256(manifest)
+	manifestDesc := ociDescriptor{MediaType: mediaTypeImageManifest, Digest: "sha256:" + hex.EncodeToString(manifestSum[:])}
+	if err := client.putManifest("pushed", manifestDesc, manifest); err != nil {
+		t.Fatalf("putManifest: %v", err)
+	}
+	if got, _, err := client.fetchManifest("pushed"); err != nil || got.Digest != manifestDesc.Digest {
+		t.Errorf("the pushed tag gives %+v, %v", got, err)
+	}
+
+	// A manifest whose blobs the registry doesn't have is refused.
+	missing := []byte(`{"schemaVersion":2,"layers":[{"digest":"sha256:` + strings.Repeat("0", 64) + `"}]}`)
+	if err := client.putManifest("broken", ociDescriptor{MediaType: mediaTypeImageManifest}, missing); err == nil {
+		t.Error("putManifest of a manifest with missing blobs succeeded")
 	}
 }
 

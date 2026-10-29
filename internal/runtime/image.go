@@ -42,6 +42,12 @@ const (
 	mediaTypeDockerManifestList = "application/vnd.docker.distribution.manifest.list.v2+json"
 	mediaTypeDockerManifest     = "application/vnd.docker.distribution.manifest.v2+json"
 
+	// The media types of what runt build writes: an image's configuration,
+	// and its layers, gzipped or not.
+	mediaTypeImageConfig = "application/vnd.oci.image.config.v1+json"
+	mediaTypeLayer       = "application/vnd.oci.image.layer.v1.tar"
+	mediaTypeLayerGzip   = "application/vnd.oci.image.layer.v1.tar+gzip"
+
 	// annotationRefName holds an image's tag within a layout.
 	annotationRefName = "org.opencontainers.image.ref.name"
 	// annotationImageName holds the full image name in layouts made by
@@ -87,24 +93,65 @@ type ociManifest struct {
 	Layers        []ociDescriptor `json:"layers"`
 }
 
-// ociImageConfig is the part of an image's configuration runt reads.
-// DiffIDs are the digests of the layers once uncompressed, bottom first.
-// Config holds the defaults for running the image (see applyImageConfig).
+// ociImageConfig is an image's configuration. DiffIDs are the digests of the
+// layers once uncompressed, bottom first. Config holds the defaults for
+// running the image (see applyImageConfig), and History a line for each
+// step that built it. runt build reads a base image's configuration into
+// this and writes it back with its own changes, so it holds every field a
+// Dockerfile can set, even those runt itself doesn't use.
 type ociImageConfig struct {
-	Created      time.Time `json:"created,omitzero"`
-	Architecture string    `json:"architecture"`
-	OS           string    `json:"os"`
-	Config       struct {
-		User       string   `json:"User,omitempty"`
-		Env        []string `json:"Env,omitempty"`
-		Entrypoint []string `json:"Entrypoint,omitempty"`
-		Cmd        []string `json:"Cmd,omitempty"`
-		WorkingDir string   `json:"WorkingDir,omitempty"`
-	} `json:"config"`
-	RootFS struct {
+	Created      time.Time          `json:"created,omitzero"`
+	Author       string             `json:"author,omitempty"`
+	Architecture string             `json:"architecture"`
+	OS           string             `json:"os"`
+	Variant      string             `json:"variant,omitempty"`
+	Config       ociContainerConfig `json:"config"`
+	RootFS       struct {
 		Type    string   `json:"type"`
 		DiffIDs []string `json:"diff_ids"`
 	} `json:"rootfs"`
+	History []ociHistory `json:"history,omitempty"`
+}
+
+// ociContainerConfig is the "config" of an image's configuration: how to run
+// it. A map[string]struct{} is a set: only its keys mean anything, and
+// struct{} is a type with no fields, which takes no space.
+type ociContainerConfig struct {
+	User         string              `json:"User,omitempty"`
+	ExposedPorts map[string]struct{} `json:"ExposedPorts,omitempty"`
+	Env          []string            `json:"Env,omitempty"`
+	Entrypoint   []string            `json:"Entrypoint,omitempty"`
+	Cmd          []string            `json:"Cmd,omitempty"`
+	Volumes      map[string]struct{} `json:"Volumes,omitempty"`
+	WorkingDir   string              `json:"WorkingDir,omitempty"`
+	Labels       map[string]string   `json:"Labels,omitempty"`
+	StopSignal   string              `json:"StopSignal,omitempty"`
+	// Docker's own additions, which the OCI format leaves out: the shell
+	// that SHELL sets, HEALTHCHECK's check, and ONBUILD's instructions.
+	Shell       []string        `json:"Shell,omitempty"`
+	Healthcheck *ociHealthcheck `json:"Healthcheck,omitempty"`
+	OnBuild     []string        `json:"OnBuild,omitempty"`
+}
+
+// ociHealthcheck is HEALTHCHECK's check, as Docker stores it: the command
+// (Test), and durations in nanoseconds, which is how a time.Duration is
+// written in JSON.
+type ociHealthcheck struct {
+	Test          []string      `json:"Test,omitempty"`
+	Interval      time.Duration `json:"Interval,omitempty"`
+	Timeout       time.Duration `json:"Timeout,omitempty"`
+	StartPeriod   time.Duration `json:"StartPeriod,omitempty"`
+	StartInterval time.Duration `json:"StartInterval,omitempty"`
+	Retries       int           `json:"Retries,omitempty"`
+}
+
+// ociHistory is one step of an image's history: what made it, and whether
+// it added a layer (a step that only changes the configuration doesn't).
+type ociHistory struct {
+	Created    time.Time `json:"created,omitzero"`
+	CreatedBy  string    `json:"created_by,omitempty"`
+	Comment    string    `json:"comment,omitempty"`
+	EmptyLayer bool      `json:"empty_layer,omitempty"`
 }
 
 // ociImage is an image found in a layout.
@@ -172,8 +219,22 @@ func readLayoutIndex(layout string) (*ociIndex, error) {
 }
 
 // loadImage reads the manifest desc points to in layout, following an index
-// to this platform's manifest, and the image configuration it names.
+// to this platform's manifest, and the image configuration it names. The
+// image must have layers, to be run.
 func loadImage(layout string, desc ociDescriptor) (*ociImage, error) {
+	image, err := readImage(layout, desc)
+	if err != nil {
+		return nil, err
+	}
+	if len(image.manifest.Layers) == 0 {
+		return nil, errors.New("image has no layers")
+	}
+	return image, nil
+}
+
+// readImage is loadImage for an image that may have no layers at all, as
+// runt build's are while they are built FROM scratch.
+func readImage(layout string, desc ociDescriptor) (*ociImage, error) {
 	image := &ociImage{layout: layout}
 	var err error
 	if image.manifest, err = image.resolveManifest(desc, 0); err != nil {
@@ -188,9 +249,6 @@ func loadImage(layout string, desc ociDescriptor) (*ociImage, error) {
 	}
 	if image.config.OS != "" && image.config.OS != "linux" {
 		return nil, fmt.Errorf("image is for %s, not linux", image.config.OS)
-	}
-	if len(image.manifest.Layers) == 0 {
-		return nil, errors.New("image has no layers")
 	}
 	if len(image.config.RootFS.DiffIDs) != len(image.manifest.Layers) {
 		return nil, fmt.Errorf("image manifest has %d layers, but its configuration lists %d", len(image.manifest.Layers), len(image.config.RootFS.DiffIDs))

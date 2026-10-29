@@ -88,6 +88,39 @@ type Config struct {
 	// Tty gives the command a pseudo-terminal of its own as its standard
 	// input, output, and error.
 	Tty bool
+
+	// image, if set, is the image to run, already opened, instead of
+	// looking Image up: runt build runs its RUN steps on images that are
+	// only in its cache. Unexported fields aren't sent to a monitor, so this
+	// only works in the foreground.
+	image *ociImage
+}
+
+// BuildOptions are runt build's options: what to build, and what to call
+// the result.
+type BuildOptions struct {
+	// Context is the build context, the directory COPY and ADD take files
+	// from.
+	Context string
+	// Dockerfile is the Dockerfile's path; empty means Dockerfile in the
+	// context, and "-" standard input.
+	Dockerfile string
+	// Tags are names to give the image, such as app:1.0.
+	Tags []string
+	// BuildArgs set the Dockerfile's ARG values, by name.
+	BuildArgs map[string]string
+	// Target is the stage to stop at, by name; empty means the last.
+	Target string
+	// NoCache runs every step, rather than reusing what an earlier build
+	// made.
+	NoCache bool
+	// Pull pulls every image FROM names, even if the store has it.
+	Pull bool
+	// Network is the network RUN steps' containers are on, as for runt run.
+	Network string
+	// UsernsUser is the user whose /etc/subuid and /etc/subgid ranges RUN
+	// steps' containers map onto, as for runt run.
+	UsernsUser string
 }
 
 // Networks a container can be on.

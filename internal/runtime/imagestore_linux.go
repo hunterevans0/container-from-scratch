@@ -3,6 +3,8 @@
 package runtime
 
 import (
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -10,6 +12,7 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
+	"slices"
 	"strings"
 	"time"
 )
@@ -29,7 +32,17 @@ import (
 //     image until the container's state, which lists the layers it uses, is
 //     saved;
 //   - runt rmi holds it exclusively while it untags images and removes
-//     blobs and unpacked layers that nothing uses any more.
+//     blobs and unpacked layers that nothing uses any more;
+//   - runt build holds it exclusively for the moment it takes to add each
+//     step's result to the store (see build_linux.go), and runt tag while
+//     it names an image;
+//   - runt push holds it shared while it uploads an image.
+//
+// runt build keeps a cache alongside, build-cache.json: an index like
+// index.json, of the image each build step made, so that the step can be
+// skipped next time. Its images have no names, and runt images doesn't show
+// them, but their blobs and unpacked layers stay until runt builder prune
+// empties it.
 //
 // For how to read the Go here, see doc.go.
 
@@ -50,6 +63,12 @@ type imageStore struct {
 	lockPath string
 	// layers holds unpacked layers (layerRoot).
 	layers string
+	// cache is runt build's cache, an index of the images its steps made.
+	cache string
+	// builds holds a directory for each build in progress, for the layers
+	// it makes before they go into the store. Unlike tmp, garbage
+	// collection leaves it alone.
+	builds string
 }
 
 // defaultImageStore is the store under /var/lib/runt that runt uses.
@@ -59,6 +78,8 @@ func defaultImageStore() *imageStore {
 		tmp:      DataRoot + "/tmp",
 		lockPath: DataRoot + "/images.lock",
 		layers:   layerRoot,
+		cache:    DataRoot + "/build-cache.json",
+		builds:   DataRoot + "/builds",
 	}
 }
 
@@ -133,12 +154,49 @@ func (s *imageStore) writeIndex(index *ociIndex) error {
 	return nil
 }
 
-// entryName is the full name an index.json entry is stored under.
+// entryName is the full name an index.json entry is stored under. An image
+// runt build made without -t has an entry with no name.
 func entryName(desc ociDescriptor) string {
 	if name := desc.Annotations[annotationImageName]; name != "" {
 		return name
 	}
 	return desc.Annotations[annotationRefName]
+}
+
+// entryKey tells index.json entries apart: by name, and for entries with
+// no name, by manifest.
+func entryKey(desc ociDescriptor) string {
+	return entryName(desc) + "@" + desc.Digest
+}
+
+// nameImage points name at the image desc describes, in index: it replaces
+// the entry with that name, if there is one, and the image's entry with no
+// name, if it has one. It reports whether name already pointed at it.
+func nameImage(index *ociIndex, desc ociDescriptor, ref imageReference) bool {
+	name := ref.String()
+	upToDate := false
+	var kept []ociDescriptor
+	for _, entry := range index.Manifests {
+		switch {
+		case entryName(entry) == name:
+			upToDate = entry.Digest == desc.Digest
+		case entryName(entry) == "" && entry.Digest == desc.Digest:
+		default:
+			kept = append(kept, entry)
+		}
+	}
+	entry := ociDescriptor{
+		MediaType:   desc.MediaType,
+		Digest:      desc.Digest,
+		Size:        desc.Size,
+		Annotations: map[string]string{annotationImageName: name},
+		Platform:    desc.Platform,
+	}
+	if ref.Tag != "" {
+		entry.Annotations[annotationRefName] = ref.Tag
+	}
+	index.Manifests = append(kept, entry)
+	return upToDate
 }
 
 // storedImage is an image in the store.
@@ -415,29 +473,8 @@ func (s *imageStore) pull(ref imageReference, out io.Writer) error {
 		}
 	}
 
-	// The new index: every entry but the one under this name, if any, and
-	// then a new entry for it.
-	name := ref.String()
-	upToDate := false
-	var kept []ociDescriptor
-	for _, entry := range index.Manifests {
-		if entryName(entry) == name {
-			upToDate = entry.Digest == desc.Digest
-			continue
-		}
-		kept = append(kept, entry)
-	}
-	entry := ociDescriptor{
-		MediaType:   desc.MediaType,
-		Digest:      desc.Digest,
-		Size:        desc.Size,
-		Annotations: map[string]string{annotationImageName: name},
-		Platform:    &ociPlatform{OS: "linux", Architecture: config.Architecture},
-	}
-	if ref.Tag != "" {
-		entry.Annotations[annotationRefName] = ref.Tag
-	}
-	index.Manifests = append(kept, entry)
+	desc.Platform = &ociPlatform{OS: "linux", Architecture: config.Architecture}
+	upToDate := nameImage(index, desc, ref)
 	if err := s.writeIndex(index); err != nil {
 		return err
 	}
@@ -574,28 +611,30 @@ func (s *imageStore) remove(ref string, force bool, stateRoot string, out io.Wri
 			return fmt.Errorf("%q matches more than one image; use more of the ID", ref)
 		}
 	}
-	// untag is a set of the names to remove: a map whose keys are the
-	// names, each mapped to true.
+	// untag is a set of the entries to remove (see entryKey): a map whose
+	// keys are the entries, each mapped to true.
 	untag := map[string]bool{}
 	var names []string
 	for _, match := range matches {
-		untag[match.name] = true
-		names = append(names, match.name)
+		untag[entryKey(match.entry)] = true
+		if match.name != "" {
+			names = append(names, match.name)
+		}
 	}
 	if len(matches) > 1 && !force {
 		return fmt.Errorf("image %s has several names (%s); remove them one at a time, or use rmi -f", shortDigest(id), strings.Join(names, ", "))
 	}
 
-	// The image is deleted if no other name is left for it.
+	// The image is deleted if no other entry is left for it.
 	var kept []ociDescriptor
 	deleted := true
 	for _, entry := range index.Manifests {
-		if untag[entryName(entry)] {
+		if untag[entryKey(entry)] {
 			continue
 		}
 		kept = append(kept, entry)
 		for _, image := range images {
-			if image.name == entryName(entry) && image.id() == id {
+			if entryKey(image.entry) == entryKey(entry) && image.id() == id {
 				deleted = false
 			}
 		}
@@ -632,18 +671,22 @@ func (s *imageStore) remove(ref string, force bool, stateRoot string, out io.Wri
 	return s.collectGarbage(true, states)
 }
 
-// collectGarbage deletes the blobs no image in the store refers to. With
-// layers set, it also deletes unpacked layers that neither an image in the
-// store nor one of the containers in states uses, and leftovers of pulls and
-// unpacking that never finished. The caller holds the lock exclusively, so
-// nothing is being pulled or unpacked.
+// collectGarbage deletes the blobs no image in the store or in runt build's
+// cache refers to. With layers set, it also deletes unpacked layers that
+// neither those images nor one of the containers in states uses, and
+// leftovers of pulls and unpacking that never finished. The caller holds the
+// lock exclusively, so nothing is being pulled or unpacked.
 //
 // It works as a "mark and sweep" garbage collector does: first mark every
-// blob reachable from index.json (each manifest, and the configuration and
-// layers it names, following indexes down), then sweep away every blob
-// that wasn't marked.
+// blob reachable from index.json and the cache (each manifest, and the
+// configuration and layers it names, following indexes down), then sweep
+// away every blob that wasn't marked.
 func (s *imageStore) collectGarbage(layers bool, states []*State) error {
 	index, err := s.readIndex()
+	if err != nil {
+		return err
+	}
+	cache, err := s.readCache()
 	if err != nil {
 		return err
 	}
@@ -679,7 +722,7 @@ func (s *imageStore) collectGarbage(layers bool, states []*State) error {
 			keepLayers[hex] = true
 		}
 	}
-	for _, entry := range index.Manifests {
+	for _, entry := range append(index.Manifests, cache.Manifests...) {
 		mark(entry, 0)
 	}
 
@@ -730,5 +773,311 @@ func (s *imageStore) collectGarbage(layers bool, states []*State) error {
 	if err := os.RemoveAll(s.tmp); err != nil {
 		return fmt.Errorf("remove unfinished pulls: %w", err)
 	}
+	return nil
+}
+
+// writeBlob adds data to the store as a blob, if it isn't there already,
+// and returns its descriptor, with mediaType. The caller holds the lock
+// exclusively.
+func (s *imageStore) writeBlob(mediaType string, data []byte) (ociDescriptor, error) {
+	sum := sha256.Sum256(data)
+	desc := ociDescriptor{MediaType: mediaType, Digest: "sha256:" + hex.EncodeToString(sum[:]), Size: int64(len(data))}
+	if s.hasBlob(desc.Digest) {
+		return desc, nil
+	}
+	path, err := s.blobPath(desc.Digest)
+	if err != nil {
+		return desc, err
+	}
+	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+		return desc, fmt.Errorf("create image store: %w", err)
+	}
+	// Written under another name and renamed, so the blob is never seen
+	// half written.
+	if err := os.WriteFile(path+".tmp", data, 0o600); err != nil {
+		return desc, err
+	}
+	return desc, os.Rename(path+".tmp", path)
+}
+
+// moveBlob moves the file at path into the store as the blob with digest.
+// The file must be on the same filesystem as the store. The caller holds
+// the lock exclusively.
+func (s *imageStore) moveBlob(path, digest string) error {
+	target, err := s.blobPath(digest)
+	if err != nil {
+		return err
+	}
+	if err := os.MkdirAll(filepath.Dir(target), 0o700); err != nil {
+		return fmt.Errorf("create image store: %w", err)
+	}
+	if err := os.Rename(path, target); err != nil {
+		return fmt.Errorf("store blob %s: %w", digest, err)
+	}
+	return nil
+}
+
+// readCache reads runt build's cache, which is empty if there isn't one.
+func (s *imageStore) readCache() (*ociIndex, error) {
+	cache := &ociIndex{SchemaVersion: 2, MediaType: mediaTypeImageIndex}
+	err := readJSONFile(s.cache, cache)
+	if errors.Is(err, os.ErrNotExist) {
+		return cache, nil
+	}
+	return cache, err
+}
+
+// writeCache replaces runt build's cache. The caller holds the lock
+// exclusively.
+func (s *imageStore) writeCache(cache *ociIndex) error {
+	data, err := json.MarshalIndent(cache, "", "  ")
+	if err != nil {
+		return err
+	}
+	if err := os.WriteFile(s.cache+".tmp", append(data, '\n'), 0o600); err != nil {
+		return fmt.Errorf("write build cache: %w", err)
+	}
+	return os.Rename(s.cache+".tmp", s.cache)
+}
+
+// annotationCacheKey holds the key of a build step an image in runt build's
+// cache was made by.
+const annotationCacheKey = "dev.runt.build.key"
+
+// cached returns the image a build step with key made, if the cache has one
+// whose blobs are all still there. The caller holds the lock.
+func (s *imageStore) cached(key string) (ociDescriptor, *ociImage, bool) {
+	cache, err := s.readCache()
+	if err != nil {
+		warn(err)
+		return ociDescriptor{}, nil, false
+	}
+	for _, entry := range cache.Manifests {
+		if entry.Annotations[annotationCacheKey] != key {
+			continue
+		}
+		image, err := readImage(s.dir, entry)
+		if err != nil {
+			return ociDescriptor{}, nil, false
+		}
+		for _, layer := range image.manifest.Layers {
+			if !s.hasBlob(layer.Digest) {
+				return ociDescriptor{}, nil, false
+			}
+		}
+		entry.Annotations = nil
+		return entry, image, true
+	}
+	return ociDescriptor{}, nil, false
+}
+
+// addToCache records in the cache that the build step with key made the
+// image whose manifest desc describes, replacing what it made before. The
+// caller holds the lock exclusively.
+func (s *imageStore) addToCache(key string, desc ociDescriptor) error {
+	cache, err := s.readCache()
+	if err != nil {
+		return err
+	}
+	var kept []ociDescriptor
+	for _, entry := range cache.Manifests {
+		if entry.Annotations[annotationCacheKey] != key {
+			kept = append(kept, entry)
+		}
+	}
+	desc.Annotations = map[string]string{annotationCacheKey: key}
+	cache.Manifests = append(kept, desc)
+	return s.writeCache(cache)
+}
+
+// nameBuilt gives the image runt build made, whose manifest desc describes,
+// the names it was asked to, as runt tag does. With no names, it gets an
+// entry with no name, unless it is in index.json already, so that runt run
+// and runt images can find it by its ID. The caller holds the lock
+// exclusively.
+func (s *imageStore) nameBuilt(desc ociDescriptor, names []imageReference) error {
+	index, err := s.readIndex()
+	if err != nil {
+		return err
+	}
+	for _, ref := range names {
+		nameImage(index, desc, ref)
+	}
+	if len(names) == 0 && !slices.ContainsFunc(index.Manifests, func(entry ociDescriptor) bool { return entry.Digest == desc.Digest }) {
+		desc.Annotations = nil
+		index.Manifests = append(index.Manifests, desc)
+	}
+	if err := s.writeIndex(index); err != nil {
+		return err
+	}
+	// An image a name used to point to may no longer be needed.
+	return s.collectGarbage(false, nil)
+}
+
+// Tag gives an image in the store another name, as docker tag does: source
+// is a name or ID, and target a name, such as localhost:5000/app:1.0, which
+// stops naming whatever image it named before.
+func Tag(source, target string) error {
+	return defaultImageStore().tag(source, target)
+}
+
+// tag does Tag's work, for this store.
+func (s *imageStore) tag(source, target string) error {
+	ref, err := parseReference(target)
+	if err != nil {
+		return err
+	}
+	if ref.Digest != "" {
+		return fmt.Errorf("%s: a name to tag with can't have a digest", target)
+	}
+	unlock, err := s.lock(true)
+	if err != nil {
+		return err
+	}
+	defer unlock()
+	found, err := s.find(source)
+	if err != nil {
+		return err
+	}
+	desc := found.entry
+	desc.Annotations = nil
+	index, err := s.readIndex()
+	if err != nil {
+		return err
+	}
+	nameImage(index, desc, ref)
+	if err := s.writeIndex(index); err != nil {
+		return err
+	}
+	return s.collectGarbage(false, nil)
+}
+
+// PruneBuildCache empties runt build's cache, as docker builder prune does,
+// and deletes the blobs and unpacked layers that only it needed, and what
+// builds that never finished left behind. It returns how many build steps'
+// images were in the cache, and how much space the blobs took.
+func PruneBuildCache() (int, int64, error) {
+	return defaultImageStore().pruneCache(StateRoot)
+}
+
+// pruneCache does PruneBuildCache's work, for this store and the containers
+// whose state is in stateRoot.
+func (s *imageStore) pruneCache(stateRoot string) (int, int64, error) {
+	unlock, err := s.lock(true)
+	if err != nil {
+		return 0, 0, err
+	}
+	defer unlock()
+	cache, err := s.readCache()
+	if err != nil {
+		return 0, 0, err
+	}
+	states, err := listStates(stateRoot)
+	if err != nil {
+		return 0, 0, err
+	}
+	before := s.blobsSize()
+	if err := os.Remove(s.cache); err != nil && !errors.Is(err, os.ErrNotExist) {
+		return 0, 0, err
+	}
+	if err := s.collectGarbage(true, states); err != nil {
+		return 0, 0, err
+	}
+	removeStaleBuilds(s.builds)
+	return len(cache.Manifests), before - s.blobsSize(), nil
+}
+
+// blobsSize is the size of all the store's blobs together.
+func (s *imageStore) blobsSize() int64 {
+	entries, _ := os.ReadDir(filepath.Join(s.dir, "blobs", "sha256"))
+	var total int64
+	for _, entry := range entries {
+		if info, err := entry.Info(); err == nil {
+			total += info.Size()
+		}
+	}
+	return total
+}
+
+// Push uploads an image in the store to its registry, as docker push does.
+// ref names the image, and so where it goes: localhost:5000/app:1.0 goes to
+// the registry on localhost:5000, as app, tagged 1.0. Progress goes to out.
+func Push(ref string, out io.Writer) error {
+	parsed, err := parseReference(ref)
+	if err != nil {
+		return err
+	}
+	return defaultImageStore().push(parsed, out)
+}
+
+// push does Push's work: it uploads each blob the registry doesn't have
+// already, the layers top first and then the configuration, and then the
+// manifest, under the tag. It holds the lock shared, so the blobs can't be
+// removed in the meantime.
+func (s *imageStore) push(ref imageReference, out io.Writer) error {
+	if ref.Digest != "" {
+		return fmt.Errorf("push takes a name with a tag, not a digest (%s)", ref.familiar())
+	}
+	unlock, err := s.lock(false)
+	if err != nil {
+		return err
+	}
+	defer unlock()
+	images, err := s.list()
+	if err != nil {
+		return err
+	}
+	index := slices.IndexFunc(images, func(image storedImage) bool { return image.name == ref.String() })
+	if index < 0 {
+		return fmt.Errorf("%w: %s; give an image that name first, with runt tag", errNoSuchImage, ref.familiar())
+	}
+	image := images[index]
+	manifest, err := image.image.readBlob(image.entry)
+	if err != nil {
+		return fmt.Errorf("image manifest: %w", err)
+	}
+
+	fmt.Fprintf(out, "The push refers to repository [%s]\n", ref.Repository())
+	client := newRegistryClient(ref, out)
+	client.push = true
+	blobs := slices.Clone(image.image.manifest.Layers)
+	slices.Reverse(blobs)
+	blobs = append(blobs, image.image.manifest.Config)
+	for i, blob := range blobs {
+		// Docker only shows the layers, not the configuration.
+		layer := i < len(blobs)-1
+		short := shortDigest(blob.Digest)
+		exists, err := client.hasBlob(blob)
+		if err != nil {
+			return err
+		}
+		if exists {
+			if layer {
+				fmt.Fprintf(out, "%s: Layer already exists\n", short)
+			}
+			continue
+		}
+		path, err := s.blobPath(blob.Digest)
+		if err != nil {
+			return err
+		}
+		if layer {
+			fmt.Fprintf(out, "%s: Pushing %s\n", short, HumanSize(blob.Size))
+		}
+		if err := client.uploadBlob(blob, path); err != nil {
+			return err
+		}
+		if layer {
+			fmt.Fprintf(out, "%s: Pushed\n", short)
+		}
+	}
+	desc := image.entry
+	if desc.MediaType == "" {
+		desc.MediaType = mediaTypeImageManifest
+	}
+	if err := client.putManifest(ref.Tag, desc, manifest); err != nil {
+		return err
+	}
+	fmt.Fprintf(out, "%s: digest: %s size: %d\n", ref.Tag, desc.Digest, len(manifest))
 	return nil
 }

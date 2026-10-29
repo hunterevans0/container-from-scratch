@@ -3,9 +3,11 @@
 package runtime
 
 import (
+	"encoding/json"
 	"io"
 	"os"
 	"path/filepath"
+	goruntime "runtime"
 	"strings"
 	"testing"
 )
@@ -24,6 +26,176 @@ func newTestStore(t *testing.T) *imageStore {
 		tmp:      filepath.Join(dir, "tmp"),
 		lockPath: filepath.Join(dir, "images.lock"),
 		layers:   filepath.Join(dir, "layers"),
+		cache:    filepath.Join(dir, "build-cache.json"),
+		builds:   filepath.Join(dir, "builds"),
+	}
+}
+
+// storeImage writes a one-layer image straight into the store, as runt
+// build does, and returns its manifest's descriptor. marker makes the
+// layer, and so the image, unique.
+func storeImage(t *testing.T, store *imageStore, marker string) ociDescriptor {
+	t.Helper()
+	layer, err := store.writeBlob(mediaTypeLayer, []byte(marker))
+	if err != nil {
+		t.Fatal(err)
+	}
+	config := ociImageConfig{Architecture: goruntime.GOARCH, OS: "linux"}
+	config.RootFS.Type, config.RootFS.DiffIDs = "layers", []string{layer.Digest}
+	configData, _ := json.Marshal(config)
+	configDesc, err := store.writeBlob(mediaTypeImageConfig, configData)
+	if err != nil {
+		t.Fatal(err)
+	}
+	manifest, _ := json.Marshal(ociManifest{SchemaVersion: 2, MediaType: mediaTypeImageManifest, Config: configDesc, Layers: []ociDescriptor{layer}})
+	desc, err := store.writeBlob(mediaTypeImageManifest, manifest)
+	if err != nil {
+		t.Fatal(err)
+	}
+	desc.Platform = &ociPlatform{OS: "linux", Architecture: goruntime.GOARCH}
+	return desc
+}
+
+// TestBuiltImagesAndCache names images as runt build and runt tag do, keeps
+// images in the build cache, and prunes it.
+func TestBuiltImagesAndCache(t *testing.T) {
+	store := newTestStore(t)
+	stateRoot := t.TempDir()
+	// Each image is named as soon as it is stored, since naming collects
+	// garbage, and an image no entry names is garbage.
+	var unnamed1 ociDescriptor
+	for _, marker := range []string{"one", "two", "one"} {
+		desc := storeImage(t, store, marker)
+		if err := store.nameBuilt(desc, nil); err != nil {
+			t.Fatal(err)
+		}
+		if marker == "one" {
+			unnamed1 = desc
+		}
+	}
+	summaries, err := store.summaries()
+	if err != nil || len(summaries) != 2 || summaries[0].Repository != "<none>" || summaries[0].Tag != "<none>" {
+		t.Fatalf("summaries of two images without names = %+v, %v", summaries, err)
+	}
+	id1 := summaries[0].ID
+	if found, err := store.find(id1[7:15]); err != nil || found.id() != id1 {
+		t.Errorf("finding an image without a name by ID: %v", err)
+	}
+
+	// Naming it replaces its entry without a name.
+	ref, _ := parseReference("app:1.0")
+	if err := store.nameBuilt(unnamed1, []imageReference{ref}); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.tag("app:1.0", "localhost:5000/app:copy"); err != nil {
+		t.Fatalf("tag: %v", err)
+	}
+	if err := store.tag("app:1.0", "app@sha256:"+strings.Repeat("0", 64)); err == nil {
+		t.Error("tagging with a digest succeeded")
+	}
+	if err := store.tag("nothing", "app:2"); err == nil {
+		t.Error("tagging an image that isn't there succeeded")
+	}
+	summaries, _ = store.summaries()
+	names := map[string]string{}
+	for _, summary := range summaries {
+		names[summary.Repository+":"+summary.Tag] = summary.ID
+	}
+	if len(summaries) != 3 || names["app:1.0"] != id1 || names["localhost:5000/app:copy"] != id1 || names["<none>:<none>"] == "" {
+		t.Errorf("after naming, the store has %v", names)
+	}
+
+	// Removing the image without a name leaves the other images alone.
+	if err := store.remove(names["<none>:<none>"], false, stateRoot, io.Discard); err != nil {
+		t.Fatalf("remove the image without a name: %v", err)
+	}
+	if summaries, _ := store.summaries(); len(summaries) != 2 {
+		t.Errorf("after removing it, the store has %+v", summaries)
+	}
+
+	// An image only the cache has keeps its blobs, until the cache is
+	// pruned.
+	cachedDesc := storeImage(t, store, "cached")
+	if err := store.addToCache("key", cachedDesc); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.collectGarbage(true, nil); err != nil {
+		t.Fatal(err)
+	}
+	if _, image, ok := store.cached("key"); !ok || image.manifest.Layers[0].Size != int64(len("cached")) {
+		t.Errorf("the cached image is gone after garbage collection")
+	}
+	if _, _, ok := store.cached("other key"); ok {
+		t.Error("found a cache entry that was never added")
+	}
+	blobs := store.blobCount(t)
+	entries, reclaimed, err := store.pruneCache(stateRoot)
+	if err != nil || entries != 1 || reclaimed == 0 || store.blobCount(t) != blobs-3 {
+		t.Errorf("pruneCache = %d, %d, %v; %d of %d blobs left", entries, reclaimed, err, store.blobCount(t), blobs)
+	}
+	if _, _, ok := store.cached("key"); ok {
+		t.Error("the cache entry is still there after pruning")
+	}
+}
+
+// TestTagAndPush pushes images from the store to the pretend registry: one
+// pulled from it under another tag, whose blobs it has already, and a new
+// one, whose blobs it doesn't.
+func TestTagAndPush(t *testing.T) {
+	r := newTestRegistry(t)
+	t.Setenv("DOCKER_CONFIG", t.TempDir())
+	r.tag("v1", r.multiPlatform("pulled"))
+	store := newTestStore(t)
+	ref, _ := parseReference(r.host() + "/test/app:v1")
+	if err := store.pull(ref, io.Discard); err != nil {
+		t.Fatal(err)
+	}
+	push := func(name string) string {
+		t.Helper()
+		ref, err := parseReference(name)
+		if err != nil {
+			t.Fatal(err)
+		}
+		var out strings.Builder
+		if err := store.push(ref, &out); err != nil {
+			t.Fatalf("push %s: %v\n%s", name, err, out.String())
+		}
+		return out.String()
+	}
+
+	if err := store.tag(r.host()+"/test/app:v1", r.host()+"/test/app:copy"); err != nil {
+		t.Fatal(err)
+	}
+	out := push(r.host() + "/test/app:copy")
+	pulled, _ := store.find(r.host() + "/test/app:v1")
+	if !strings.Contains(out, "Layer already exists") || len(r.uploads) != 0 || r.tags["copy"] != pulled.entry.Digest {
+		t.Errorf("pushing a copy uploaded %q, and tagged %s:\n%s", r.uploads, r.tags["copy"], out)
+	}
+
+	built := storeImage(t, store, "built")
+	builtRef, _ := parseReference(r.host() + "/test/app:built")
+	if err := store.nameBuilt(built, []imageReference{builtRef}); err != nil {
+		t.Fatal(err)
+	}
+	out = push(r.host() + "/test/app:built")
+	if !strings.Contains(out, "Pushed") || len(r.uploads) != 2 || r.tags["built"] != built.Digest {
+		t.Errorf("pushing a new image uploaded %q, and tagged %s:\n%s", r.uploads, r.tags["built"], out)
+	}
+
+	// Pulled back into another store, it is the same image.
+	other := newTestStore(t)
+	if err := other.pull(builtRef, io.Discard); err != nil {
+		t.Fatalf("pull the pushed image: %v", err)
+	}
+	if found, err := other.find(builtRef.String()); err != nil || found.entry.Digest != built.Digest {
+		t.Errorf("the pulled image is %+v, %v", found.entry, err)
+	}
+
+	for _, name := range []string{r.host() + "/test/app:nothing", r.host() + "/test/app@sha256:" + strings.Repeat("0", 64)} {
+		ref, _ := parseReference(name)
+		if err := store.push(ref, io.Discard); err == nil {
+			t.Errorf("pushing %s succeeded", name)
+		}
 	}
 }
 

@@ -22,8 +22,9 @@ integration: build
 # Only the feature checks in integration/features_test.go, each printing a
 # line saying what it shows. Without -test.v, checks that pass print nothing
 # else. FEATURE picks one: Layers, OCIFormats, Registry, ImageStore,
-# ImageConfig, Network, Ports, DNS, UserNetworks, BindMounts, Volumes, or
-# Tmpfs, optionally with a check, as in FEATURE=Registry/BasicAuth.
+# ImageConfig, Network, Ports, DNS, UserNetworks, BindMounts, Volumes, Tmpfs,
+# Build, Cache, or Push, optionally with a check, as in
+# FEATURE=Registry/BasicAuth.
 FEATURE ?=
 features: build
 	go test -c -tags integration -o integration.test ./integration

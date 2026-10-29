@@ -108,7 +108,15 @@ func mountContainerFS(id string, layers []string, uids, gids IDRange) (string, e
 	// The overlay's options name its layers: lowerdir lists the read-only
 	// ones, top first and separated by colons, upperdir is the writable one,
 	// and workdir the scratch space.
-	options := fmt.Sprintf("lowerdir=%s,upperdir=%s,workdir=%s", strings.Join(layers, ":"), upper, work)
+	//
+	// redirect_dir=off and metacopy=off keep the writable layer complete in
+	// itself, so runt build can turn it into an image layer (see
+	// buildlayer_linux.go). Otherwise, renaming a directory from a lower
+	// layer could leave only a pointer to it in the writable layer, and
+	// changing a file's owner or mode only its new metadata, without its
+	// content. Either feature may be on by default, depending on how the
+	// kernel was built.
+	options := fmt.Sprintf("lowerdir=%s,upperdir=%s,workdir=%s,redirect_dir=off,metacopy=off", strings.Join(layers, ":"), upper, work)
 	// Mount options must fit in one page.
 	if len(options) >= os.Getpagesize() {
 		cleanup()

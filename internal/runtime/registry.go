@@ -1,6 +1,7 @@
 package runtime
 
 import (
+	"bytes"
 	"crypto/sha256"
 	"encoding/base64"
 	"encoding/hex"
@@ -20,13 +21,24 @@ import (
 
 // A registry client for the OCI distribution API
 // (github.com/opencontainers/distribution-spec), which Docker Hub, GitHub's
-// ghcr.io, and every other registry serve. Pulling an image takes three kinds
-// of request, all GETs:
+// ghcr.io, and every other registry serve. Pulling an image takes two kinds
+// of request, both GETs:
 //
 //   - /v2/REPOSITORY/manifests/TAG-OR-DIGEST, for the image's manifest, or
 //     an index of manifests for several platforms.
 //   - /v2/REPOSITORY/blobs/DIGEST, for its configuration and each layer.
 //     Registries often answer with a redirect to a CDN.
+//
+// Pushing one goes the other way, blobs first, so that the manifest only
+// arrives once everything it names is there:
+//
+//   - HEAD /v2/REPOSITORY/blobs/DIGEST, to see whether the registry has a
+//     blob already, as it often has a base image's layers.
+//   - POST /v2/REPOSITORY/blobs/uploads/, to start an upload. The registry
+//     answers with a Location to send the blob to.
+//   - PUT LOCATION?digest=DIGEST, with the blob, all in one request. The
+//     registry checks it against the digest before keeping it.
+//   - PUT /v2/REPOSITORY/manifests/TAG, with the manifest, which tags it.
 //
 // Authentication works by challenge. A request without credentials gets 401
 // and a WWW-Authenticate header. "Basic" means send a user name and password
@@ -61,6 +73,8 @@ type registryClient struct {
 	// authorization is the Authorization header to send, once the
 	// registry has asked for one.
 	authorization string
+	// push asks for tokens that allow pushing as well as pulling.
+	push bool
 }
 
 // newRegistryClient returns a client for ref's repository. It uses the
@@ -111,25 +125,52 @@ func registryURL(host string) string {
 	return "https://" + host
 }
 
-// get makes a GET request to the registry, logging in and trying again if
-// the registry asks for credentials.
+// get makes a GET request to the registry, at path under its base URL. accept
+// is the Accept header, if any.
+func (c *registryClient) get(path string, accept string) (*http.Response, error) {
+	header := http.Header{}
+	if accept != "" {
+		header.Set("Accept", accept)
+	}
+	return c.do(http.MethodGet, c.base+path, header, nil)
+}
+
+// requestBody makes a request's body, and returns its length. A request may
+// have to be sent twice (see do), and a body can only be read once, so do
+// calls this afresh for each attempt.
+type requestBody func() (io.ReadCloser, int64, error)
+
+// do makes a request to the registry, at target, a full URL, logging in and
+// trying again if the registry asks for credentials. body, if not nil, makes
+// what to send.
 //
 // The loop runs at most twice: the first attempt, and if that gets 401
 // Unauthorized, one more with the credentials the challenge asked for.
 // After that, any answer, 401 included, is returned to the caller, whose
 // job it is to close the response's Body.
-func (c *registryClient) get(path string, accept string) (*http.Response, error) {
+func (c *registryClient) do(method, target string, header http.Header, body requestBody) (*http.Response, error) {
 	for attempt := 0; ; attempt++ {
-		request, err := http.NewRequest(http.MethodGet, c.base+path, nil)
+		request, err := http.NewRequest(method, target, nil)
 		if err != nil {
 			return nil, err
 		}
-		request.Header.Set("User-Agent", "runt/0.1.0")
-		if accept != "" {
-			request.Header.Set("Accept", accept)
+		for key, values := range header {
+			request.Header[key] = values
 		}
-		if c.authorization != "" {
+		request.Header.Set("User-Agent", "runt/0.1.0")
+		// Credentials only go to the registry itself, not to wherever an
+		// upload's Location may point.
+		if c.authorization != "" && sameHost(target, c.base) {
 			request.Header.Set("Authorization", c.authorization)
+		}
+		if body != nil {
+			content, size, err := body()
+			if err != nil {
+				return nil, err
+			}
+			// Setting the length means it is sent in a Content-Length
+			// header, which registries want, rather than in chunks.
+			request.Body, request.ContentLength = content, size
 		}
 		response, err := c.http.Do(request)
 		if err != nil {
@@ -144,6 +185,13 @@ func (c *registryClient) get(path string, accept string) (*http.Response, error)
 			return nil, err
 		}
 	}
+}
+
+// sameHost reports whether two URLs are on the same host and port.
+func sameHost(a, b string) bool {
+	ua, errA := url.Parse(a)
+	ub, errB := url.Parse(b)
+	return errA == nil && errB == nil && ua.Host == ub.Host
 }
 
 // authenticate answers a WWW-Authenticate challenge, returning the
@@ -185,8 +233,13 @@ func (c *registryClient) fetchToken(params map[string]string, user, password str
 	if service := params["service"]; service != "" {
 		query.Set("service", service)
 	}
+	// The scope says what the token is for. Pushing needs a token that
+	// allows it, whatever the challenge asked for: the first request of a
+	// push only needs to pull, and a registry's challenge asks for no more.
 	scope := params["scope"]
-	if scope == "" && c.repository != "" {
+	if c.push && c.repository != "" {
+		scope = "repository:" + c.repository + ":pull,push"
+	} else if scope == "" && c.repository != "" {
 		scope = "repository:" + c.repository + ":pull"
 	}
 	if scope != "" {
@@ -278,6 +331,16 @@ func parseChallenge(header string) (scheme string, params map[string]string) {
 // registryError turns an unsuccessful response into an error, with the
 // message from the registry's JSON error body if it sent one.
 func registryError(response *http.Response, what string) error {
+	detail := registryErrorDetail(response)
+	if response.StatusCode == http.StatusNotFound || response.StatusCode == http.StatusUnauthorized {
+		return fmt.Errorf("%s: %s (does the image exist, and do you need runt login?)", what, detail)
+	}
+	return fmt.Errorf("%s: %s", what, detail)
+}
+
+// registryErrorDetail is what went wrong, by the registry's JSON error body
+// if it sent one, or else the response's status.
+func registryErrorDetail(response *http.Response) string {
 	var body struct {
 		Errors []struct {
 			Code    string `json:"code"`
@@ -285,14 +348,10 @@ func registryError(response *http.Response, what string) error {
 		} `json:"errors"`
 	}
 	json.NewDecoder(io.LimitReader(response.Body, 64*1024)).Decode(&body)
-	detail := response.Status
 	if len(body.Errors) > 0 {
-		detail = strings.ToLower(body.Errors[0].Code) + ": " + body.Errors[0].Message
+		return strings.ToLower(body.Errors[0].Code) + ": " + body.Errors[0].Message
 	}
-	if response.StatusCode == http.StatusNotFound || response.StatusCode == http.StatusUnauthorized {
-		return fmt.Errorf("%s: %s (does the image exist, and do you need runt login?)", what, detail)
-	}
-	return fmt.Errorf("%s: %s", what, detail)
+	return response.Status
 }
 
 // fetchManifest gets the manifest or index that ref (a tag or digest)
@@ -379,6 +438,101 @@ func (c *registryClient) fetchBlob(desc ociDescriptor, path string) error {
 		return fmt.Errorf("blob %s does not match its digest (got %s)", desc.Digest, got)
 	}
 	return nil
+}
+
+// hasBlob asks the registry whether the repository has the blob desc names.
+// HEAD is GET without the content: the answer's status says whether it is
+// there.
+func (c *registryClient) hasBlob(desc ociDescriptor) (bool, error) {
+	response, err := c.do(http.MethodHead, c.base+"/v2/"+c.repository+"/blobs/"+desc.Digest, nil, nil)
+	if err != nil {
+		return false, err
+	}
+	response.Body.Close()
+	switch response.StatusCode {
+	case http.StatusOK:
+		return true, nil
+	case http.StatusNotFound:
+		return false, nil
+	}
+	return false, pushError(response, "check for blob "+desc.Digest)
+}
+
+// uploadBlob sends the blob desc names, from the file at path, to the
+// registry: a POST to start the upload, and a PUT of the whole blob to the
+// Location the registry answers with.
+func (c *registryClient) uploadBlob(desc ociDescriptor, path string) error {
+	response, err := c.do(http.MethodPost, c.base+"/v2/"+c.repository+"/blobs/uploads/", nil, nil)
+	if err != nil {
+		return err
+	}
+	response.Body.Close()
+	if response.StatusCode != http.StatusAccepted {
+		return pushError(response, "start uploading blob "+desc.Digest)
+	}
+	// The Location may be a path on the registry or a full URL, with a
+	// query of its own that the digest is added to.
+	location, err := url.Parse(response.Header.Get("Location"))
+	if err != nil || response.Header.Get("Location") == "" {
+		return fmt.Errorf("start uploading blob %s: the registry sent no upload location", desc.Digest)
+	}
+	base, err := url.Parse(c.base)
+	if err != nil {
+		return err
+	}
+	target := base.ResolveReference(location)
+	query := target.Query()
+	query.Set("digest", desc.Digest)
+	target.RawQuery = query.Encode()
+
+	header := http.Header{}
+	header.Set("Content-Type", "application/octet-stream")
+	response, err = c.do(http.MethodPut, target.String(), header, func() (io.ReadCloser, int64, error) {
+		file, err := os.Open(path)
+		return file, desc.Size, err
+	})
+	if err != nil {
+		return fmt.Errorf("upload blob %s: %w", desc.Digest, err)
+	}
+	response.Body.Close()
+	if response.StatusCode != http.StatusCreated {
+		return pushError(response, "upload blob "+desc.Digest)
+	}
+	return nil
+}
+
+// putManifest sends a manifest to the registry under tag. Its blobs must be
+// there already. The registry answers with the digest it worked out, which
+// should be the manifest's own.
+func (c *registryClient) putManifest(tag string, desc ociDescriptor, data []byte) error {
+	header := http.Header{}
+	header.Set("Content-Type", desc.MediaType)
+	response, err := c.do(http.MethodPut, c.base+"/v2/"+c.repository+"/manifests/"+tag, header, func() (io.ReadCloser, int64, error) {
+		// io.NopCloser gives the reader a Close method that does nothing,
+		// as a request body needs.
+		return io.NopCloser(bytes.NewReader(data)), int64(len(data)), nil
+	})
+	if err != nil {
+		return fmt.Errorf("upload manifest: %w", err)
+	}
+	response.Body.Close()
+	if response.StatusCode != http.StatusCreated {
+		return pushError(response, "upload manifest for "+c.repository+":"+tag)
+	}
+	if digest := response.Header.Get("Docker-Content-Digest"); digest != "" && digest != desc.Digest {
+		return fmt.Errorf("the registry stored the manifest as %s, not %s", digest, desc.Digest)
+	}
+	return nil
+}
+
+// pushError is registryError for a push, whose usual trouble is not being
+// allowed to.
+func pushError(response *http.Response, what string) error {
+	detail := registryErrorDetail(response)
+	if response.StatusCode == http.StatusUnauthorized || response.StatusCode == http.StatusForbidden {
+		return fmt.Errorf("%s: %s (pushing needs runt login, as a user allowed to push to the repository)", what, detail)
+	}
+	return fmt.Errorf("%s: %s", what, detail)
 }
 
 // Credentials are kept the way Docker keeps them, in its config.json:

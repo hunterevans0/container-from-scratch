@@ -40,6 +40,10 @@ func Pull(string, io.Writer) error                   { return errUnsupported }
 func EnsureImage(string, io.Writer) error            { return errUnsupported }
 func ListImages() ([]ImageSummary, error)            { return nil, errUnsupported }
 func RemoveImage(string, bool, io.Writer) error      { return errUnsupported }
+func Tag(string, string) error                       { return errUnsupported }
+func Push(string, io.Writer) error                   { return errUnsupported }
+func Build(BuildOptions, io.Writer) (string, error)  { return "", errUnsupported }
+func PruneBuildCache() (int, int64, error)           { return 0, 0, errUnsupported }
 func ReadPassword(string) (string, error)            { return "", errUnsupported }
 func HumanSize(int64) string                         { return "" }
 func CreateNetwork(string, string) (*Network, error) { return nil, errUnsupported }
