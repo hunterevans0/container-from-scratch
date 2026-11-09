@@ -49,87 +49,6 @@ func networkConfigPath(name string) string {
 	return filepath.Join(networkConfigRoot, name+".json")
 }
 
-// readNetwork reads the configuration of the network called name.
-func readNetwork(name string) (*Network, error) {
-	// A name such as ../x would lead out of networkConfigRoot. validName
-	// (in state.go) is the pattern container names must match too.
-	if !validName.MatchString(name) {
-		return nil, fmt.Errorf("no such network: %s", name)
-	}
-	data, err := os.ReadFile(networkConfigPath(name))
-	if errors.Is(err, os.ErrNotExist) {
-		return nil, fmt.Errorf("no such network: %s; make it with runt network create", name)
-	}
-	if err != nil {
-		return nil, err
-	}
-	// json.Unmarshal fills in the struct from the JSON, matching keys to
-	// fields by their tags (see Network, in runtime.go). It needs a pointer,
-	// &network, to be able to change the variable.
-	var network Network
-	if err := json.Unmarshal(data, &network); err != nil {
-		return nil, fmt.Errorf("parse network %s: %w", name, err)
-	}
-	return &network, nil
-}
-
-// loadNetwork returns the network called name, made with runt network
-// create.
-func loadNetwork(name string) (*bridgeNetwork, error) {
-	network, err := readNetwork(name)
-	if err != nil {
-		return nil, err
-	}
-	return network.bridgeNetwork()
-}
-
-// bridgeNetwork turns a network's saved configuration, which keeps its
-// subnet as text, into the form the rest of the code works with. Network is
-// the exported type, which cmd/runt sees; bridgeNetwork is runt's own.
-func (n *Network) bridgeNetwork() (*bridgeNetwork, error) {
-	_, subnet, err := net.ParseCIDR(n.Subnet)
-	if err != nil {
-		return nil, fmt.Errorf("network %s: %w", n.Name, err)
-	}
-	return &bridgeNetwork{name: n.Name, bridge: n.Bridge, subnet: subnet, dns: true}, nil
-}
-
-// userNetworks reads every network made with runt network create, by name.
-func userNetworks() ([]Network, error) {
-	// Glob lists the files matching a pattern, as a shell's * does.
-	paths, err := filepath.Glob(filepath.Join(networkConfigRoot, "*.json"))
-	if err != nil {
-		return nil, err
-	}
-	var networks []Network
-	for _, path := range paths {
-		network, err := readNetwork(strings.TrimSuffix(filepath.Base(path), ".json"))
-		if err != nil {
-			return nil, err
-		}
-		// network is a pointer; *network is the Network it points to,
-		// which append copies into the slice.
-		networks = append(networks, *network)
-	}
-	// sort.Slice sorts with a function that says whether element i goes
-	// before element j.
-	sort.Slice(networks, func(i, j int) bool { return networks[i].Name < networks[j].Name })
-	return networks, nil
-}
-
-// checkNetworkName rejects a name that is malformed or is a built-in
-// network's.
-func checkNetworkName(name string) error {
-	if !validName.MatchString(name) {
-		return fmt.Errorf("invalid network name %q: use letters, digits, and _.- and start with a letter or digit", name)
-	}
-	switch name {
-	case NetworkBridge, NetworkNone, "host":
-		return fmt.Errorf("%q is the name of a built-in network", name)
-	}
-	return nil
-}
-
 // CreateNetwork makes a network, which containers join with --network NAME,
 // and on which they find each other by name. subnet is its range of
 // addresses, or, if empty, the first free /24 from 10.89.0.0/24 on, as
@@ -140,8 +59,13 @@ func checkNetworkName(name string) error {
 // save them. The exclusive lock keeps two runt network create commands from
 // choosing the same subnet, or name, at once.
 func CreateNetwork(name, subnet string) (*Network, error) {
-	if err := checkNetworkName(name); err != nil {
-		return nil, err
+	// Reject a name that is malformed or is a built-in network's.
+	if !validName.MatchString(name) {
+		return nil, fmt.Errorf("invalid network name %q: use letters, digits, and _.- and start with a letter or digit", name)
+	}
+	switch name {
+	case NetworkBridge, NetworkNone, "host":
+		return nil, fmt.Errorf("%q is the name of a built-in network", name)
 	}
 	unlock, err := lockNetworks(true)
 	if err != nil {
@@ -151,10 +75,41 @@ func CreateNetwork(name, subnet string) (*Network, error) {
 	if _, err := os.Stat(networkConfigPath(name)); err == nil {
 		return nil, fmt.Errorf("network %s already exists", name)
 	}
-	networks, err := userNetworks()
+	// Read every network made with runt network create, by name. Glob
+	// lists the files matching a pattern, as a shell's * does.
+	paths, err := filepath.Glob(filepath.Join(networkConfigRoot, "*.json"))
 	if err != nil {
 		return nil, err
 	}
+	var networks []Network
+	for _, path := range paths {
+		// Read the configuration of the network the file is for. A name
+		// such as ../x would lead out of networkConfigRoot. validName (in
+		// state.go) is the pattern container names must match too.
+		networkName := strings.TrimSuffix(filepath.Base(path), ".json")
+		if !validName.MatchString(networkName) {
+			return nil, fmt.Errorf("no such network: %s", networkName)
+		}
+		data, err := os.ReadFile(networkConfigPath(networkName))
+		if errors.Is(err, os.ErrNotExist) {
+			return nil, fmt.Errorf("no such network: %s; make it with runt network create", networkName)
+		}
+		if err != nil {
+			return nil, err
+		}
+		// json.Unmarshal fills in the struct from the JSON, matching keys to
+		// fields by their tags (see Network, in runtime.go). It needs a
+		// pointer, &network, to be able to change the variable. append
+		// copies network into the slice.
+		var network Network
+		if err := json.Unmarshal(data, &network); err != nil {
+			return nil, fmt.Errorf("parse network %s: %w", networkName, err)
+		}
+		networks = append(networks, network)
+	}
+	// sort.Slice sorts with a function that says whether element i goes
+	// before element j.
+	sort.Slice(networks, func(i, j int) bool { return networks[i].Name < networks[j].Name })
 	// The subnets the new network mustn't overlap. Two networks sharing
 	// addresses would confuse the host's routing: it couldn't tell which
 	// bridge an address is behind.
@@ -279,10 +234,41 @@ func ListNetworks() ([]Network, error) {
 		return nil, err
 	}
 	defer unlock()
-	user, err := userNetworks()
+	// Read every network made with runt network create, by name. Glob
+	// lists the files matching a pattern, as a shell's * does.
+	paths, err := filepath.Glob(filepath.Join(networkConfigRoot, "*.json"))
 	if err != nil {
 		return nil, err
 	}
+	var user []Network
+	for _, path := range paths {
+		// Read the configuration of the network the file is for. A name
+		// such as ../x would lead out of networkConfigRoot. validName (in
+		// state.go) is the pattern container names must match too.
+		name := strings.TrimSuffix(filepath.Base(path), ".json")
+		if !validName.MatchString(name) {
+			return nil, fmt.Errorf("no such network: %s", name)
+		}
+		data, err := os.ReadFile(networkConfigPath(name))
+		if errors.Is(err, os.ErrNotExist) {
+			return nil, fmt.Errorf("no such network: %s; make it with runt network create", name)
+		}
+		if err != nil {
+			return nil, err
+		}
+		// json.Unmarshal fills in the struct from the JSON, matching keys to
+		// fields by their tags (see Network, in runtime.go). It needs a
+		// pointer, &network, to be able to change the variable. append
+		// copies network into the slice.
+		var network Network
+		if err := json.Unmarshal(data, &network); err != nil {
+			return nil, fmt.Errorf("parse network %s: %w", name, err)
+		}
+		user = append(user, network)
+	}
+	// sort.Slice sorts with a function that says whether element i goes
+	// before element j.
+	sort.Slice(user, func(i, j int) bool { return user[i].Name < user[j].Name })
 	return append(networks, user...), nil
 }
 
@@ -301,10 +287,34 @@ func RemoveNetwork(name string) error {
 		return err
 	}
 	defer unlock()
-	network, err := loadNetwork(name)
+	// Read the configuration of the network called name. A name such as
+	// ../x would lead out of networkConfigRoot. validName (in state.go) is
+	// the pattern container names must match too.
+	if !validName.MatchString(name) {
+		return fmt.Errorf("no such network: %s", name)
+	}
+	data, err := os.ReadFile(networkConfigPath(name))
+	if errors.Is(err, os.ErrNotExist) {
+		return fmt.Errorf("no such network: %s; make it with runt network create", name)
+	}
 	if err != nil {
 		return err
 	}
+	// json.Unmarshal fills in the struct from the JSON, matching keys to
+	// fields by their tags (see Network, in runtime.go). It needs a
+	// pointer, &saved, to be able to change the variable.
+	var saved Network
+	if err := json.Unmarshal(data, &saved); err != nil {
+		return fmt.Errorf("parse network %s: %w", name, err)
+	}
+	// Turn the saved configuration, which keeps its subnet as text, into
+	// the form the rest of the code works with. Network is the exported
+	// type, which cmd/runt sees; bridgeNetwork is runt's own.
+	_, savedSubnet, err := net.ParseCIDR(saved.Subnet)
+	if err != nil {
+		return fmt.Errorf("network %s: %w", saved.Name, err)
+	}
+	network := &bridgeNetwork{name: saved.Name, bridge: saved.Bridge, subnet: savedSubnet, dns: true}
 	inUse, err := network.ipam().inUse()
 	if err != nil {
 		return err
@@ -316,14 +326,25 @@ func RemoveNetwork(name string) error {
 	if err != nil {
 		return err
 	}
-	err = conn.deleteLink(network.bridge)
+	deleteRequest := newRequest(syscall.RTM_DELLINK, 0, ifInfo(0, 0, 0))
+	deleteRequest.attr(syscall.IFLA_IFNAME, cString(network.bridge))
+	err = conn.do(deleteRequest)
 	conn.Close()
 	// ENODEV: no such device. No container ever joined, so there is no
 	// bridge, or a reboot took it.
 	if err != nil && !errors.Is(err, syscall.ENODEV) {
 		return fmt.Errorf("delete bridge %s: %w", network.bridge, err)
 	}
-	for _, rule := range network.rules() {
+	// The network's iptables rules, each a table, a chain, and the rule, as
+	// setup adds them (see network_linux.go).
+	subnet := network.subnet.String()
+	for _, rule := range []iptablesRule{
+		{"nat", "POSTROUTING", []string{"-s", subnet, "!", "-o", network.bridge, "-j", "MASQUERADE"}},
+		{"filter", "FORWARD", []string{"-i", network.bridge, "-o", network.bridge, "-j", "ACCEPT"}},
+		{"filter", "FORWARD", []string{"-i", network.bridge, "!", "-o", allBridges, "-j", "ACCEPT"}},
+		{"filter", "FORWARD", []string{"-o", network.bridge, "-m", "conntrack", "--ctstate", "RELATED,ESTABLISHED", "-j", "ACCEPT"}},
+		{"filter", "FORWARD", []string{"-o", network.bridge, "-m", "conntrack", "--ctstate", "DNAT", "-j", "ACCEPT"}},
+	} {
 		if err := rule.remove(); err != nil {
 			return err
 		}

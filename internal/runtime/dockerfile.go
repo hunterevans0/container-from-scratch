@@ -208,10 +208,20 @@ directives:
 	names := map[string]bool{}
 	for _, inst := range instructions {
 		if inst.command == "FROM" {
-			stage, err := parseFrom(inst)
-			if err != nil {
-				return nil, err
+			// FROM [--platform=PLATFORM] IMAGE [AS NAME].
+			words := strings.Fields(inst.args)
+			stage := &dockerStage{from: inst}
+			switch {
+			case len(words) == 1:
+			case len(words) == 3 && strings.EqualFold(words[1], "AS"):
+				stage.name = strings.ToLower(words[2])
+				if !stageNamePattern.MatchString(stage.name) {
+					return nil, fmt.Errorf("line %d: invalid stage name %q: use letters, digits, and _.- and start with a letter", inst.line, words[2])
+				}
+			default:
+				return nil, fmt.Errorf("line %d: FROM takes an image, and optionally AS and a name", inst.line)
 			}
+			stage.image = words[0]
 			if stage.name != "" {
 				if names[stage.name] {
 					return nil, fmt.Errorf("line %d: there is already a stage called %q", inst.line, stage.name)
@@ -289,24 +299,6 @@ func parseInstruction(text string, line int) (instruction, error) {
 		}
 	}
 	return inst, nil
-}
-
-// parseFrom reads FROM [--platform=PLATFORM] IMAGE [AS NAME].
-func parseFrom(inst instruction) (*dockerStage, error) {
-	words := strings.Fields(inst.args)
-	stage := &dockerStage{from: inst}
-	switch {
-	case len(words) == 1:
-	case len(words) == 3 && strings.EqualFold(words[1], "AS"):
-		stage.name = strings.ToLower(words[2])
-		if !stageNamePattern.MatchString(stage.name) {
-			return nil, fmt.Errorf("line %d: invalid stage name %q: use letters, digits, and _.- and start with a letter", inst.line, words[2])
-		}
-	default:
-		return nil, fmt.Errorf("line %d: FROM takes an image, and optionally AS and a name", inst.line)
-	}
-	stage.image = words[0]
-	return stage, nil
 }
 
 // cutSpace splits text at its first space or tab, returning the word before

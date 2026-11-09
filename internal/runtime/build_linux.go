@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"io"
 	"io/fs"
+	"net/url"
 	"os"
 	"path"
 	"path/filepath"
@@ -67,7 +68,137 @@ func Build(options BuildOptions, out io.Writer) (string, error) {
 		return "", err
 	}
 	defer b.close()
-	return b.build()
+
+	// Run every step, then name the image.
+	for i, stage := range b.file.stages[:b.target+1] {
+		// Start the stage, from the image its FROM names: scratch, an
+		// earlier stage by name, or an image, pulled first if the store
+		// doesn't have it (or with --pull, in any case). Each step is shown
+		// as it is about to run, as docker build does.
+		b.step++
+		fmt.Fprintf(b.out, "Step %d/%d : %s\n", b.step, b.steps, stage.from.original)
+		lexer := wordLexer{escape: b.file.escape, lookup: func(name string) (string, bool) {
+			value, ok := b.globals[name]
+			return value, ok
+		}}
+		name, err := lexer.word(stage.image)
+		if err != nil {
+			return "", fmt.Errorf("line %d: %w", stage.from.line, err)
+		}
+		if platform := stage.from.flags["platform"]; platform != "" {
+			if platform, err = lexer.word(platform); err != nil {
+				return "", fmt.Errorf("line %d: %w", stage.from.line, err)
+			}
+			if want := "linux/" + goruntime.GOARCH; platform != want && !strings.HasPrefix(platform, want+"/") {
+				return "", fmt.Errorf("line %d: %w", stage.from.line, fmt.Errorf("--platform=%s: runt build only builds for this machine, %s", platform, want))
+			}
+		}
+		st := &buildStage{name: stage.name, args: map[string]string{}}
+		if strings.EqualFold(name, "scratch") {
+			st.image = &ociImage{layout: b.store.dir}
+			st.image.config.Architecture, st.image.config.OS = goruntime.GOARCH, "linux"
+			st.image.config.RootFS.Type, st.image.config.RootFS.DiffIDs = "layers", []string{}
+			st.key = digestOf("FROM scratch")
+		} else if n := slices.IndexFunc(b.stages, func(earlier *buildStage) bool { return earlier.name != "" && earlier.name == strings.ToLower(name) }); n >= 0 {
+			earlier := b.stages[n]
+			st.image, st.desc, st.key = earlier.image, earlier.desc, earlier.key
+			b.printImage(st)
+		} else {
+			found, err := b.baseImage(name)
+			if err != nil {
+				return "", fmt.Errorf("line %d: %w", stage.from.line, err)
+			}
+			st.image, st.desc = found.image, found.entry
+			st.desc.Annotations = nil
+			st.key = digestOf("FROM " + found.entry.Digest)
+			b.printImage(st)
+		}
+		for _, inst := range stage.instructions {
+			// Run one instruction of the stage, showing the step first.
+			b.step++
+			fmt.Fprintf(b.out, "Step %d/%d : %s\n", b.step, b.steps, inst.original)
+			var err error
+			switch inst.command {
+			case "ARG":
+				// Declare ARGs: their values, from --build-arg, or else the
+				// default given, or else the global ARG of the same name,
+				// are in scope for the rest of the stage.
+				pairs, argErr := b.lexer(st).keyValues(inst.args, false, true)
+				if argErr != nil {
+					err = argErr
+					break
+				}
+				for _, pair := range pairs {
+					b.usedArgs[pair.key] = true
+					value, set := b.options.BuildArgs[pair.key]
+					if !set && pair.hasValue {
+						value, set = pair.value, true
+					}
+					if !set {
+						value, set = b.globals[pair.key]
+					}
+					if set {
+						st.args[pair.key] = value
+					} else {
+						delete(st.args, pair.key)
+					}
+				}
+				st.key = b.stepKey(st, inst, "")
+				b.printImage(st)
+			case "RUN":
+				err = b.run(st, inst)
+			case "COPY", "ADD":
+				err = b.copy(st, inst)
+			default:
+				// An instruction that only changes the image's
+				// configuration.
+				change, changeErr := b.configChange(st, inst)
+				if changeErr != nil {
+					err = changeErr
+					break
+				}
+				key := b.stepKey(st, inst, "")
+				if !b.useCache(st, key) {
+					err = b.commit(st, key, inst, nil, change)
+				}
+			}
+			if err != nil {
+				return "", fmt.Errorf("line %d: %s: %w", inst.line, inst.command, err)
+			}
+		}
+		if i == b.target && st.desc.Digest == "" {
+			return "", errors.New("the image has nothing in it: FROM scratch needs at least one instruction after it")
+		}
+		b.stages = append(b.stages, st)
+	}
+
+	var unused []string
+	for name := range b.options.BuildArgs {
+		if !b.usedArgs[name] {
+			unused = append(unused, name)
+		}
+	}
+	if len(unused) > 0 {
+		sort.Strings(unused)
+		fmt.Fprintf(b.out, "[Warning] One or more build-args %v were not consumed\n", unused)
+	}
+
+	final := b.stages[b.target]
+	unlock, err := b.store.lock(true)
+	if err != nil {
+		return "", err
+	}
+	err = b.store.nameBuilt(final.desc, b.tags)
+	unlock()
+	if err != nil {
+		return "", err
+	}
+	id := final.image.manifest.Config.Digest
+	fmt.Fprintf(b.out, "Successfully built %s\n", shortDigest(id))
+	for _, tag := range b.tags {
+		fmt.Fprintf(b.out, "Successfully tagged %s\n", tag.familiar())
+	}
+	return id, nil
 }
 
 // builder is one build in progress.
@@ -165,8 +296,31 @@ func newBuilder(options BuildOptions, out io.Writer) (*builder, error) {
 	for _, stage := range b.file.stages[:b.target+1] {
 		b.steps += 1 + len(stage.instructions)
 	}
-	if err := b.readGlobalArgs(); err != nil {
-		return nil, err
+	// Work out the values of the ARGs before the first FROM, starting from
+	// the platform ones that BuildKit predefines, such as TARGETARCH, for
+	// Dockerfiles that build for several platforms.
+	arch := goruntime.GOARCH
+	b.globals = map[string]string{
+		"TARGETPLATFORM": "linux/" + arch, "TARGETOS": "linux", "TARGETARCH": arch, "TARGETVARIANT": "",
+		"BUILDPLATFORM": "linux/" + arch, "BUILDOS": "linux", "BUILDARCH": arch, "BUILDVARIANT": "",
+	}
+	lexer := wordLexer{escape: b.file.escape, lookup: func(name string) (string, bool) {
+		value, ok := b.globals[name]
+		return value, ok
+	}}
+	for _, inst := range b.file.args {
+		pairs, err := lexer.keyValues(inst.args, false, true)
+		if err != nil {
+			return nil, fmt.Errorf("line %d: %w", inst.line, err)
+		}
+		for _, pair := range pairs {
+			b.usedArgs[pair.key] = true
+			if value, given := b.options.BuildArgs[pair.key]; given {
+				b.globals[pair.key] = value
+			} else if pair.hasValue {
+				b.globals[pair.key] = pair.value
+			}
+		}
 	}
 	if b.uids, b.gids, err = idRanges(Config{UsernsUser: options.UsernsUser}); err != nil {
 		return nil, err
@@ -175,32 +329,12 @@ func newBuilder(options BuildOptions, out io.Writer) (*builder, error) {
 	if err := os.MkdirAll(b.store.builds, 0o700); err != nil {
 		return nil, err
 	}
-	removeStaleBuilds(b.store.builds)
-	if b.dir, err = os.MkdirTemp(b.store.builds, "build-"); err != nil {
-		return nil, err
-	}
-	if b.unlockDir, err = lockFile(filepath.Join(b.dir, "lock"), true); err != nil {
-		os.RemoveAll(b.dir)
-		return nil, err
-	}
-	return b, nil
-}
-
-// close removes the build's directory.
-func (b *builder) close() {
-	b.unlockDir()
-	if err := os.RemoveAll(b.dir); err != nil {
-		warn(err)
-	}
-}
-
-// removeStaleBuilds removes what builds that never finished left in dir:
-// their directories, whose lock no build holds any more. One made in the
-// last minute may not have taken its lock yet, so it is left alone.
-func removeStaleBuilds(dir string) {
-	entries, _ := os.ReadDir(dir)
-	for _, entry := range entries {
-		build := filepath.Join(dir, entry.Name())
+	// Remove what builds that never finished left in b.store.builds: their directories,
+	// whose lock no build holds any more. One made in the last minute may not
+	// have taken its lock yet, so it is left alone.
+	builds, _ := os.ReadDir(b.store.builds)
+	for _, entry := range builds {
+		build := filepath.Join(b.store.builds, entry.Name())
 		info, err := entry.Info()
 		if err != nil || time.Since(info.ModTime()) < time.Minute {
 			continue
@@ -221,89 +355,22 @@ func removeStaleBuilds(dir string) {
 		}
 		os.RemoveAll(build)
 	}
+	if b.dir, err = os.MkdirTemp(b.store.builds, "build-"); err != nil {
+		return nil, err
+	}
+	if b.unlockDir, err = lockFile(filepath.Join(b.dir, "lock"), true); err != nil {
+		os.RemoveAll(b.dir)
+		return nil, err
+	}
+	return b, nil
 }
 
-// readGlobalArgs works out the values of the ARGs before the first FROM,
-// starting from the platform ones that BuildKit predefines, such as
-// TARGETARCH, for Dockerfiles that build for several platforms.
-func (b *builder) readGlobalArgs() error {
-	arch := goruntime.GOARCH
-	b.globals = map[string]string{
-		"TARGETPLATFORM": "linux/" + arch, "TARGETOS": "linux", "TARGETARCH": arch, "TARGETVARIANT": "",
-		"BUILDPLATFORM": "linux/" + arch, "BUILDOS": "linux", "BUILDARCH": arch, "BUILDVARIANT": "",
+// close removes the build's directory.
+func (b *builder) close() {
+	b.unlockDir()
+	if err := os.RemoveAll(b.dir); err != nil {
+		warn(err)
 	}
-	lexer := wordLexer{escape: b.file.escape, lookup: func(name string) (string, bool) {
-		value, ok := b.globals[name]
-		return value, ok
-	}}
-	for _, inst := range b.file.args {
-		pairs, err := lexer.keyValues(inst.args, false, true)
-		if err != nil {
-			return fmt.Errorf("line %d: %w", inst.line, err)
-		}
-		for _, pair := range pairs {
-			b.usedArgs[pair.key] = true
-			if value, given := b.options.BuildArgs[pair.key]; given {
-				b.globals[pair.key] = value
-			} else if pair.hasValue {
-				b.globals[pair.key] = pair.value
-			}
-		}
-	}
-	return nil
-}
-
-// build runs every step, then names the image.
-func (b *builder) build() (string, error) {
-	for i, stage := range b.file.stages[:b.target+1] {
-		st, err := b.from(stage)
-		if err != nil {
-			return "", fmt.Errorf("line %d: %w", stage.from.line, err)
-		}
-		for _, inst := range stage.instructions {
-			if err := b.runStep(st, inst); err != nil {
-				return "", fmt.Errorf("line %d: %s: %w", inst.line, inst.command, err)
-			}
-		}
-		if i == b.target && st.desc.Digest == "" {
-			return "", errors.New("the image has nothing in it: FROM scratch needs at least one instruction after it")
-		}
-		b.stages = append(b.stages, st)
-	}
-
-	var unused []string
-	for name := range b.options.BuildArgs {
-		if !b.usedArgs[name] {
-			unused = append(unused, name)
-		}
-	}
-	if len(unused) > 0 {
-		sort.Strings(unused)
-		fmt.Fprintf(b.out, "[Warning] One or more build-args %v were not consumed\n", unused)
-	}
-
-	final := b.stages[b.target]
-	unlock, err := b.store.lock(true)
-	if err != nil {
-		return "", err
-	}
-	err = b.store.nameBuilt(final.desc, b.tags)
-	unlock()
-	if err != nil {
-		return "", err
-	}
-	id := final.image.manifest.Config.Digest
-	fmt.Fprintf(b.out, "Successfully built %s\n", shortDigest(id))
-	for _, tag := range b.tags {
-		fmt.Fprintf(b.out, "Successfully tagged %s\n", tag.familiar())
-	}
-	return id, nil
-}
-
-// printStep shows the step about to run, as docker build does.
-func (b *builder) printStep(inst instruction) {
-	b.step++
-	fmt.Fprintf(b.out, "Step %d/%d : %s\n", b.step, b.steps, inst.original)
 }
 
 // printImage shows the image a step left the stage with.
@@ -311,53 +378,6 @@ func (b *builder) printImage(st *buildStage) {
 	if st.desc.Digest != "" {
 		fmt.Fprintf(b.out, " ---> %s\n", shortDigest(st.image.manifest.Config.Digest))
 	}
-}
-
-// from starts a stage, from the image its FROM names: scratch, an earlier
-// stage by name, or an image, pulled first if the store doesn't have it (or
-// with --pull, in any case).
-func (b *builder) from(stage *dockerStage) (*buildStage, error) {
-	b.printStep(stage.from)
-	lexer := wordLexer{escape: b.file.escape, lookup: func(name string) (string, bool) {
-		value, ok := b.globals[name]
-		return value, ok
-	}}
-	name, err := lexer.word(stage.image)
-	if err != nil {
-		return nil, err
-	}
-	if platform := stage.from.flags["platform"]; platform != "" {
-		if platform, err = lexer.word(platform); err != nil {
-			return nil, err
-		}
-		if want := "linux/" + goruntime.GOARCH; platform != want && !strings.HasPrefix(platform, want+"/") {
-			return nil, fmt.Errorf("--platform=%s: runt build only builds for this machine, %s", platform, want)
-		}
-	}
-	st := &buildStage{name: stage.name, args: map[string]string{}}
-
-	if strings.EqualFold(name, "scratch") {
-		st.image = &ociImage{layout: b.store.dir}
-		st.image.config.Architecture, st.image.config.OS = goruntime.GOARCH, "linux"
-		st.image.config.RootFS.Type, st.image.config.RootFS.DiffIDs = "layers", []string{}
-		st.key = digestOf("FROM scratch")
-		return st, nil
-	}
-	if i := slices.IndexFunc(b.stages, func(earlier *buildStage) bool { return earlier.name != "" && earlier.name == strings.ToLower(name) }); i >= 0 {
-		earlier := b.stages[i]
-		st.image, st.desc, st.key = earlier.image, earlier.desc, earlier.key
-		b.printImage(st)
-		return st, nil
-	}
-	found, err := b.baseImage(name)
-	if err != nil {
-		return nil, err
-	}
-	st.image, st.desc = found.image, found.entry
-	st.desc.Annotations = nil
-	st.key = digestOf("FROM " + found.entry.Digest)
-	b.printImage(st)
-	return st, nil
 }
 
 // baseImage finds the image name names in the store, pulling it if need be.
@@ -380,20 +400,6 @@ func (b *builder) baseImage(name string) (storedImage, error) {
 	}
 	defer unlock()
 	return b.store.find(name)
-}
-
-// runStep runs one instruction of a stage.
-func (b *builder) runStep(st *buildStage, inst instruction) error {
-	b.printStep(inst)
-	switch inst.command {
-	case "ARG":
-		return b.arg(st, inst)
-	case "RUN":
-		return b.run(st, inst)
-	case "COPY", "ADD":
-		return b.copy(st, inst)
-	}
-	return b.configure(st, inst)
 }
 
 // stepKey is the cache key of inst, run on the stage as it is (see the top
@@ -445,7 +451,14 @@ func (b *builder) useCache(st *buildStage, key string) bool {
 // if it changes it. The new image is recorded in the cache under key, and
 // becomes the stage's image.
 func (b *builder) commit(st *buildStage, key string, inst instruction, layer *layerBlob, change func(config *ociImageConfig) error) error {
-	config, err := cloneConfig(st.image.config)
+	// A copy of the stage's configuration that shares nothing with it, by
+	// way of JSON, so that changing the copy's lists and maps leaves the
+	// original alone.
+	var config ociImageConfig
+	data, err := json.Marshal(st.image.config)
+	if err == nil {
+		err = json.Unmarshal(data, &config)
+	}
 	if err != nil {
 		return err
 	}
@@ -491,8 +504,18 @@ func (b *builder) commit(st *buildStage, key string, inst instruction, layer *la
 	}
 	defer unlock()
 	if layer != nil {
-		if err := b.store.moveBlob(layer.path, layer.desc.Digest); err != nil {
+		// Move the layer's file into the store as its blob. The file is on
+		// the same filesystem as the store, and the lock is held
+		// exclusively.
+		target, err := b.store.blobPath(layer.desc.Digest)
+		if err != nil {
 			return err
+		}
+		if err := os.MkdirAll(filepath.Dir(target), 0o700); err != nil {
+			return fmt.Errorf("create image store: %w", err)
+		}
+		if err := os.Rename(layer.path, target); err != nil {
+			return fmt.Errorf("store blob %s: %w", layer.desc.Digest, err)
 		}
 	}
 	if manifest.Config, err = b.store.writeBlob(mediaTypeImageConfig, configData); err != nil {
@@ -516,18 +539,6 @@ func (b *builder) commit(st *buildStage, key string, inst instruction, layer *la
 	return nil
 }
 
-// cloneConfig returns a copy of config that shares nothing with it, by way
-// of JSON, so that changing the copy's lists and maps leaves the original
-// alone.
-func cloneConfig(config ociImageConfig) (ociImageConfig, error) {
-	var clone ociImageConfig
-	data, err := json.Marshal(config)
-	if err == nil {
-		err = json.Unmarshal(data, &clone)
-	}
-	return clone, err
-}
-
 // lexer processes a stage's arguments, with ENV's variables and then ARG's,
 // as the instruction about to run sees them.
 func (b *builder) lexer(st *buildStage) wordLexer {
@@ -542,50 +553,19 @@ func (b *builder) lexer(st *buildStage) wordLexer {
 	}}
 }
 
-// arg declares ARGs: their values, from --build-arg, or else the default
-// given, or else the global ARG of the same name, are in scope for the rest
-// of the stage.
-func (b *builder) arg(st *buildStage, inst instruction) error {
-	pairs, err := b.lexer(st).keyValues(inst.args, false, true)
-	if err != nil {
-		return err
-	}
-	for _, pair := range pairs {
-		b.usedArgs[pair.key] = true
-		value, set := b.options.BuildArgs[pair.key]
-		if !set && pair.hasValue {
-			value, set = pair.value, true
-		}
-		if !set {
-			value, set = b.globals[pair.key]
-		}
-		if set {
-			st.args[pair.key] = value
-		} else {
-			delete(st.args, pair.key)
-		}
-	}
-	st.key = b.stepKey(st, inst, "")
-	b.printImage(st)
-	return nil
-}
-
-// shell is the stage's shell, which SHELL sets, for the shell form of RUN,
-// CMD, and ENTRYPOINT.
-func (st *buildStage) shell() []string {
-	if shell := st.image.config.Config.Shell; len(shell) > 0 {
-		return shell
-	}
-	return []string{"/bin/sh", "-c"}
-}
-
 // command is an instruction's command: its exec form, or else the shell
 // running the arguments.
 func (st *buildStage) command(inst instruction) []string {
 	if inst.isExec {
 		return inst.exec
 	}
-	return append(slices.Clone(st.shell()), inst.args)
+	// The stage's shell, which SHELL sets, for the shell form of RUN, CMD,
+	// and ENTRYPOINT.
+	shell := st.image.config.Config.Shell
+	if len(shell) == 0 {
+		shell = []string{"/bin/sh", "-c"}
+	}
+	return append(slices.Clone(shell), inst.args)
 }
 
 // run runs a RUN's command in a container made from the stage's image, and
@@ -715,15 +695,40 @@ func (b *builder) copy(st *buildStage, inst instruction) error {
 		dest = path.Join("/", st.image.config.Config.WorkingDir, dest)
 	}
 	dest = path.Clean(dest)
-	if flags["checksum"] != "" && (len(sources) != 1 || !isURL(sources[0])) {
+	// A source is a URL to download if it starts with http:// or https://.
+	if flags["checksum"] != "" && (len(sources) != 1 || !(strings.HasPrefix(sources[0], "http://") || strings.HasPrefix(sources[0], "https://"))) {
 		return errors.New("--checksum only works with a single URL")
 	}
 
 	var fromImage *ociImage
 	if from := flags["from"]; from != "" {
-		var err error
-		if fromImage, err = b.fromImage(from); err != nil {
-			return err
+		// Find the image COPY --from names: an earlier stage, by name or
+		// number, or else an image, pulled first if the store doesn't have
+		// it.
+		if n, err := strconv.Atoi(from); err == nil {
+			if n < 0 || n >= len(b.stages) {
+				return fmt.Errorf("--from=%d: there is no stage %d before this one", n, n)
+			}
+			fromImage = b.stages[n].image
+		} else {
+			name := strings.ToLower(from)
+			earlier := false
+			for _, stage := range b.stages {
+				if stage.name == name {
+					fromImage, earlier = stage.image, true
+					break
+				}
+			}
+			if !earlier {
+				if slices.ContainsFunc(b.file.stages, func(stage *dockerStage) bool { return stage.name == name }) {
+					return fmt.Errorf("--from=%s: a stage can only copy from stages before it", from)
+				}
+				base, err := b.baseImage(from)
+				if err != nil {
+					return err
+				}
+				fromImage = base.image
+			}
 		}
 	}
 	unlock, err := b.store.lock(false)
@@ -733,20 +738,92 @@ func (b *builder) copy(st *buildStage, inst instruction) error {
 	defer unlock()
 	root := b.context
 	if fromImage != nil {
-		layers, err := b.unpack(fromImage)
-		if err != nil {
-			return err
+		// Unpack the image's layers for a mount, as a container's would be. An
+		// image with none yet, FROM scratch, gets an empty directory, since
+		// overlayfs needs at least one.
+		var layers []string
+		if len(fromImage.manifest.Layers) > 0 {
+			// Make sure every layer of the image is unpacked, with its file
+			// ownership shifted into the build's ID ranges, and list the layer
+			// directories top first, the order overlayfs takes them in.
+			//
+			// Layers are stored by digest under layerRoot/<uid base>-<gid base>,
+			// since their ownership depends on the ranges, and are shared by every
+			// container that uses them. A layer is unpacked into a temporary
+			// directory and renamed into place when complete, so a half-unpacked
+			// layer is never used, and two runt processes unpacking the same layer
+			// at once don't get in each other's way.
+			store := filepath.Join(layerRoot, fmt.Sprintf("%d-%d", b.uids.Base, b.gids.Base))
+			if err := os.MkdirAll(store, 0o700); err != nil {
+				return fmt.Errorf("create layer store: %w", err)
+			}
+			var dirs []string
+			for i, layer := range fromImage.manifest.Layers {
+				blob, err := fromImage.blobPath(layer.Digest)
+				if err != nil {
+					return err
+				}
+				dir := filepath.Join(store, filepath.Base(blob))
+				dirs = append(dirs, dir)
+				if _, err := os.Stat(dir); err == nil {
+					continue
+				}
+				temp, err := os.MkdirTemp(store, "unpacking-")
+				if err != nil {
+					return fmt.Errorf("create layer directory: %w", err)
+				}
+				err = unpackLayer(blob, layer, fromImage.config.RootFS.DiffIDs[i], temp, b.uids, b.gids)
+				if err == nil {
+					err = os.Rename(temp, dir)
+				}
+				if err != nil {
+					os.RemoveAll(temp)
+					if _, statErr := os.Stat(dir); statErr == nil {
+						// Another runt finished unpacking it first.
+						continue
+					}
+					return fmt.Errorf("unpack layer %s: %w", layer.Digest, err)
+				}
+			}
+			// The manifest lists layers bottom first; overlayfs wants them top
+			// first.
+			slices.Reverse(dirs)
+			layers = dirs
+		} else {
+			empty := filepath.Join(b.dir, "empty")
+			if err := os.MkdirAll(empty, 0o755); err != nil {
+				return err
+			}
+			layers = []string{empty}
 		}
-		dir, unmount, err := mountReadOnly(layers, filepath.Join(b.dir, fmt.Sprintf("from-%d", b.step)))
-		if err != nil {
-			return err
+		// Make the image's root filesystem readable on the host, for COPY
+		// --from: its layers, given top first, under a read-only overlay,
+		// or the one layer itself, or an empty directory if it has none.
+		target := filepath.Join(b.dir, fmt.Sprintf("from-%d", b.step))
+		dir := target
+		switch len(layers) {
+		case 0:
+			if err := os.MkdirAll(target, 0o755); err != nil {
+				return err
+			}
+		case 1:
+			dir = layers[0]
+		default:
+			if err := os.MkdirAll(target, 0o755); err != nil {
+				return err
+			}
+			// An overlay with no writable layer is read-only, and needs at
+			// least two layers.
+			if err := syscall.Mount("overlay", target, "overlay", syscall.MS_RDONLY|syscall.MS_NODEV, "lowerdir="+strings.Join(layers, ":")); err != nil {
+				return fmt.Errorf("mount stage filesystem: %w", err)
+			}
+			defer syscall.Unmount(target, syscall.MNT_DETACH)
 		}
-		defer unmount()
 		root = &copyRoot{dir: dir}
 	}
 	var found []copySource
 	for _, source := range sources {
-		if isURL(source) {
+		if strings.HasPrefix(source, "http://") || strings.HasPrefix(source, "https://") {
 			if !add {
 				return fmt.Errorf("%s: COPY can't download; use ADD, or RUN curl", source)
 			}
@@ -781,10 +858,64 @@ func (b *builder) copy(st *buildStage, inst instruction) error {
 	// The image's filesystem, with a writable layer for the copies, as a
 	// container's would be. Its directory goes with a state directory, as
 	// a container's does, so that runt run doesn't take it for one left
-	// behind (see pruneContainerFS).
-	layers, err := b.unpack(st.image)
-	if err != nil {
-		return err
+	// behind (see supervise).
+	// Unpack the image's layers for a mount, as a container's would be. An
+	// image with none yet, FROM scratch, gets an empty directory, since
+	// overlayfs needs at least one.
+	var layers []string
+	if len(st.image.manifest.Layers) > 0 {
+		// Make sure every layer of the image is unpacked, with its file
+		// ownership shifted into the build's ID ranges, and list the layer
+		// directories top first, the order overlayfs takes them in.
+		//
+		// Layers are stored by digest under layerRoot/<uid base>-<gid base>,
+		// since their ownership depends on the ranges, and are shared by every
+		// container that uses them. A layer is unpacked into a temporary
+		// directory and renamed into place when complete, so a half-unpacked
+		// layer is never used, and two runt processes unpacking the same layer
+		// at once don't get in each other's way.
+		store := filepath.Join(layerRoot, fmt.Sprintf("%d-%d", b.uids.Base, b.gids.Base))
+		if err := os.MkdirAll(store, 0o700); err != nil {
+			return fmt.Errorf("create layer store: %w", err)
+		}
+		var dirs []string
+		for i, layer := range st.image.manifest.Layers {
+			blob, err := st.image.blobPath(layer.Digest)
+			if err != nil {
+				return err
+			}
+			dir := filepath.Join(store, filepath.Base(blob))
+			dirs = append(dirs, dir)
+			if _, err := os.Stat(dir); err == nil {
+				continue
+			}
+			temp, err := os.MkdirTemp(store, "unpacking-")
+			if err != nil {
+				return fmt.Errorf("create layer directory: %w", err)
+			}
+			err = unpackLayer(blob, layer, st.image.config.RootFS.DiffIDs[i], temp, b.uids, b.gids)
+			if err == nil {
+				err = os.Rename(temp, dir)
+			}
+			if err != nil {
+				os.RemoveAll(temp)
+				if _, statErr := os.Stat(dir); statErr == nil {
+					// Another runt finished unpacking it first.
+					continue
+				}
+				return fmt.Errorf("unpack layer %s: %w", layer.Digest, err)
+			}
+		}
+		// The manifest lists layers bottom first; overlayfs wants them top
+		// first.
+		slices.Reverse(dirs)
+		layers = dirs
+	} else {
+		empty := filepath.Join(b.dir, "empty")
+		if err := os.MkdirAll(empty, 0o755); err != nil {
+			return err
+		}
+		layers = []string{empty}
 	}
 	id, err := newID()
 	if err != nil {
@@ -794,38 +925,88 @@ func (b *builder) copy(st *buildStage, inst instruction) error {
 		return err
 	}
 	defer os.RemoveAll(stateDir(StateRoot, id))
-	merged, err := mountContainerFS(id, layers, b.uids, b.gids)
-	if err != nil {
-		return err
+	// Mount the filesystem: an overlay of layers, given top first, under a
+	// new writable layer. merged is its mount point.
+	if len(layers) == 0 {
+		return errors.New("no filesystem layers")
+	}
+	for _, layer := range layers {
+		// The mount options use these to separate layers and options.
+		if strings.ContainsAny(layer, ":,\\") {
+			return fmt.Errorf("layer path %q contains ':', ',', or '\\', which overlayfs can't take", layer)
+		}
+	}
+	// 0711 lets anyone pass through the top directory, and the
+	// filesystem's own directory lets in only its group, container
+	// root's, as for a container's.
+	if err := os.MkdirAll(containerFSRoot, 0o711); err != nil {
+		return fmt.Errorf("create %s: %w", containerFSRoot, err)
+	}
+	fsDir := containerFSDir(id)
+	if err := os.Mkdir(fsDir, 0o710); err != nil {
+		return fmt.Errorf("create container filesystem directory: %w", err)
+	}
+	// cleanup removes what has been made so far, on any failure from here
+	// on.
+	cleanup := func() { os.RemoveAll(fsDir) }
+	if err := os.Chown(fsDir, 0, b.gids.Base); err != nil {
+		cleanup()
+		return fmt.Errorf("set owner of %s: %w", fsDir, err)
+	}
+	upper := filepath.Join(fsDir, "upper")
+	work := filepath.Join(fsDir, "work")
+	merged := filepath.Join(fsDir, "rootfs")
+	// The root directory of the overlay takes its owner and mode from the
+	// writable layer: container root, with the mode of the top layer's
+	// root.
+	rootMode := os.FileMode(0o755)
+	if info, err := os.Stat(layers[0]); err == nil {
+		rootMode = info.Mode().Perm()
+	}
+	// The steps are a slice of anonymous functions, run in order, so that
+	// one error check covers them all.
+	for _, step := range []func() error{
+		func() error { return os.Mkdir(upper, rootMode) },
+		func() error { return os.Chmod(upper, rootMode) }, // undo the umask
+		func() error { return os.Chown(upper, b.uids.Base, b.gids.Base) },
+		func() error { return os.Mkdir(work, 0o700) },
+		func() error { return os.Mkdir(merged, 0o755) },
+	} {
+		if err := step(); err != nil {
+			cleanup()
+			return fmt.Errorf("prepare container filesystem: %w", err)
+		}
+	}
+	// The overlay's options name its layers: lowerdir lists the read-only
+	// ones, top first and separated by colons, upperdir is the writable
+	// one, and workdir the scratch space. redirect_dir=off and
+	// metacopy=off keep the writable layer complete in itself, so it can
+	// be turned into an image layer (see the overlay in supervise).
+	options := fmt.Sprintf("lowerdir=%s,upperdir=%s,workdir=%s,redirect_dir=off,metacopy=off", strings.Join(layers, ":"), upper, work)
+	// Mount options must fit in one page.
+	if len(options) >= os.Getpagesize() {
+		cleanup()
+		return fmt.Errorf("too many layers (%d) to fit overlayfs's mount options", len(layers))
+	}
+	// nodev: an image could contain device files, and a mount made by host
+	// root would let the container open them.
+	if err := syscall.Mount("overlay", merged, "overlay", syscall.MS_NODEV, options); err != nil {
+		cleanup()
+		return fmt.Errorf("mount overlay filesystem: %w", err)
 	}
 	defer func() {
 		if err := removeContainerFS(id); err != nil {
 			warn(err)
 		}
 	}()
-	if err := b.copyFiles(merged, found, dest, destDir, add, flags); err != nil {
-		return err
-	}
-	if err := unmountContainerFS(id); err != nil {
-		return err
-	}
-	layer, err := exportLayer(filepath.Join(containerFSDir(id), "upper"), b.uids, b.gids, nil, b.dir)
-	if err != nil {
-		return err
-	}
-	unlock()
-	return b.commit(st, key, inst, layer, nil)
-}
-
-// copyFiles writes the sources into the image's filesystem at merged, at
-// dest, as COPY or ADD does:
-//
-//   - a directory's contents go into dest;
-//   - a file goes into dest if dest is a directory (or ends in /), or else
-//     becomes dest;
-//   - for ADD, a local archive is unpacked into dest, and a download is a
-//     file named for its URL.
-func (b *builder) copyFiles(merged string, sources []copySource, dest string, destDir, add bool, flags map[string]string) error {
+	// Write the sources into the image's filesystem at merged, at dest, as
+	// COPY or ADD does:
+	//
+	//   - a directory's contents go into dest;
+	//   - a file goes into dest if dest is a directory (or ends in /), or
+	//     else becomes dest;
+	//   - for ADD, a local archive is unpacked into dest, and a download is
+	//     a file named for its URL.
 	writer := &rootWriter{root: merged, uids: b.uids, gids: b.gids}
 	if spec := flags["chown"]; spec != "" {
 		owner, err := parseChown(spec, merged)
@@ -854,12 +1035,18 @@ func (b *builder) copyFiles(merged string, sources []copySource, dest string, de
 		info, err := os.Stat(host)
 		return err == nil && info.IsDir()
 	}
-	for _, source := range sources {
+	for _, source := range found {
 		switch {
 		case source.url != "":
 			target := dest
 			if intoDest() {
-				target = path.Join(dest, urlBase(source.url))
+				// The file name ADD gives what it downloads: the last part
+				// of the URL's path.
+				base := ""
+				if u, err := url.Parse(source.url); err == nil {
+					base = path.Base(u.Path)
+				}
+				target = path.Join(dest, base)
 			}
 			if err := writer.copySource(source, target); err != nil {
 				return err
@@ -890,60 +1077,18 @@ func (b *builder) copyFiles(merged string, sources []copySource, dest string, de
 			}
 		}
 	}
-	return writer.finish()
-}
-
-// fromImage finds the image COPY --from names: an earlier stage, by name or
-// number, or else an image, pulled first if the store doesn't have it.
-func (b *builder) fromImage(from string) (*ociImage, error) {
-	if n, err := strconv.Atoi(from); err == nil {
-		if n < 0 || n >= len(b.stages) {
-			return nil, fmt.Errorf("--from=%d: there is no stage %d before this one", n, n)
-		}
-		return b.stages[n].image, nil
+	if err := writer.finish(); err != nil {
+		return err
 	}
-	name := strings.ToLower(from)
-	for _, stage := range b.stages {
-		if stage.name == name {
-			return stage.image, nil
-		}
+	if err := unmountContainerFS(id); err != nil {
+		return err
 	}
-	if slices.ContainsFunc(b.file.stages, func(stage *dockerStage) bool { return stage.name == name }) {
-		return nil, fmt.Errorf("--from=%s: a stage can only copy from stages before it", from)
-	}
-	found, err := b.baseImage(from)
-	if err != nil {
-		return nil, err
-	}
-	return found.image, nil
-}
-
-// unpack unpacks an image's layers for a mount, as a container's would be.
-// An image with none yet, FROM scratch, gets an empty directory, since
-// overlayfs needs at least one.
-func (b *builder) unpack(image *ociImage) ([]string, error) {
-	if len(image.manifest.Layers) > 0 {
-		return unpackImage(image, b.uids, b.gids)
-	}
-	empty := filepath.Join(b.dir, "empty")
-	if err := os.MkdirAll(empty, 0o755); err != nil {
-		return nil, err
-	}
-	return []string{empty}, nil
-}
-
-// configure runs an instruction that only changes the image's
-// configuration.
-func (b *builder) configure(st *buildStage, inst instruction) error {
-	change, err := b.configChange(st, inst)
+	layer, err := exportLayer(filepath.Join(containerFSDir(id), "upper"), b.uids, b.gids, nil, b.dir)
 	if err != nil {
 		return err
 	}
-	key := b.stepKey(st, inst, "")
-	if b.useCache(st, key) {
-		return nil
-	}
-	return b.commit(st, key, inst, nil, change)
+	unlock()
+	return b.commit(st, key, inst, layer, nil)
 }
 
 // configChange works out what an instruction changes in the image's
@@ -1041,9 +1186,30 @@ func (b *builder) configChange(st *buildStage, inst instruction) (func(config *o
 		if err != nil {
 			return nil, err
 		}
-		ports, err := exposedPorts(words)
-		if err != nil {
-			return nil, err
+		// EXPOSE's ports: PORT, PORT/PROTOCOL, or a range,
+		// START-END[/PROTOCOL]. The protocol is tcp unless given.
+		var ports []string
+		for _, word := range words {
+			number, protocol, _ := strings.Cut(word, "/")
+			protocol = strings.ToLower(protocol)
+			if protocol == "" {
+				protocol = "tcp"
+			}
+			if protocol != "tcp" && protocol != "udp" && protocol != "sctp" {
+				return nil, fmt.Errorf("EXPOSE %s: the protocol must be tcp, udp, or sctp", word)
+			}
+			first, last, isRange := strings.Cut(number, "-")
+			if !isRange {
+				last = first
+			}
+			start, err1 := strconv.ParseUint(first, 10, 16)
+			end, err2 := strconv.ParseUint(last, 10, 16)
+			if err1 != nil || err2 != nil || start == 0 || end < start {
+				return nil, fmt.Errorf("EXPOSE %s: not a port or range of ports", word)
+			}
+			for port := start; port <= end; port++ {
+				ports = append(ports, fmt.Sprintf("%d/%s", port, protocol))
+			}
 		}
 		return func(config *ociImageConfig) error {
 			if config.Config.ExposedPorts == nil {
@@ -1080,9 +1246,46 @@ func (b *builder) configChange(st *buildStage, inst instruction) (func(config *o
 			return nil
 		}, nil
 	case "HEALTHCHECK":
-		check, err := parseHealthcheck(inst)
-		if err != nil {
-			return nil, err
+		// HEALTHCHECK [OPTIONS] CMD COMMAND, or HEALTHCHECK NONE, which
+		// turns off the base image's. runt doesn't run health checks
+		// itself, but keeps them in the image, as Docker does, for whatever
+		// runs it.
+		var check *ociHealthcheck
+		kind, rest := cutSpace(inst.args)
+		if strings.EqualFold(kind, "NONE") {
+			if rest != "" || len(inst.flags) > 0 {
+				return nil, errors.New("HEALTHCHECK NONE takes nothing else")
+			}
+			check = &ociHealthcheck{Test: []string{"NONE"}}
+		} else {
+			if !strings.EqualFold(kind, "CMD") || rest == "" {
+				return nil, errors.New("HEALTHCHECK takes CMD and a command, or NONE")
+			}
+			check = &ociHealthcheck{Test: []string{"CMD-SHELL", rest}}
+			var list []string
+			if strings.HasPrefix(rest, "[") && json.Unmarshal([]byte(rest), &list) == nil {
+				check.Test = append([]string{"CMD"}, list...)
+			}
+			durations := map[string]*time.Duration{
+				"interval": &check.Interval, "timeout": &check.Timeout,
+				"start-period": &check.StartPeriod, "start-interval": &check.StartInterval,
+			}
+			for name, field := range durations {
+				if text, ok := inst.flags[name]; ok {
+					duration, err := time.ParseDuration(text)
+					if err != nil || (duration != 0 && duration < time.Millisecond) {
+						return nil, fmt.Errorf("--%s=%s: give a duration of at least 1ms, such as 30s", name, text)
+					}
+					*field = duration
+				}
+			}
+			if text, ok := inst.flags["retries"]; ok {
+				retries, err := strconv.Atoi(text)
+				if err != nil || retries < 0 {
+					return nil, fmt.Errorf("--retries=%s: give a number", text)
+				}
+				check.Retries = retries
+			}
 		}
 		return func(config *ociImageConfig) error {
 			config.Config.Healthcheck = check
@@ -1090,76 +1293,4 @@ func (b *builder) configChange(st *buildStage, inst instruction) (func(config *o
 		}, nil
 	}
 	return nil, fmt.Errorf("unknown instruction %s", inst.command)
-}
-
-// exposedPorts reads EXPOSE's ports: PORT, PORT/PROTOCOL, or a range,
-// START-END[/PROTOCOL]. The protocol is tcp unless given.
-func exposedPorts(words []string) ([]string, error) {
-	var ports []string
-	for _, word := range words {
-		number, protocol, _ := strings.Cut(word, "/")
-		protocol = strings.ToLower(protocol)
-		if protocol == "" {
-			protocol = "tcp"
-		}
-		if protocol != "tcp" && protocol != "udp" && protocol != "sctp" {
-			return nil, fmt.Errorf("EXPOSE %s: the protocol must be tcp, udp, or sctp", word)
-		}
-		first, last, isRange := strings.Cut(number, "-")
-		if !isRange {
-			last = first
-		}
-		start, err1 := strconv.ParseUint(first, 10, 16)
-		end, err2 := strconv.ParseUint(last, 10, 16)
-		if err1 != nil || err2 != nil || start == 0 || end < start {
-			return nil, fmt.Errorf("EXPOSE %s: not a port or range of ports", word)
-		}
-		for port := start; port <= end; port++ {
-			ports = append(ports, fmt.Sprintf("%d/%s", port, protocol))
-		}
-	}
-	return ports, nil
-}
-
-// parseHealthcheck reads HEALTHCHECK [OPTIONS] CMD COMMAND, or HEALTHCHECK
-// NONE, which turns off the base image's. runt doesn't run health checks
-// itself, but keeps them in the image, as Docker does, for whatever runs
-// it.
-func parseHealthcheck(inst instruction) (*ociHealthcheck, error) {
-	kind, rest := cutSpace(inst.args)
-	if strings.EqualFold(kind, "NONE") {
-		if rest != "" || len(inst.flags) > 0 {
-			return nil, errors.New("HEALTHCHECK NONE takes nothing else")
-		}
-		return &ociHealthcheck{Test: []string{"NONE"}}, nil
-	}
-	if !strings.EqualFold(kind, "CMD") || rest == "" {
-		return nil, errors.New("HEALTHCHECK takes CMD and a command, or NONE")
-	}
-	check := &ociHealthcheck{Test: []string{"CMD-SHELL", rest}}
-	var list []string
-	if strings.HasPrefix(rest, "[") && json.Unmarshal([]byte(rest), &list) == nil {
-		check.Test = append([]string{"CMD"}, list...)
-	}
-	durations := map[string]*time.Duration{
-		"interval": &check.Interval, "timeout": &check.Timeout,
-		"start-period": &check.StartPeriod, "start-interval": &check.StartInterval,
-	}
-	for name, field := range durations {
-		if text, ok := inst.flags[name]; ok {
-			duration, err := time.ParseDuration(text)
-			if err != nil || (duration != 0 && duration < time.Millisecond) {
-				return nil, fmt.Errorf("--%s=%s: give a duration of at least 1ms, such as 30s", name, text)
-			}
-			*field = duration
-		}
-	}
-	if text, ok := inst.flags["retries"]; ok {
-		retries, err := strconv.Atoi(text)
-		if err != nil || retries < 0 {
-			return nil, fmt.Errorf("--retries=%s: give a number", text)
-		}
-		check.Retries = retries
-	}
-	return check, nil
 }

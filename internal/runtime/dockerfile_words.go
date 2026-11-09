@@ -135,8 +135,35 @@ func (s *wordScanner) scan(split bool, stop rune) ([]string, error) {
 			s.pos = end + 1
 		case ch == '"':
 			s.pos++
-			if err := s.doubleQuoted(&word); err != nil {
-				return nil, err
+			// The rest of a double-quoted string, up to and past its closing
+			// quote. Inside, the escape character only escapes ", $, and
+			// itself.
+			escapable := `"$` + string(s.lexer.escape)
+			closed := false
+		quoted:
+			for s.pos < len(s.text) {
+				ch := s.text[s.pos]
+				switch {
+				case ch == '"':
+					s.pos++
+					closed = true
+					break quoted
+				case ch == s.lexer.escape && s.pos+1 < len(s.text) && strings.ContainsRune(escapable, s.text[s.pos+1]):
+					word.WriteRune(s.text[s.pos+1])
+					s.pos += 2
+				case ch == '$':
+					value, err := s.variable()
+					if err != nil {
+						return nil, err
+					}
+					word.WriteString(value)
+				default:
+					word.WriteRune(ch)
+					s.pos++
+				}
+			}
+			if !closed {
+				return nil, errors.New("a double quote is never closed")
 			}
 		case ch == '$':
 			value, err := s.variable()
@@ -156,34 +183,6 @@ func (s *wordScanner) scan(split bool, stop rune) ([]string, error) {
 	return words, nil
 }
 
-// doubleQuoted reads the rest of a double-quoted string, up to and past its
-// closing quote, into word. Inside, the escape character only escapes ",
-// $, and itself.
-func (s *wordScanner) doubleQuoted(word *strings.Builder) error {
-	escapable := `"$` + string(s.lexer.escape)
-	for s.pos < len(s.text) {
-		ch := s.text[s.pos]
-		switch {
-		case ch == '"':
-			s.pos++
-			return nil
-		case ch == s.lexer.escape && s.pos+1 < len(s.text) && strings.ContainsRune(escapable, s.text[s.pos+1]):
-			word.WriteRune(s.text[s.pos+1])
-			s.pos += 2
-		case ch == '$':
-			value, err := s.variable()
-			if err != nil {
-				return err
-			}
-			word.WriteString(value)
-		default:
-			word.WriteRune(ch)
-			s.pos++
-		}
-	}
-	return errors.New("a double quote is never closed")
-}
-
 // variable reads a variable reference starting at the $ at pos, and returns
 // its value. A $ not followed by a name or { is just a $.
 func (s *wordScanner) variable() (string, error) {
@@ -192,7 +191,18 @@ func (s *wordScanner) variable() (string, error) {
 		return "$", nil
 	}
 	if s.text[s.pos] != '{' {
-		name := s.name()
+		// The variable's name at pos: a letter or _, then letters, digits, and
+		// _. It is "" if there isn't one.
+		start := s.pos
+		for s.pos < len(s.text) {
+			ch := s.text[s.pos]
+			letter := ch == '_' || (ch >= 'a' && ch <= 'z') || (ch >= 'A' && ch <= 'Z')
+			if !letter && (s.pos == start || ch < '0' || ch > '9') {
+				break
+			}
+			s.pos++
+		}
+		name := string(s.text[start:s.pos])
 		if name == "" {
 			return "$", nil
 		}
@@ -201,7 +211,18 @@ func (s *wordScanner) variable() (string, error) {
 	}
 
 	s.pos++
-	name := s.name()
+	// The variable's name at pos: a letter or _, then letters, digits, and
+	// _. It is "" if there isn't one.
+	start := s.pos
+	for s.pos < len(s.text) {
+		ch := s.text[s.pos]
+		letter := ch == '_' || (ch >= 'a' && ch <= 'z') || (ch >= 'A' && ch <= 'Z')
+		if !letter && (s.pos == start || ch < '0' || ch > '9') {
+			break
+		}
+		s.pos++
+	}
+	name := string(s.text[start:s.pos])
 	if name == "" || s.pos >= len(s.text) {
 		return "", errors.New("bad variable reference: ${ must be followed by a name and }")
 	}
@@ -263,19 +284,4 @@ func (s *wordScanner) variable() (string, error) {
 		}
 	}
 	return value, nil
-}
-
-// name reads a variable's name at pos: a letter or _, then letters, digits,
-// and _. It returns "" if there isn't one.
-func (s *wordScanner) name() string {
-	start := s.pos
-	for s.pos < len(s.text) {
-		ch := s.text[s.pos]
-		letter := ch == '_' || (ch >= 'a' && ch <= 'z') || (ch >= 'A' && ch <= 'Z')
-		if !letter && (s.pos == start || ch < '0' || ch > '9') {
-			break
-		}
-		s.pos++
-	}
-	return string(s.text[start:s.pos])
 }

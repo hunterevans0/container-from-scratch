@@ -8,13 +8,8 @@ package runtime
 // can have some and not others. Before running the container's command, init
 // drops all but the 14 Docker leaves a container, so that root inside the
 // container can do ordinary root work but not administer the system. For how
-// to read the Go here, see doc.go.
-
-import (
-	"fmt"
-	"syscall"
-	"unsafe"
-)
+// to read the Go here, see doc.go. The capabilities are dropped in
+// setupContainer (runtime_linux.go) and ExecInit (exec_linux.go).
 
 // Capability numbers from <linux/capability.h>.
 const (
@@ -76,48 +71,4 @@ type capData struct {
 	effective   uint32
 	permitted   uint32
 	inheritable uint32
-}
-
-// dropCapabilities reduces this process to defaultCapabilities. Capabilities
-// are per thread, so every call goes through AllThreadsSyscall to cover all of
-// the Go runtime's threads; that needs a binary built without cgo.
-func dropCapabilities() error {
-	// The bitmask of capabilities to keep: 1 << n is a number with only
-	// bit n set, and |= sets that bit in keep.
-	var keep uint32
-	for _, capability := range defaultCapabilities {
-		keep |= 1 << capability
-	}
-
-	// The bounding set limits what any later exec can gain, including a root
-	// process, which otherwise gets every capability back. Dropping from it
-	// needs CAP_SETPCAP, so this comes before capset. EINVAL means we are
-	// past the last capability this kernel knows.
-	for capability := uintptr(0); capability < 64; capability++ {
-		// Skip the ones to keep: keep & (1 << n) is non-zero if bit n is
-		// set in keep.
-		if capability < 32 && keep&(1<<capability) != 0 {
-			continue
-		}
-		_, _, errno := syscall.AllThreadsSyscall(syscall.SYS_PRCTL, syscall.PR_CAPBSET_DROP, capability, 0)
-		if errno == syscall.EINVAL {
-			break
-		}
-		if errno != 0 {
-			return fmt.Errorf("drop capability %d from bounding set: %w", capability, errno)
-		}
-	}
-
-	// The inheritable set stays empty, as in Docker. data is an array of two
-	// capData; only the first, for capabilities 0 to 31, has anything set.
-	header := capHeader{version: linuxCapabilityVersion3}
-	data := [2]capData{{effective: keep, permitted: keep}}
-	// A system call takes plain numbers, so the structs are passed by their
-	// memory addresses: unsafe.Pointer(&header) is header's address, which
-	// uintptr turns into a number. The unsafe package is how Go code steps
-	// outside its type safety for this kind of thing.
-	if _, _, errno := syscall.AllThreadsSyscall(syscall.SYS_CAPSET, uintptr(unsafe.Pointer(&header)), uintptr(unsafe.Pointer(&data)), 0); errno != 0 {
-		return fmt.Errorf("set capabilities: %w", errno)
-	}
-	return nil
 }

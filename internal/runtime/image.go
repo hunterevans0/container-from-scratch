@@ -191,20 +191,7 @@ func isLayoutRef(ref string) bool {
 // architectures, it picks the one runt is running on.
 func openImage(ref string) (*ociImage, error) {
 	layout, tag := splitImageRef(ref)
-	index, err := readLayoutIndex(layout)
-	if err != nil {
-		return nil, err
-	}
-	desc, err := pickTagged(index.Manifests, tag)
-	if err != nil {
-		return nil, fmt.Errorf("image layout %s: %w", layout, err)
-	}
-	return loadImage(layout, desc)
-}
-
-// readLayoutIndex checks that layout is an OCI image layout and reads its
-// index.json.
-func readLayoutIndex(layout string) (*ociIndex, error) {
+	// Check that layout is an OCI image layout and read its index.json.
 	var marker struct {
 		Version string `json:"imageLayoutVersion"`
 	}
@@ -215,26 +202,41 @@ func readLayoutIndex(layout string) (*ociIndex, error) {
 	if err := readJSONFile(filepath.Join(layout, "index.json"), &index); err != nil {
 		return nil, err
 	}
-	return &index, nil
-}
-
-// loadImage reads the manifest desc points to in layout, following an index
-// to this platform's manifest, and the image configuration it names. The
-// image must have layers, to be run.
-func loadImage(layout string, desc ociDescriptor) (*ociImage, error) {
-	image, err := readImage(layout, desc)
-	if err != nil {
-		return nil, err
+	// Choose the entry of index.json with tag, or the only entry (or the
+	// one tagged latest) when there is no tag.
+	var desc ociDescriptor
+	picked := false
+	var tags []string
+	for _, entry := range index.Manifests {
+		ref := entry.Annotations[annotationRefName]
+		name := entry.Annotations[annotationImageName]
+		if tag != "" && (ref == tag || name == tag || strings.HasSuffix(name, ":"+tag)) {
+			desc, picked = entry, true
+			break
+		}
+		if tag == "" && ref == "latest" {
+			desc, picked = entry, true
+			break
+		}
+		if ref != "" {
+			tags = append(tags, ref)
+		}
 	}
-	if len(image.manifest.Layers) == 0 {
-		return nil, errors.New("image has no layers")
+	if !picked {
+		switch {
+		case tag == "" && len(index.Manifests) == 1:
+			desc = index.Manifests[0]
+		case len(index.Manifests) == 0:
+			return nil, fmt.Errorf("image layout %s: %w", layout, errors.New("index.json lists no images"))
+		case tag == "":
+			return nil, fmt.Errorf("image layout %s: %w", layout, fmt.Errorf("it holds several images; add :TAG (tags: %s)", strings.Join(tags, ", ")))
+		default:
+			return nil, fmt.Errorf("image layout %s: %w", layout, fmt.Errorf("no image tagged %q (tags: %s)", tag, strings.Join(tags, ", ")))
+		}
 	}
-	return image, nil
-}
-
-// readImage is loadImage for an image that may have no layers at all, as
-// runt build's are while they are built FROM scratch.
-func readImage(layout string, desc ociDescriptor) (*ociImage, error) {
+	// Read the manifest desc points to in layout, following an index to
+	// this platform's manifest, and the image configuration it names. The
+	// image must have layers, to be run.
 	image := &ociImage{layout: layout}
 	var err error
 	if image.manifest, err = image.resolveManifest(desc, 0); err != nil {
@@ -253,36 +255,10 @@ func readImage(layout string, desc ociDescriptor) (*ociImage, error) {
 	if len(image.config.RootFS.DiffIDs) != len(image.manifest.Layers) {
 		return nil, fmt.Errorf("image manifest has %d layers, but its configuration lists %d", len(image.manifest.Layers), len(image.config.RootFS.DiffIDs))
 	}
+	if len(image.manifest.Layers) == 0 {
+		return nil, errors.New("image has no layers")
+	}
 	return image, nil
-}
-
-// pickTagged chooses the entry of index.json with tag, or the only entry
-// (or the one tagged latest) when there is no tag.
-func pickTagged(entries []ociDescriptor, tag string) (ociDescriptor, error) {
-	var tags []string
-	for _, entry := range entries {
-		ref := entry.Annotations[annotationRefName]
-		name := entry.Annotations[annotationImageName]
-		if tag != "" && (ref == tag || name == tag || strings.HasSuffix(name, ":"+tag)) {
-			return entry, nil
-		}
-		if tag == "" && ref == "latest" {
-			return entry, nil
-		}
-		if ref != "" {
-			tags = append(tags, ref)
-		}
-	}
-	if tag == "" && len(entries) == 1 {
-		return entries[0], nil
-	}
-	if len(entries) == 0 {
-		return ociDescriptor{}, errors.New("index.json lists no images")
-	}
-	if tag == "" {
-		return ociDescriptor{}, fmt.Errorf("it holds several images; add :TAG (tags: %s)", strings.Join(tags, ", "))
-	}
-	return ociDescriptor{}, fmt.Errorf("no image tagged %q (tags: %s)", tag, strings.Join(tags, ", "))
 }
 
 // resolveManifest reads the manifest desc points to. If it is an index, it

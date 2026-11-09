@@ -18,7 +18,7 @@ import (
 // runt gives every container an /etc/hosts and an /etc/resolv.conf of its
 // own, as Docker does: images come without a resolv.conf, since Docker
 // writes one, and the hosts file names the container's own address. The
-// supervisor writes them (see etcFiles), and init mounts them over the
+// supervisor writes them (see supervise), and init mounts them over the
 // container's own files (see mountEtcFiles), so the image and its layers
 // are left as they are.
 //
@@ -31,28 +31,6 @@ import (
 
 // defaultHostname is the container's hostname unless it is given one.
 const defaultHostname = "runt"
-
-// etcFiles are the files for a container's /etc, by path: its hostname and
-// address in /etc/hosts, if it has one, and in /etc/resolv.conf, the DNS
-// servers it should use. network is nil for a container with --network
-// none.
-func etcFiles(hostname string, network *containerNetwork) map[string]string {
-	if hostname == "" {
-		hostname = defaultHostname
-	}
-	var ip net.IP
-	embeddedDNS := false
-	if network != nil {
-		ip = network.reservation.ip
-		embeddedDNS = network.network.dns
-	}
-	// A map literal: each key, the file's path, with its value, the file's
-	// contents.
-	return map[string]string{
-		"/etc/hosts":       hostsFile(hostname, ip),
-		"/etc/resolv.conf": containerResolvConf(hostResolvConf(), embeddedDNS).String(),
-	}
-}
 
 // hostsFile is /etc/hosts for a container with hostname and, if it isn't
 // nil, address ip, with the same entries for localhost as Docker's. Each
@@ -119,23 +97,6 @@ func (c resolvConf) String() string {
 		fmt.Fprintf(&b, "options %s\n", strings.Join(c.options, " "))
 	}
 	return b.String()
-}
-
-// hostResolvConf reads the host's DNS configuration. On a host whose
-// resolver is systemd-resolved, /etc/resolv.conf names only its stub server
-// at 127.0.0.53, and the servers it asks are in
-// /run/systemd/resolve/resolv.conf, as Docker knows to look.
-func hostResolvConf() resolvConf {
-	// The error is ignored (_): a host with no resolv.conf has no servers,
-	// which containerResolvConf makes up for.
-	data, _ := os.ReadFile("/etc/resolv.conf")
-	conf := parseResolvConf(string(data))
-	if slices.Equal(conf.nameservers, []string{"127.0.0.53"}) {
-		if data, err := os.ReadFile("/run/systemd/resolve/resolv.conf"); err == nil {
-			conf = parseResolvConf(string(data))
-		}
-	}
-	return conf
 }
 
 // fallbackNameservers are the DNS servers Docker gives a container when the
@@ -226,34 +187,34 @@ func mountEtcFiles(files map[string]string, keepRoot bool) error {
 		if err := os.WriteFile(source, []byte(content), 0o644); err != nil {
 			return fmt.Errorf("write %s: %w", path, err)
 		}
-		if err := mountTarget(path); err != nil {
-			return fmt.Errorf("create %s to mount over: %w", path, err)
+		// Make sure there is a file at path to mount over. This runs after
+		// pivot_root, so a symlink there can only lead to a file in the
+		// container. One that leads nowhere, such as to systemd-resolved's
+		// file in /run, is replaced with an empty file, as is no file at
+		// all.
+		//
+		// os.Stat follows symlinks, so it fails with ErrNotExist both when
+		// there is nothing at path and when a symlink there leads nowhere.
+		// Any other error is a failure; success means there is something
+		// to mount over already.
+		if _, err := os.Stat(path); !errors.Is(err, os.ErrNotExist) {
+			if err != nil {
+				return fmt.Errorf("create %s to mount over: %w", path, err)
+			}
+		} else {
+			if err := os.Remove(path); err != nil && !errors.Is(err, os.ErrNotExist) {
+				return fmt.Errorf("create %s to mount over: %w", path, err)
+			}
+			if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+				return fmt.Errorf("create %s to mount over: %w", path, err)
+			}
+			if err := os.WriteFile(path, nil, 0o644); err != nil {
+				return fmt.Errorf("create %s to mount over: %w", path, err)
+			}
 		}
 		if err := syscall.Mount(source, path, "", syscall.MS_BIND, ""); err != nil {
 			return fmt.Errorf("bind mount %s: %w", path, err)
 		}
 	}
 	return nil
-}
-
-// mountTarget makes sure there is a file at path to mount over. This runs
-// after pivot_root, so a symlink there can only lead to a file in the
-// container. One that leads nowhere, such as to systemd-resolved's file in
-// /run, is replaced with an empty file, as is no file at all.
-//
-// os.Stat follows symlinks, so it fails with ErrNotExist both when there is
-// nothing at path and when a symlink there leads nowhere. Any other result,
-// success included, is returned as it is: nil means there is something to
-// mount over already.
-func mountTarget(path string) error {
-	if _, err := os.Stat(path); !errors.Is(err, os.ErrNotExist) {
-		return err
-	}
-	if err := os.Remove(path); err != nil && !errors.Is(err, os.ErrNotExist) {
-		return err
-	}
-	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
-		return err
-	}
-	return os.WriteFile(path, nil, 0o644)
 }

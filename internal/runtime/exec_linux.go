@@ -71,10 +71,17 @@ func Exec(ref string, command []string, options ExecOptions) error {
 		// its master back on descriptor 4, as init does for the container's
 		// own terminal.
 		tty = "tty"
-		var child *os.File
-		if consoleSocket, child, err = consoleSocketPair(); err != nil {
-			return err
+		// The Unix socket the pseudo-terminal's master is sent over. Our end
+		// stays a raw descriptor for recvmsg; the child end is passed to the
+		// process that makes the pseudo-terminal. socketpair makes two sockets
+		// already connected to each other, like the two ends of a pipe that works
+		// both ways.
+		var fds [2]int
+		if fds, err = syscall.Socketpair(syscall.AF_UNIX, syscall.SOCK_STREAM|syscall.SOCK_CLOEXEC, 0); err != nil {
+			return fmt.Errorf("create console socket: %w", err)
 		}
+		consoleSocket = fds[0]
+		child := os.NewFile(uintptr(fds[1]), "console socket")
 		defer syscall.Close(consoleSocket)
 		defer child.Close()
 		extraFiles = append(extraFiles, child)
@@ -136,9 +143,37 @@ func Exec(ref string, command []string, options ExecOptions) error {
 	// Each signal that arrives on the channel is sent on to the command.
 	// sig is an os.Signal, an interface; sig.(syscall.Signal) takes out the
 	// signal number it holds, which syscall.Kill wants.
+	//
+	// The command is found as the child of nsenter: nsenter has a single
+	// child, which ExecInit replaces with the command. pid is its PID, or 0
+	// if there is none. Looking through /proc/<pid>/stat for every process
+	// gives each one's parent. Sscanf reads values out of a string as a
+	// format says, as C's scanf does: %c a character, %d a number.
 	go func() {
 		for sig := range signals {
-			if pid := childOf(nsenterCommand.Process.Pid); pid > 0 {
+			parent := nsenterCommand.Process.Pid
+			pid := 0
+			stats, _ := filepath.Glob("/proc/[0-9]*/stat")
+			for _, path := range stats {
+				data, err := os.ReadFile(path)
+				if err != nil {
+					continue
+				}
+				// The fields after the command name, which is in parentheses
+				// and may contain anything, start with the state and then the
+				// parent.
+				end := bytes.LastIndexByte(data, ')')
+				if end < 0 {
+					continue
+				}
+				var processState byte
+				var ppid int
+				if _, err := fmt.Sscanf(string(data[end+1:]), " %c %d", &processState, &ppid); err == nil && ppid == parent {
+					pid, _ = strconv.Atoi(filepath.Base(filepath.Dir(path)))
+					break
+				}
+			}
+			if pid > 0 {
 				syscall.Kill(pid, sig.(syscall.Signal))
 			}
 		}
@@ -154,11 +189,61 @@ func Exec(ref string, command []string, options ExecOptions) error {
 		// socket, and nsenter's exit status says what happened.
 		if console, err = receiveFile(consoleSocket, "console"); err == nil {
 			defer console.Close()
-			disconnect, err := connectTerminal(console, options.Interactive)
-			if err != nil {
+			// Connect runt's own terminal to the container's pseudo-terminal:
+			// give the pseudo-terminal the same size and keep it in step when the
+			// window is resized, and with options.Interactive put the terminal in raw mode and
+			// send what is typed to the container. Undoing this is deferred.
+			//
+			// The terminal to copy the size from: runt's input, or else its output,
+			// whichever is a terminal.
+			var source *os.File
+			for _, file := range []*os.File{os.Stdin, os.Stdout} {
+				if isTerminal(file) {
+					source = file
+					break
+				}
+			}
+			resize := func() {
+				size := defaultWinsize
+				if source != nil {
+					// The terminal's size, in rows and columns.
+					var current winsize
+					if err := ioctl(source, syscall.TIOCGWINSZ, unsafe.Pointer(&current)); err == nil && current.rows > 0 && current.cols > 0 {
+						size = current
+					}
+				}
+				setWinsize(console, size)
+			}
+			resize()
+			// The kernel sends SIGWINCH when runt's terminal window is resized.
+			// signal.Notify delivers it on the channel winch instead of applying
+			// its default action, and the goroutine resizes the container's
+			// pseudo-terminal each time one comes. "for range winch" loops over
+			// values received from the channel, until it is closed.
+			winch := make(chan os.Signal, 1)
+			signal.Notify(winch, syscall.SIGWINCH)
+			go func() {
+				for range winch {
+					resize()
+				}
+			}()
+			stopResizing := func() {
+				signal.Stop(winch)
+				close(winch)
+			}
+			if !options.Interactive {
+				defer stopResizing()
+			} else if restore, err := makeRaw(os.Stdin); err != nil {
+				stopResizing()
 				warn(err)
 			} else {
-				defer disconnect()
+				// This copy ends at the first read after the container is gone, or
+				// when runt exits.
+				go io.Copy(console, os.Stdin)
+				defer func() {
+					stopResizing()
+					restore()
+				}()
 			}
 			output = make(chan struct{})
 			go func() {
@@ -179,34 +264,6 @@ func Exec(ref string, command []string, options ExecOptions) error {
 		<-output
 	}
 	return err
-}
-
-// childOf returns the PID of a child of process parent, or 0 if it has none.
-// nsenter has a single child, which ExecInit replaces with the command.
-// It looks through /proc/<pid>/stat for every process, which gives each
-// one's parent. Sscanf reads values out of a string as a format says, as C's
-// scanf does: %c a character, %d a number.
-func childOf(parent int) int {
-	stats, _ := filepath.Glob("/proc/[0-9]*/stat")
-	for _, path := range stats {
-		data, err := os.ReadFile(path)
-		if err != nil {
-			continue
-		}
-		// The fields after the command name, which is in parentheses and
-		// may contain anything, start with the state and then the parent.
-		end := bytes.LastIndexByte(data, ')')
-		if end < 0 {
-			continue
-		}
-		var state byte
-		var ppid int
-		if _, err := fmt.Sscanf(string(data[end+1:]), " %c %d", &state, &ppid); err == nil && ppid == parent {
-			pid, _ := strconv.Atoi(filepath.Base(filepath.Dir(path)))
-			return pid
-		}
-	}
-	return 0
 }
 
 // ExecInit runs inside the container, started by nsenter on behalf of Exec,
@@ -233,8 +290,67 @@ func ExecInit() error {
 	}
 	if tty {
 		syscall.CloseOnExec(4)
-		if err := useNewTerminal(os.NewFile(4, "console socket")); err != nil {
+		// Make a pseudo-terminal in the container, send its master to runt
+		// exec over socket, and make the slave this process's controlling
+		// terminal and its standard input, output, and error.
+		socket := os.NewFile(4, "console socket")
+		// Make a new pseudo-terminal pair from /dev/ptmx. Neither end becomes
+		// this process's controlling terminal.
+		//
+		// Opening /dev/ptmx makes a new pair and returns its master end; the slave
+		// end appears as /dev/pts/N, which is then opened by name.
+		masterFD, err := syscall.Open("/dev/ptmx", syscall.O_RDWR|syscall.O_NOCTTY|syscall.O_CLOEXEC, 0)
+		if err != nil {
+			return fmt.Errorf("open /dev/ptmx: %w", err)
+		}
+		master := os.NewFile(uintptr(masterFD), "/dev/ptmx")
+		// A new slave is locked until the master unlocks it (unlockpt), and its
+		// number says which /dev/pts entry it is (ptsname).
+		var unlock int32
+		if err := ioctl(master, syscall.TIOCSPTLCK, unsafe.Pointer(&unlock)); err != nil {
+			master.Close()
+			return fmt.Errorf("unlock pseudo-terminal: %w", err)
+		}
+		var number uint32
+		if err := ioctl(master, syscall.TIOCGPTN, unsafe.Pointer(&number)); err != nil {
+			master.Close()
+			return fmt.Errorf("get pseudo-terminal number: %w", err)
+		}
+		ptsPath := fmt.Sprintf("/dev/pts/%d", number)
+		slaveFD, err := syscall.Open(ptsPath, syscall.O_RDWR|syscall.O_NOCTTY|syscall.O_CLOEXEC, 0)
+		if err != nil {
+			master.Close()
+			return fmt.Errorf("open %s: %w", ptsPath, err)
+		}
+		slave := os.NewFile(uintptr(slaveFD), ptsPath)
+		err = sendFile(socket, master)
+		master.Close()
+		if err != nil {
+			slave.Close()
 			return err
+		}
+		// runt exec sends a byte once it has sized the terminal.
+		if _, err := socket.Read(make([]byte, 1)); err != nil {
+			slave.Close()
+			return fmt.Errorf("wait for terminal: %w", err)
+		}
+		socket.Close()
+
+		// A controlling terminal belongs to a session, so start one. This
+		// process isn't a process group leader (nsenter is), so it may.
+		if _, err := syscall.Setsid(); err != nil {
+			return fmt.Errorf("start session: %w", err)
+		}
+		// dup3 copies a descriptor onto a given number: here the terminal
+		// onto 0, 1, and 2, standard input, output, and error.
+		for fd := 0; fd <= 2; fd++ {
+			if err := syscall.Dup3(int(slave.Fd()), fd, 0); err != nil {
+				return fmt.Errorf("use terminal: %w", err)
+			}
+		}
+		slave.Close()
+		if err := ioctl(os.Stdin, syscall.TIOCSCTTY, unsafe.Pointer(nil)); err != nil {
+			return fmt.Errorf("set controlling terminal: %w", err)
 		}
 	}
 
@@ -246,63 +362,78 @@ func ExecInit() error {
 			return err
 		}
 	}
-	if err := setNoNewPrivs(); err != nil {
-		return err
+	// no_new_privs makes exec stop granting privileges: setuid and setgid
+	// bits and file capabilities are ignored from here on, in this process
+	// and all its descendants. It is per thread, so it goes through
+	// AllThreadsSyscall like the capability calls. AllThreadsSyscall6 is
+	// the form for system calls that take up to six arguments.
+	if _, _, errno := syscall.AllThreadsSyscall6(syscall.SYS_PRCTL, prSetNoNewPrivs, 1, 0, 0, 0, 0); errno != 0 {
+		return fmt.Errorf("set no_new_privs: %w", errno)
 	}
-	if err := dropCapabilities(); err != nil {
-		return err
+	// Reduce this process to defaultCapabilities. Capabilities are per
+	// thread, so every call goes through AllThreadsSyscall to cover all of
+	// the Go runtime's threads; that needs a binary built without cgo.
+	//
+	// The bitmask of capabilities to keep: 1 << n is a number with only
+	// bit n set, and |= sets that bit in keep.
+	var keep uint32
+	for _, capability := range defaultCapabilities {
+		keep |= 1 << capability
+	}
+	// The bounding set limits what any later exec can gain, including a root
+	// process, which otherwise gets every capability back. Dropping from it
+	// needs CAP_SETPCAP, so this comes before capset. EINVAL means we are
+	// past the last capability this kernel knows.
+	for capability := uintptr(0); capability < 64; capability++ {
+		// Skip the ones to keep: keep & (1 << n) is non-zero if bit n is
+		// set in keep.
+		if capability < 32 && keep&(1<<capability) != 0 {
+			continue
+		}
+		_, _, errno := syscall.AllThreadsSyscall(syscall.SYS_PRCTL, syscall.PR_CAPBSET_DROP, capability, 0)
+		if errno == syscall.EINVAL {
+			break
+		}
+		if errno != 0 {
+			return fmt.Errorf("drop capability %d from bounding set: %w", capability, errno)
+		}
+	}
+	// The inheritable set stays empty, as in Docker. data is an array of two
+	// capData; only the first, for capabilities 0 to 31, has anything set.
+	header := capHeader{version: linuxCapabilityVersion3}
+	data := [2]capData{{effective: keep, permitted: keep}}
+	// A system call takes plain numbers, so the structs are passed by their
+	// memory addresses: unsafe.Pointer(&header) is header's address, which
+	// uintptr turns into a number. The unsafe package is how Go code steps
+	// outside its type safety for this kind of thing.
+	if _, _, errno := syscall.AllThreadsSyscall(syscall.SYS_CAPSET, uintptr(unsafe.Pointer(&header)), uintptr(unsafe.Pointer(&data)), 0); errno != 0 {
+		return fmt.Errorf("set capabilities: %w", errno)
 	}
 	if err := installSeccomp(); err != nil {
 		return err
 	}
-	if err := closeExtraFiles(); err != nil {
-		return err
+	// Make sure the command inherits only stdin, stdout, and stderr, as runc
+	// does. Go opens its own files close-on-exec, but runt can inherit open
+	// descriptors from whatever started it (WSL leaves some terminal
+	// descriptors open, for example), and those would otherwise pass into
+	// the container.
+	entries, err := os.ReadDir("/proc/self/fd")
+	if err != nil {
+		return fmt.Errorf("list open files: %w", err)
+	}
+	// /proc/self/fd has an entry per open descriptor, named by its number.
+	// Marking one close-on-exec makes the kernel close it when the process
+	// runs another program, so the command never sees it.
+	for _, entry := range entries {
+		if fd, err := strconv.Atoi(entry.Name()); err == nil && fd > 2 {
+			syscall.CloseOnExec(fd)
+		}
 	}
 	// syscall.Exec replaces this process with the command: the same
 	// process, with the same PID, namespaces, and restrictions, but running
 	// the command's program. On success it never returns.
 	if err := syscall.Exec(path, command, os.Environ()); err != nil {
 		return &commandError{fmt.Errorf("exec %s: %w", command[0], err)}
-	}
-	return nil
-}
-
-// useNewTerminal makes a pseudo-terminal in the container, sends its master
-// to runt exec over socket, and makes the slave this process's controlling
-// terminal and its standard input, output, and error.
-func useNewTerminal(socket *os.File) error {
-	master, slave, err := openPTY()
-	if err != nil {
-		return err
-	}
-	err = sendFile(socket, master)
-	master.Close()
-	if err != nil {
-		slave.Close()
-		return err
-	}
-	// runt exec sends a byte once it has sized the terminal.
-	if _, err := socket.Read(make([]byte, 1)); err != nil {
-		slave.Close()
-		return fmt.Errorf("wait for terminal: %w", err)
-	}
-	socket.Close()
-
-	// A controlling terminal belongs to a session, so start one. This
-	// process isn't a process group leader (nsenter is), so it may.
-	if _, err := syscall.Setsid(); err != nil {
-		return fmt.Errorf("start session: %w", err)
-	}
-	// dup3 copies a descriptor onto a given number: here the terminal onto
-	// 0, 1, and 2, standard input, output, and error.
-	for fd := 0; fd <= 2; fd++ {
-		if err := syscall.Dup3(int(slave.Fd()), fd, 0); err != nil {
-			return fmt.Errorf("use terminal: %w", err)
-		}
-	}
-	slave.Close()
-	if err := ioctl(os.Stdin, syscall.TIOCSCTTY, unsafe.Pointer(nil)); err != nil {
-		return fmt.Errorf("set controlling terminal: %w", err)
 	}
 	return nil
 }

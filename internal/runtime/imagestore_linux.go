@@ -14,6 +14,7 @@ import (
 	"regexp"
 	"slices"
 	"strings"
+	"syscall"
 	"time"
 )
 
@@ -120,7 +121,18 @@ func (s *imageStore) readIndex() (*ociIndex, error) {
 	if _, err := os.Stat(filepath.Join(s.dir, "index.json")); errors.Is(err, os.ErrNotExist) {
 		return &ociIndex{SchemaVersion: 2, MediaType: mediaTypeImageIndex}, nil
 	}
-	return readLayoutIndex(s.dir)
+	// Check that the store is an OCI image layout and read its index.json.
+	var marker struct {
+		Version string `json:"imageLayoutVersion"`
+	}
+	if err := readJSONFile(filepath.Join(s.dir, "oci-layout"), &marker); err != nil || marker.Version == "" {
+		return nil, fmt.Errorf("%s is not an OCI image layout (no valid oci-layout file)", s.dir)
+	}
+	var index ociIndex
+	if err := readJSONFile(filepath.Join(s.dir, "index.json"), &index); err != nil {
+		return nil, err
+	}
+	return &index, nil
 }
 
 // writeIndex replaces index.json, creating the layout if it doesn't exist.
@@ -224,8 +236,29 @@ func (s *imageStore) list() ([]storedImage, error) {
 	}
 	var images []storedImage
 	for _, entry := range index.Manifests {
-		image, err := loadImage(s.dir, entry)
+		// Read the manifest entry points to in the store, following an index to
+		// this platform's manifest, and the image configuration it names.
+		image := &ociImage{layout: s.dir}
+		var err error
+		if image.manifest, err = image.resolveManifest(entry, 0); err != nil {
+			continue
+		}
+		data, err := image.readBlob(image.manifest.Config)
 		if err != nil {
+			continue
+		}
+		if err := json.Unmarshal(data, &image.config); err != nil {
+			continue
+		}
+		if image.config.OS != "" && image.config.OS != "linux" {
+			continue
+		}
+		if len(image.config.RootFS.DiffIDs) != len(image.manifest.Layers) {
+			continue
+		}
+		// The image must have layers, to be run; one that can't be read, or
+		// has none, is left out.
+		if len(image.manifest.Layers) == 0 {
 			continue
 		}
 		images = append(images, storedImage{entry: entry, name: entryName(entry), image: image})
@@ -244,7 +277,26 @@ func (s *imageStore) find(text string) (storedImage, error) {
 	if err != nil {
 		return storedImage{}, err
 	}
-	matches := s.match(images, text)
+	// The images text names: the one with that name, or else every image whose
+	// ID starts with it.
+	var matches []storedImage
+	named := false
+	if parsed, err := parseReference(text); err == nil {
+		for _, image := range images {
+			if image.name == parsed.String() || image.name == text {
+				matches, named = []storedImage{image}, true
+				break
+			}
+		}
+	}
+	if !named && imageIDPrefix.MatchString(text) {
+		prefix := "sha256:" + strings.TrimPrefix(text, "sha256:")
+		for _, image := range images {
+			if strings.HasPrefix(image.id(), prefix) {
+				matches = append(matches, image)
+			}
+		}
+	}
 	if len(matches) == 0 {
 		return storedImage{}, fmt.Errorf("%w: %s", errNoSuchImage, text)
 	}
@@ -256,43 +308,6 @@ func (s *imageStore) find(text string) (storedImage, error) {
 		}
 	}
 	return matches[0], nil
-}
-
-// match returns the images text names: the one with that name, or else every
-// image whose ID starts with it.
-func (s *imageStore) match(images []storedImage, text string) []storedImage {
-	if ref, err := parseReference(text); err == nil {
-		for _, image := range images {
-			if image.name == ref.String() || image.name == text {
-				return []storedImage{image}
-			}
-		}
-	}
-	if !imageIDPrefix.MatchString(text) {
-		return nil
-	}
-	prefix := "sha256:" + strings.TrimPrefix(text, "sha256:")
-	var matches []storedImage
-	for _, image := range images {
-		if strings.HasPrefix(image.id(), prefix) {
-			matches = append(matches, image)
-		}
-	}
-	return matches
-}
-
-// openImageRef opens the image ref names: an OCI image layout directory, or
-// else an image in the store. With an image from the store, the caller
-// should hold its lock.
-func openImageRef(ref string) (*ociImage, error) {
-	if isLayoutRef(ref) {
-		return openImage(ref)
-	}
-	found, err := defaultImageStore().find(ref)
-	if err != nil {
-		return nil, err
-	}
-	return found.image, nil
 }
 
 // EnsureImage makes sure the image ref names is available, pulling it into
@@ -361,7 +376,13 @@ func (s *imageStore) pull(ref imageReference, out io.Writer) error {
 
 	fmt.Fprintf(out, "Pulling %s\n", ref.familiar())
 	client := newRegistryClient(ref, out)
-	desc, data, err := client.fetchManifest(ref.manifestRef())
+	// What to ask the registry for: the digest if there is one, or else
+	// the tag.
+	manifestRef := ref.Tag
+	if ref.Digest != "" {
+		manifestRef = ref.Digest
+	}
+	desc, data, err := client.fetchManifest(manifestRef)
 	if err != nil {
 		return err
 	}
@@ -601,7 +622,26 @@ func (s *imageStore) remove(ref string, force bool, stateRoot string, out io.Wri
 	if err != nil {
 		return err
 	}
-	matches := s.match(images, ref)
+	// The images ref names: the one with that name, or else every image whose
+	// ID starts with it.
+	var matches []storedImage
+	named := false
+	if parsed, err := parseReference(ref); err == nil {
+		for _, image := range images {
+			if image.name == parsed.String() || image.name == ref {
+				matches, named = []storedImage{image}, true
+				break
+			}
+		}
+	}
+	if !named && imageIDPrefix.MatchString(ref) {
+		prefix := "sha256:" + strings.TrimPrefix(ref, "sha256:")
+		for _, image := range images {
+			if strings.HasPrefix(image.id(), prefix) {
+				matches = append(matches, image)
+			}
+		}
+	}
 	if len(matches) == 0 {
 		return fmt.Errorf("%w: %s", errNoSuchImage, ref)
 	}
@@ -800,23 +840,6 @@ func (s *imageStore) writeBlob(mediaType string, data []byte) (ociDescriptor, er
 	return desc, os.Rename(path+".tmp", path)
 }
 
-// moveBlob moves the file at path into the store as the blob with digest.
-// The file must be on the same filesystem as the store. The caller holds
-// the lock exclusively.
-func (s *imageStore) moveBlob(path, digest string) error {
-	target, err := s.blobPath(digest)
-	if err != nil {
-		return err
-	}
-	if err := os.MkdirAll(filepath.Dir(target), 0o700); err != nil {
-		return fmt.Errorf("create image store: %w", err)
-	}
-	if err := os.Rename(path, target); err != nil {
-		return fmt.Errorf("store blob %s: %w", digest, err)
-	}
-	return nil
-}
-
 // readCache reads runt build's cache, which is empty if there isn't one.
 func (s *imageStore) readCache() (*ociIndex, error) {
 	cache := &ociIndex{SchemaVersion: 2, MediaType: mediaTypeImageIndex}
@@ -825,19 +848,6 @@ func (s *imageStore) readCache() (*ociIndex, error) {
 		return cache, nil
 	}
 	return cache, err
-}
-
-// writeCache replaces runt build's cache. The caller holds the lock
-// exclusively.
-func (s *imageStore) writeCache(cache *ociIndex) error {
-	data, err := json.MarshalIndent(cache, "", "  ")
-	if err != nil {
-		return err
-	}
-	if err := os.WriteFile(s.cache+".tmp", append(data, '\n'), 0o600); err != nil {
-		return fmt.Errorf("write build cache: %w", err)
-	}
-	return os.Rename(s.cache+".tmp", s.cache)
 }
 
 // annotationCacheKey holds the key of a build step an image in runt build's
@@ -856,10 +866,28 @@ func (s *imageStore) cached(key string) (ociDescriptor, *ociImage, bool) {
 		if entry.Annotations[annotationCacheKey] != key {
 			continue
 		}
-		image, err := readImage(s.dir, entry)
+		// Read the manifest entry points to in the store, following an index to
+		// this platform's manifest, and the image configuration it names.
+		image := &ociImage{layout: s.dir}
+		var err error
+		if image.manifest, err = image.resolveManifest(entry, 0); err != nil {
+			return ociDescriptor{}, nil, false
+		}
+		data, err := image.readBlob(image.manifest.Config)
 		if err != nil {
 			return ociDescriptor{}, nil, false
 		}
+		if err := json.Unmarshal(data, &image.config); err != nil {
+			return ociDescriptor{}, nil, false
+		}
+		if image.config.OS != "" && image.config.OS != "linux" {
+			return ociDescriptor{}, nil, false
+		}
+		if len(image.config.RootFS.DiffIDs) != len(image.manifest.Layers) {
+			return ociDescriptor{}, nil, false
+		}
+		// It may have no layers at all, as runt build's images do while they
+		// are built FROM scratch.
 		for _, layer := range image.manifest.Layers {
 			if !s.hasBlob(layer.Digest) {
 				return ociDescriptor{}, nil, false
@@ -887,7 +915,15 @@ func (s *imageStore) addToCache(key string, desc ociDescriptor) error {
 	}
 	desc.Annotations = map[string]string{annotationCacheKey: key}
 	cache.Manifests = append(kept, desc)
-	return s.writeCache(cache)
+	// Replace the cache. The caller holds the lock exclusively.
+	data, err := json.MarshalIndent(cache, "", "  ")
+	if err != nil {
+		return err
+	}
+	if err := os.WriteFile(s.cache+".tmp", append(data, '\n'), 0o600); err != nil {
+		return fmt.Errorf("write build cache: %w", err)
+	}
+	return os.Rename(s.cache+".tmp", s.cache)
 }
 
 // nameBuilt gives the image runt build made, whose manifest desc describes,
@@ -976,27 +1012,54 @@ func (s *imageStore) pruneCache(stateRoot string) (int, int64, error) {
 	if err != nil {
 		return 0, 0, err
 	}
-	before := s.blobsSize()
+	// The size of all the store's blobs together, before and after.
+	blobs, _ := os.ReadDir(filepath.Join(s.dir, "blobs", "sha256"))
+	var before int64
+	for _, entry := range blobs {
+		if info, err := entry.Info(); err == nil {
+			before += info.Size()
+		}
+	}
 	if err := os.Remove(s.cache); err != nil && !errors.Is(err, os.ErrNotExist) {
 		return 0, 0, err
 	}
 	if err := s.collectGarbage(true, states); err != nil {
 		return 0, 0, err
 	}
-	removeStaleBuilds(s.builds)
-	return len(cache.Manifests), before - s.blobsSize(), nil
-}
-
-// blobsSize is the size of all the store's blobs together.
-func (s *imageStore) blobsSize() int64 {
-	entries, _ := os.ReadDir(filepath.Join(s.dir, "blobs", "sha256"))
-	var total int64
-	for _, entry := range entries {
+	// Remove what builds that never finished left in s.builds: their directories,
+	// whose lock no build holds any more. One made in the last minute may not
+	// have taken its lock yet, so it is left alone.
+	builds, _ := os.ReadDir(s.builds)
+	for _, entry := range builds {
+		build := filepath.Join(s.builds, entry.Name())
+		info, err := entry.Info()
+		if err != nil || time.Since(info.ModTime()) < time.Minute {
+			continue
+		}
+		lock, err := os.Open(filepath.Join(build, "lock"))
+		if err == nil {
+			// LOCK_NB: fail at once, rather than wait, if a build holds it.
+			err = flock(lock, syscall.LOCK_EX|syscall.LOCK_NB)
+			lock.Close()
+		}
+		if err != nil && !errors.Is(err, os.ErrNotExist) {
+			continue
+		}
+		// COPY --from's mounts, if it died with them mounted.
+		mounts, _ := filepath.Glob(filepath.Join(build, "from-*"))
+		for _, mount := range mounts {
+			syscall.Unmount(mount, syscall.MNT_DETACH)
+		}
+		os.RemoveAll(build)
+	}
+	blobs, _ = os.ReadDir(filepath.Join(s.dir, "blobs", "sha256"))
+	var after int64
+	for _, entry := range blobs {
 		if info, err := entry.Info(); err == nil {
-			total += info.Size()
+			after += info.Size()
 		}
 	}
-	return total
+	return len(cache.Manifests), before - after, nil
 }
 
 // Push uploads an image in the store to its registry, as docker push does.

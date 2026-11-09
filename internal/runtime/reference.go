@@ -152,12 +152,3 @@ func (ref imageReference) registryHost() string {
 	}
 	return ref.Domain
 }
-
-// manifestRef is what to ask the registry for: the digest if there is one,
-// or else the tag.
-func (ref imageReference) manifestRef() string {
-	if ref.Digest != "" {
-		return ref.Digest
-	}
-	return ref.Tag
-}

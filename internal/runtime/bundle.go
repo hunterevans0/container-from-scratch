@@ -8,6 +8,7 @@ import (
 	"path"
 	"path/filepath"
 	"slices"
+	"strconv"
 	"strings"
 )
 
@@ -118,8 +119,8 @@ var standardMounts = []specMount{
 //   - linux.uidMappings and gidMappings, each a single range starting at
 //     container ID 0. Without them runt uses /etc/subuid and /etc/subgid.
 //   - linux.resources: memory.limit, cpu.quota and period, and pids.limit.
-//   - mounts: bind mounts and tmpfs mounts (see bundleMount), besides the
-//     standard ones runt makes anyway.
+//   - mounts: bind mounts and tmpfs mounts (see the loop over spec.Mounts
+//     below), besides the standard ones runt makes anyway.
 //
 // Other kinds of mount, and linux.namespaces naming an existing namespace
 // to join, runt rejects, rather than quietly running the container
@@ -148,11 +149,89 @@ func LoadBundle(config *Config) error {
 	// runt makes the standard mounts its own way; the rest it makes as -v
 	// and --tmpfs would.
 	for _, mount := range spec.Mounts {
-		if isStandardMount(mount.Destination) {
+		// One of standardMounts? path.Clean tidies a path, as in /dev/ ->
+		// /dev, so either way matches.
+		standard := false
+		for _, standardMount := range standardMounts {
+			if path.Clean(mount.Destination) == standardMount.Destination {
+				standard = true
+				break
+			}
+		}
+		if standard {
 			continue
 		}
-		m, err := bundleMount(dir, mount)
-		if err != nil {
+		// Any other mount becomes a Mount: a bind mount (type bind, or an
+		// option bind or rbind), whose source is relative to the bundle or
+		// absolute, or a tmpfs. Their options are as in mount(8). Unlike
+		// with --tmpfs, a tmpfs has only the options it lists.
+		m := Mount{Destination: mount.Destination}
+		switch {
+		case mount.Type == "tmpfs":
+			// The tmpfs's options, a later option winning over an earlier
+			// one. Besides those in mountFlagOptions, it takes size=SIZE,
+			// as in 64m (see ParseBytes), and mode=MODE, the permissions of
+			// its root directory in octal, as in 1777 (the default). They
+			// come out in a set order, with the size in bytes.
+			on := map[string]bool{}
+			var size, mode string
+			for _, option := range mount.Options {
+				key, value, hasValue := strings.Cut(option, "=")
+				flag, isFlag := mountFlagOptions[option]
+				switch {
+				case isFlag:
+					on[flag.option] = flag.on
+				case key == "size" && hasValue:
+					bytes, err := ParseBytes(value)
+					if err != nil || bytes <= 0 {
+						return fmt.Errorf("bundle %s: mount at %s: %w", dir, mount.Destination, fmt.Errorf("invalid size %q", value))
+					}
+					size = "size=" + strconv.FormatInt(bytes, 10)
+				case key == "mode" && hasValue:
+					// Base 8, at most 32 bits, as the permissions are written
+					// in octal.
+					bits, err := strconv.ParseUint(value, 8, 32)
+					if err != nil || bits > 0o7777 {
+						return fmt.Errorf("bundle %s: mount at %s: %w", dir, mount.Destination, fmt.Errorf("invalid mode %q; give it in octal, as in 1777", value))
+					}
+					mode = "mode=" + strconv.FormatUint(bits, 8)
+				default:
+					return fmt.Errorf("bundle %s: mount at %s: %w", dir, mount.Destination, fmt.Errorf("unsupported option %q; use size=, mode=, ro, rw, exec, noexec, suid, nosuid, dev, or nodev", option))
+				}
+			}
+			var options []string
+			for _, option := range []string{"ro", "nosuid", "nodev", "noexec"} {
+				if on[option] {
+					options = append(options, option)
+				}
+			}
+			for _, option := range []string{size, mode} {
+				if option != "" {
+					options = append(options, option)
+				}
+			}
+			m.Type, m.Options = MountTmpfs, options
+		case mount.Type == "bind" || slices.Contains(mount.Options, "bind") || slices.Contains(mount.Options, "rbind"):
+			if mount.Source == "" {
+				return fmt.Errorf("bundle %s: mount at %s: %w", dir, mount.Destination, errors.New("a bind mount needs a source"))
+			}
+			m.Type, m.Source = MountBind, mount.Source
+			if !filepath.IsAbs(m.Source) {
+				m.Source = filepath.Join(dir, m.Source)
+			}
+			for _, option := range mount.Options {
+				if !slices.Contains(bundleOptions, option) {
+					return fmt.Errorf("bundle %s: mount at %s: %w", dir, mount.Destination, fmt.Errorf("unsupported option %q", option))
+				}
+				// rw and the rest are runt's anyway.
+				if flag, ok := mountFlagOptions[option]; ok && flag.on {
+					m.Options = append(m.Options, option)
+				}
+			}
+		default:
+			return fmt.Errorf("bundle %s: mount at %s: %w", dir, mount.Destination, fmt.Errorf("type %q is not supported; runt makes bind and tmpfs mounts, besides its standard ones (/proc, /dev, /sys, ...)", mount.Type))
+		}
+		if err := checkDestination(m); err != nil {
 			return fmt.Errorf("bundle %s: mount at %s: %w", dir, mount.Destination, err)
 		}
 		config.Mounts = append(config.Mounts, m)
@@ -193,11 +272,26 @@ func LoadBundle(config *Config) error {
 			return fmt.Errorf("bundle %s: joining an existing %s namespace is not supported", dir, namespace.Type)
 		}
 	}
-	if config.UIDs, err = specIDRange(spec.Linux.UIDMappings, "uidMappings"); err != nil {
-		return fmt.Errorf("bundle %s: %w", dir, err)
+	// Each ID mapping in config.json must be the single range runt
+	// supports. A switch with nothing after the word switch tries each
+	// case's condition in turn, like a chain of if and else if.
+	switch mappings := spec.Linux.UIDMappings; {
+	case len(mappings) == 0:
+		config.UIDs = IDRange{}
+	case len(mappings) > 1 || mappings[0].ContainerID != 0 || mappings[0].Size == 0:
+		config.UIDs = IDRange{}
+		return fmt.Errorf("bundle %s: %w", dir, fmt.Errorf("linux.%s must be a single range starting at container ID 0", "uidMappings"))
+	default:
+		config.UIDs = IDRange{Base: int(mappings[0].HostID), Size: int(mappings[0].Size)}
 	}
-	if config.GIDs, err = specIDRange(spec.Linux.GIDMappings, "gidMappings"); err != nil {
-		return fmt.Errorf("bundle %s: %w", dir, err)
+	switch mappings := spec.Linux.GIDMappings; {
+	case len(mappings) == 0:
+		config.GIDs = IDRange{}
+	case len(mappings) > 1 || mappings[0].ContainerID != 0 || mappings[0].Size == 0:
+		config.GIDs = IDRange{}
+		return fmt.Errorf("bundle %s: %w", dir, fmt.Errorf("linux.%s must be a single range starting at container ID 0", "gidMappings"))
+	default:
+		config.GIDs = IDRange{Base: int(mappings[0].HostID), Size: int(mappings[0].Size)}
 	}
 	if (config.UIDs.Size == 0) != (config.GIDs.Size == 0) {
 		return fmt.Errorf("bundle %s: give both uidMappings and gidMappings, or neither", dir)
@@ -227,72 +321,10 @@ func LoadBundle(config *Config) error {
 // quota is given, in microseconds.
 const cpuPeriodDefault = 100000
 
-// isStandardMount reports whether destination is one of standardMounts.
-// path.Clean tidies a path, as in /dev/ -> /dev, so either way matches.
-func isStandardMount(destination string) bool {
-	for _, mount := range standardMounts {
-		if path.Clean(destination) == mount.Destination {
-			return true
-		}
-	}
-	return false
-}
-
 // bundleOptions are the options runt takes on a bind mount in config.json.
 // It always makes them as bind does with rbind, and private, so those
 // options change nothing.
 var bundleOptions = []string{"bind", "rbind", "private", "rprivate", "rw", "ro", "nosuid", "nodev", "noexec"}
-
-// bundleMount turns a mount in config.json, other than the standard ones,
-// into a Mount: a bind mount (type bind, or an option bind or rbind), whose
-// source is relative to the bundle or absolute, or a tmpfs. Their options
-// are as in mount(8). Unlike with --tmpfs, a tmpfs has only the options it
-// lists.
-func bundleMount(dir string, mount specMount) (Mount, error) {
-	m := Mount{Destination: mount.Destination}
-	switch {
-	case mount.Type == "tmpfs":
-		options, err := tmpfsOptions(nil, mount.Options)
-		if err != nil {
-			return Mount{}, err
-		}
-		m.Type, m.Options = MountTmpfs, options
-	case mount.Type == "bind" || slices.Contains(mount.Options, "bind") || slices.Contains(mount.Options, "rbind"):
-		if mount.Source == "" {
-			return Mount{}, errors.New("a bind mount needs a source")
-		}
-		m.Type, m.Source = MountBind, mount.Source
-		if !filepath.IsAbs(m.Source) {
-			m.Source = filepath.Join(dir, m.Source)
-		}
-		for _, option := range mount.Options {
-			if !slices.Contains(bundleOptions, option) {
-				return Mount{}, fmt.Errorf("unsupported option %q", option)
-			}
-			// rw and the rest are runt's anyway.
-			if flag, ok := mountFlagOptions[option]; ok && flag.on {
-				m.Options = append(m.Options, option)
-			}
-		}
-	default:
-		return Mount{}, fmt.Errorf("type %q is not supported; runt makes bind and tmpfs mounts, besides its standard ones (/proc, /dev, /sys, ...)", mount.Type)
-	}
-	return m, checkDestination(m)
-}
-
-// specIDRange turns a config.json ID mapping into the single range runt
-// supports.
-// A switch with nothing after the word switch tries each case's condition
-// in turn, like a chain of if and else if.
-func specIDRange(mappings []specIDMapping, field string) (IDRange, error) {
-	switch {
-	case len(mappings) == 0:
-		return IDRange{}, nil
-	case len(mappings) > 1 || mappings[0].ContainerID != 0 || mappings[0].Size == 0:
-		return IDRange{}, fmt.Errorf("linux.%s must be a single range starting at container ID 0", field)
-	}
-	return IDRange{Base: int(mappings[0].HostID), Size: int(mappings[0].Size)}, nil
-}
 
 // WriteSpec writes a starting config.json into dir, as runc spec does, for a
 // root filesystem at rootfs. It runs sh on a terminal as container root,

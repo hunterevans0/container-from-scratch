@@ -51,42 +51,11 @@ func (r iptablesRule) run(command string) error {
 	return err
 }
 
-// exists reports whether the rule is there. iptables -C (check) succeeds if
+// remove deletes the rule, if it is there. iptables -C (check) succeeds if
 // it is, and fails if it isn't.
-func (r iptablesRule) exists() bool {
-	return r.run("-C") == nil
-}
-
-// insert puts the rule first in its chain, ahead of any rules that would
-// drop the packets, unless it is there already. Checking first makes
-// setting up a network safe to repeat, which it is, for every container.
-func (r iptablesRule) insert() error {
-	if r.exists() {
-		return nil
-	}
-	return r.run("-I")
-}
-
-// add puts the rule last in its chain.
-func (r iptablesRule) add() error {
-	return r.run("-A")
-}
-
-// remove deletes the rule, if it is there.
 func (r iptablesRule) remove() error {
-	if !r.exists() {
+	if r.run("-C") != nil {
 		return nil
 	}
 	return r.run("-D")
-}
-
-// ensureChain makes a chain of our own, unless it is there already.
-// iptables -L lists a chain, and fails if there is no such chain; -N makes
-// a new one.
-func ensureChain(table, chain string) error {
-	if _, err := runIptables("-t", table, "-n", "-L", chain); err == nil {
-		return nil
-	}
-	_, err := runIptables("-t", table, "-N", chain)
-	return err
 }

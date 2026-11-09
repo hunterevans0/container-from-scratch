@@ -76,17 +76,55 @@ func ParseVolume(s string) (Mount, error) {
 var tmpfsDefaults = []string{"nosuid", "nodev", "noexec"}
 
 // ParseTmpfs parses a --tmpfs option, DESTINATION[:OPTIONS], as Docker takes
-// it, as in /run:size=64m,mode=755. OPTIONS are separated by commas (see
-// tmpfsOptions).
+// it, as in /run:size=64m,mode=755. OPTIONS are separated by commas.
 func ParseTmpfs(s string) (Mount, error) {
 	destination, list, hasOptions := strings.Cut(s, ":")
 	var given []string
 	if hasOptions {
 		given = strings.Split(list, ",")
 	}
-	options, err := tmpfsOptions(tmpfsDefaults, given)
-	if err != nil {
-		return Mount{}, fmt.Errorf("invalid tmpfs %q: %w", s, err)
+	// The mount's options: tmpfsDefaults, then given, a later option
+	// winning over an earlier one. Besides those in mountFlagOptions, it
+	// takes size=SIZE, as in 64m (see ParseBytes), and mode=MODE, the
+	// permissions of its root directory in octal, as in 1777 (the default).
+	// They come out in a set order, with the size in bytes.
+	on := map[string]bool{}
+	var size, mode string
+	// slices.Concat joins the two lists into a new one.
+	for _, option := range slices.Concat(tmpfsDefaults, given) {
+		key, value, hasValue := strings.Cut(option, "=")
+		flag, isFlag := mountFlagOptions[option]
+		switch {
+		case isFlag:
+			on[flag.option] = flag.on
+		case key == "size" && hasValue:
+			bytes, err := ParseBytes(value)
+			if err != nil || bytes <= 0 {
+				return Mount{}, fmt.Errorf("invalid tmpfs %q: %w", s, fmt.Errorf("invalid size %q", value))
+			}
+			size = "size=" + strconv.FormatInt(bytes, 10)
+		case key == "mode" && hasValue:
+			// Base 8, at most 32 bits, as the permissions are written in
+			// octal.
+			bits, err := strconv.ParseUint(value, 8, 32)
+			if err != nil || bits > 0o7777 {
+				return Mount{}, fmt.Errorf("invalid tmpfs %q: %w", s, fmt.Errorf("invalid mode %q; give it in octal, as in 1777", value))
+			}
+			mode = "mode=" + strconv.FormatUint(bits, 8)
+		default:
+			return Mount{}, fmt.Errorf("invalid tmpfs %q: %w", s, fmt.Errorf("unsupported option %q; use size=, mode=, ro, rw, exec, noexec, suid, nosuid, dev, or nodev", option))
+		}
+	}
+	var options []string
+	for _, option := range []string{"ro", "nosuid", "nodev", "noexec"} {
+		if on[option] {
+			options = append(options, option)
+		}
+	}
+	for _, option := range []string{size, mode} {
+		if option != "" {
+			options = append(options, option)
+		}
 	}
 	mount := Mount{Type: MountTmpfs, Destination: destination, Options: options}
 	return mount, checkDestination(mount)
@@ -103,53 +141,6 @@ var mountFlagOptions = map[string]struct {
 	"nosuid": {"nosuid", true}, "suid": {"nosuid", false},
 	"nodev": {"nodev", true}, "dev": {"nodev", false},
 	"noexec": {"noexec", true}, "exec": {"noexec", false},
-}
-
-// tmpfsOptions works out a tmpfs mount's options: defaults, then given, a
-// later option winning over an earlier one. Besides those in
-// mountFlagOptions, it takes size=SIZE, as in 64m (see ParseBytes), and
-// mode=MODE, the permissions of its root directory in octal, as in 1777 (the
-// default). It returns them in a set order, with the size in bytes.
-func tmpfsOptions(defaults, given []string) ([]string, error) {
-	on := map[string]bool{}
-	var size, mode string
-	// slices.Concat joins the two lists into a new one.
-	for _, option := range slices.Concat(defaults, given) {
-		key, value, hasValue := strings.Cut(option, "=")
-		flag, isFlag := mountFlagOptions[option]
-		switch {
-		case isFlag:
-			on[flag.option] = flag.on
-		case key == "size" && hasValue:
-			bytes, err := ParseBytes(value)
-			if err != nil || bytes <= 0 {
-				return nil, fmt.Errorf("invalid size %q", value)
-			}
-			size = "size=" + strconv.FormatInt(bytes, 10)
-		case key == "mode" && hasValue:
-			// Base 8, at most 32 bits, as the permissions are written in
-			// octal.
-			bits, err := strconv.ParseUint(value, 8, 32)
-			if err != nil || bits > 0o7777 {
-				return nil, fmt.Errorf("invalid mode %q; give it in octal, as in 1777", value)
-			}
-			mode = "mode=" + strconv.FormatUint(bits, 8)
-		default:
-			return nil, fmt.Errorf("unsupported option %q; use size=, mode=, ro, rw, exec, noexec, suid, nosuid, dev, or nodev", option)
-		}
-	}
-	var options []string
-	for _, option := range []string{"ro", "nosuid", "nodev", "noexec"} {
-		if on[option] {
-			options = append(options, option)
-		}
-	}
-	for _, option := range []string{size, mode} {
-		if option != "" {
-			options = append(options, option)
-		}
-	}
-	return options, nil
 }
 
 // checkDestination checks where a mount goes in the container: an absolute
@@ -175,11 +166,6 @@ func checkDestination(mount Mount) error {
 // isUnder reports whether p is dir, or inside it. Both are clean paths.
 func isUnder(p, dir string) bool {
 	return p == dir || strings.HasPrefix(p, dir+"/")
-}
-
-// hasOption reports whether a mount has option, such as ro.
-func (m Mount) hasOption(option string) bool {
-	return slices.Contains(m.Options, option)
 }
 
 // sortMounts checks a container's mounts against each other, and returns

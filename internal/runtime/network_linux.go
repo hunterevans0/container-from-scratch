@@ -5,16 +5,21 @@ package runtime
 // Bridge networks, and how a container joins one. For an overview of the
 // package, and how to read the Go here, see doc.go.
 
-// import lists the packages this file uses: errors and fmt for errors and
-// formatting, net for IP addresses and interfaces, os for files, path/filepath
-// for building paths, strings for string handling, and syscall for raw
-// system calls and error numbers.
+// import lists the packages this file uses: encoding/binary for numbers as
+// bytes, encoding/json for saved network configurations, errors and fmt for
+// errors and formatting, net for IP addresses and interfaces, os for files,
+// path/filepath for building paths, slices, strconv, and strings for slice
+// and string handling, and syscall for raw system calls and error numbers.
 import (
+	"encoding/binary"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"net"
 	"os"
 	"path/filepath"
+	"slices"
+	"strconv"
 	"strings"
 	"syscall"
 )
@@ -51,7 +56,7 @@ import (
 //  3. configureNetwork, which init runs inside the container: give eth0 its
 //     address and a default route. Init does this itself because only a
 //     process inside the namespace sees eth0 by that name.
-//  4. leave, once the container has exited: undo 1 and 2.
+//  4. Leaving, once the container has exited (see supervise): undo 1 and 2.
 
 // const declares constants. Several can be grouped in parentheses.
 const (
@@ -91,19 +96,6 @@ type bridgeNetwork struct {
 	dns bool
 }
 
-// defaultNetwork returns the built-in network. Fields left out of a struct
-// literal, here dns, get their zero value, false.
-func defaultNetwork() *bridgeNetwork {
-	return &bridgeNetwork{name: NetworkBridge, bridge: defaultBridge, subnet: defaultSubnet}
-}
-
-// gateway is the bridge's own address: the first in the subnet after the
-// subnet's own (10.88.0.1). Containers send everything not for their own
-// network there, for the host to route on.
-func (n *bridgeNetwork) gateway() net.IP {
-	return subnetAddress(n.subnet, 1)
-}
-
 // ipam is the network's address book: which addresses are taken, and by
 // which containers (see ipam_linux.go). Each network keeps its own, in a
 // directory named after it.
@@ -138,7 +130,9 @@ type containerNetwork struct {
 // container's ports. The veth pair comes later, once the container's network
 // namespace exists (see connect).
 func joinNetwork(id, name string, ports []PortMapping) (*containerNetwork, error) {
-	network := defaultNetwork()
+	// The built-in network. Fields left out of a struct literal, here dns,
+	// get their zero value, false.
+	network := &bridgeNetwork{name: NetworkBridge, bridge: defaultBridge, subnet: defaultSubnet}
 	if name != NetworkBridge {
 		// A network made with runt network create: read its configuration
 		// from disk, holding a shared lock, which many containers can hold
@@ -152,9 +146,34 @@ func joinNetwork(id, name string, ports []PortMapping) (*containerNetwork, error
 		// runt network rm from removing it. Deferred, unlock runs when
 		// joinNetwork returns.
 		defer unlock()
-		if network, err = loadNetwork(name); err != nil {
+		// Read the configuration of the network called name. A name such as
+		// ../x would lead out of networkConfigRoot. validName (in state.go)
+		// is the pattern container names must match too.
+		if !validName.MatchString(name) {
+			return nil, fmt.Errorf("no such network: %s", name)
+		}
+		data, err := os.ReadFile(networkConfigPath(name))
+		if errors.Is(err, os.ErrNotExist) {
+			return nil, fmt.Errorf("no such network: %s; make it with runt network create", name)
+		}
+		if err != nil {
 			return nil, err
 		}
+		// json.Unmarshal fills in the struct from the JSON, matching keys to
+		// fields by their tags (see Network, in runtime.go). It needs a
+		// pointer, &saved, to be able to change the variable.
+		var saved Network
+		if err := json.Unmarshal(data, &saved); err != nil {
+			return nil, fmt.Errorf("parse network %s: %w", name, err)
+		}
+		// Turn the saved configuration, which keeps its subnet as text, into
+		// the form the rest of the code works with. Network is the exported
+		// type, which cmd/runt sees; bridgeNetwork is runt's own.
+		_, subnet, err := net.ParseCIDR(saved.Subnet)
+		if err != nil {
+			return nil, fmt.Errorf("network %s: %w", saved.Name, err)
+		}
+		network = &bridgeNetwork{name: saved.Name, bridge: saved.Bridge, subnet: subnet, dns: true}
 	}
 	if err := network.setup(); err != nil {
 		return nil, err
@@ -168,42 +187,134 @@ func joinNetwork(id, name string, ports []PortMapping) (*containerNetwork, error
 	// characters.
 	n := &containerNetwork{network: network, reservation: reservation, hostVeth: "veth" + id[:8]}
 	// The address was free, so any port rules still sending connections to
-	// it are a dead container's. The anonymous function tells
-	// removeStaleDNAT which rules to remove: those whose destination is this
-	// address.
-	err = removeStaleDNAT(func(rule dnatRule) bool { return rule.toIP == reservation.ip.String() })
+	// it are a dead container's: remove the published ports' rules whose
+	// destination is this address, left behind by containers whose
+	// supervisors were killed.
+	output, err := runIptables("-t", "nat", "-S", portsChain)
 	if err == nil {
-		err = n.publish(ports)
+		for _, line := range strings.Split(output, "\n") {
+			if rule, ok := parseDNATRule(line); ok && rule.toIP == reservation.ip.String() {
+				if err = (iptablesRule{"nat", portsChain, rule.spec}).remove(); err != nil {
+					break
+				}
+			}
+		}
+	}
+	if err == nil {
+		// Publish the container's ports, as each of ports says. If one
+		// fails, those already published stay in n.ports, to be undone
+		// below. For each, the order matters:
+		//
+		//  1. Listen on the host port. This fails if anything else holds the
+		//     port, and with port 0 the system picks one.
+		//  2. Remove any rules a dead container left for the port, which
+		//     only the holder of the port may do.
+		//  3. Add the DNAT rule.
+		//  4. Start relaying what the proxy gets, in a goroutine of its own,
+		//     which runs until the port is closed.
+		for _, mapping := range ports {
+			host := mapping.HostIP
+			if host == "" {
+				host = "0.0.0.0"
+			}
+			// JoinHostPort makes "0.0.0.0:8080" (and would add brackets
+			// around an IPv6 address).
+			address := net.JoinHostPort(host, strconv.Itoa(mapping.HostPort))
+			port := &publishedPort{mapping: mapping}
+			if mapping.Protocol == "udp" {
+				// "udp4" and "tcp4" ask for IPv4 sockets only.
+				conn, listenErr := net.ListenPacket("udp4", address)
+				if listenErr != nil {
+					err = fmt.Errorf("publish port %d/udp: %w", mapping.ContainerPort, listenErr)
+					break
+				}
+				// ListenPacket returns an interface that could hold several
+				// kinds of socket. For "udp4" it is always a *net.UDPConn,
+				// and the type assertions take that out, and the
+				// *net.UDPAddr its address is, to learn the port actually
+				// bound.
+				port.packets = conn.(*net.UDPConn)
+				port.mapping.HostPort = conn.LocalAddr().(*net.UDPAddr).Port
+			} else {
+				listener, listenErr := net.Listen("tcp4", address)
+				if listenErr != nil {
+					err = fmt.Errorf("publish port %d/tcp: %w", mapping.ContainerPort, listenErr)
+					break
+				}
+				port.listener = listener
+				port.mapping.HostPort = listener.Addr().(*net.TCPAddr).Port
+			}
+			hostPort := strconv.Itoa(port.mapping.HostPort)
+			// Rules for the same port and protocol, at an address that
+			// overlaps ours, are stale: if their owner were alive, it would
+			// hold the port, and listening above would have failed. Rules
+			// for the same port at another single address belong to
+			// whoever listens there.
+			output, err = runIptables("-t", "nat", "-S", portsChain)
+			if err == nil {
+				for _, line := range strings.Split(output, "\n") {
+					if rule, ok := parseDNATRule(line); ok && rule.protocol == mapping.Protocol && rule.port == hostPort &&
+						(rule.hostIP == "" || mapping.HostIP == "" || rule.hostIP == mapping.HostIP) {
+						if err = (iptablesRule{"nat", portsChain, rule.spec}).remove(); err != nil {
+							break
+						}
+					}
+				}
+			}
+			if err != nil {
+				port.close()
+				break
+			}
+			// The rule, as on iptables' command line, for example:
+			// -d 127.0.0.1 ! -i runt+ -p tcp -m tcp --dport 8080 -j DNAT --to-destination 10.88.0.2:80
+			// That is: packets for this host address (if one was given),
+			// not coming from one of runt's bridges, for this protocol and
+			// port, get their destination rewritten to the container's
+			// address and port.
+			var spec []string
+			if mapping.HostIP != "" {
+				spec = append(spec, "-d", mapping.HostIP)
+			}
+			backend := net.JoinHostPort(n.reservation.ip.String(), strconv.Itoa(mapping.ContainerPort))
+			spec = append(spec, "!", "-i", allBridges, "-p", mapping.Protocol, "-m", mapping.Protocol, "--dport", hostPort,
+				"-j", "DNAT", "--to-destination", backend)
+			rule := iptablesRule{"nat", portsChain, spec}
+			// -A puts the rule last in its chain.
+			if err = rule.run("-A"); err != nil {
+				port.close()
+				break
+			}
+			port.rule = rule
+			if port.listener != nil {
+				go proxyTCP(port.listener, backend)
+			} else {
+				go proxyUDP(port.packets, backend)
+			}
+			n.ports = append(n.ports, port)
+		}
 	}
 	if err != nil {
 		// Give back whatever was taken: the address, and any ports
-		// published before the one that failed.
-		n.leave()
+		// published before the one that failed. Errors in doing so are
+		// left out: err says what went wrong.
+		if n.dns != nil {
+			n.dns.udp.Close()
+			n.dns.tcp.Close()
+		}
+		for _, port := range n.ports {
+			port.close()
+		}
+		if conn, err := openNetlink(); err == nil {
+			// Deleting either end of a veth pair deletes both.
+			deleteRequest := newRequest(syscall.RTM_DELLINK, 0, ifInfo(0, 0, 0))
+			deleteRequest.attr(syscall.IFLA_IFNAME, cString(n.hostVeth))
+			conn.do(deleteRequest)
+			conn.Close()
+		}
+		n.reservation.release()
 		return nil, err
 	}
 	return n, nil
-}
-
-// address is the container's address, as eth0 gets it: the reserved address
-// with the network's mask, which tells the container which addresses are on
-// its own network and reachable directly, through the bridge.
-func (n *containerNetwork) address() *net.IPNet {
-	return &net.IPNet{IP: n.reservation.ip, Mask: n.network.subnet.Mask}
-}
-
-// initConfig is what init needs to configure eth0.
-func (n *containerNetwork) initConfig() *initNetwork {
-	return &initNetwork{Address: n.address().String(), Gateway: n.network.gateway().String()}
-}
-
-// portMappings are the container's published ports, with the host ports
-// the system picked, for state.json and runt ps.
-func (n *containerNetwork) portMappings() []PortMapping {
-	var mappings []PortMapping
-	for _, port := range n.ports {
-		mappings = append(mappings, port.mapping)
-	}
-	return mappings
 }
 
 // connect makes the container's veth pair: eth0 in the network namespace of
@@ -224,48 +335,97 @@ func (n *containerNetwork) connect(pid int) error {
 	if err != nil {
 		return fmt.Errorf("find bridge %s: %w", n.network.bridge, err)
 	}
-	// One request makes both ends: the host's, plugged into the bridge,
-	// and eth0, made straight in init's network namespace, with a MAC
-	// address made from the container's IP address (see macAddress).
-	if err := conn.createVeth(n.hostVeth, bridge.Index, containerInterface, macAddress(n.reservation.ip), pid); err != nil {
+	// One request makes both ends, joined like the ends of a cable: the
+	// host's, up and plugged into the bridge, and eth0, made straight in
+	// init's network namespace, with a MAC address made from the
+	// container's IP address (see macAddress). A number in an attribute is
+	// 4 bytes.
+	peerMAC := macAddress(n.reservation.ip)
+	vethRequest := newRequest(syscall.RTM_NEWLINK, syscall.NLM_F_CREATE|syscall.NLM_F_EXCL, ifInfo(0, syscall.IFF_UP, syscall.IFF_UP))
+	vethRequest.attr(syscall.IFLA_IFNAME, cString(n.hostVeth))
+	vethRequest.attr(syscall.IFLA_MASTER, binary.NativeEndian.AppendUint32(nil, uint32(bridge.Index)))
+	vethRequest.nested(syscall.IFLA_LINKINFO, func() {
+		vethRequest.attr(iflaInfoKind, cString("veth"))
+		vethRequest.nested(iflaInfoData, func() {
+			// The peer is described as an interface of its own: an
+			// ifinfomsg, then its attributes.
+			vethRequest.nested(vethInfoPeer, func() {
+				vethRequest.data = append(vethRequest.data, ifInfo(0, 0, 0)...)
+				vethRequest.attr(syscall.IFLA_IFNAME, cString(containerInterface))
+				vethRequest.attr(syscall.IFLA_ADDRESS, peerMAC)
+				vethRequest.attr(syscall.IFLA_NET_NS_PID, binary.NativeEndian.AppendUint32(nil, uint32(pid)))
+			})
+		})
+	})
+	if err := conn.do(vethRequest); err != nil {
 		return fmt.Errorf("create veth pair %s: %w", n.hostVeth, err)
 	}
 	if n.network.dns {
-		if n.dns, err = startDNS(pid, n.network.name); err != nil {
-			return err
+		// Start the container's DNS server, on its network. Once its
+		// sockets are ready, the serving goes on in two goroutines, one for
+		// UDP and one for TCP, until its sockets are closed.
+		networkName := n.network.name
+		// The host's DNS servers, as host:port, for the DNS server to pass
+		// questions on to. On a host whose resolver is systemd-resolved,
+		// /etc/resolv.conf names only its stub server at 127.0.0.53, and
+		// the servers it asks are in /run/systemd/resolve/resolv.conf, as
+		// Docker knows to look. The error is ignored (_): a host with no
+		// resolv.conf has no servers, and gets fallbackNameservers.
+		resolvData, _ := os.ReadFile("/etc/resolv.conf")
+		hostConf := parseResolvConf(string(resolvData))
+		if slices.Equal(hostConf.nameservers, []string{"127.0.0.53"}) {
+			if data, err := os.ReadFile("/run/systemd/resolve/resolv.conf"); err == nil {
+				hostConf = parseResolvConf(string(data))
+			}
 		}
+		nameservers := hostConf.nameservers
+		if len(nameservers) == 0 {
+			nameservers = fallbackNameservers
+		}
+		var upstreams []string
+		for _, nameserver := range nameservers {
+			upstreams = append(upstreams, net.JoinHostPort(nameserver, "53"))
+		}
+		s := &dnsServer{
+			network: networkName,
+			// The address of the container on the network called name (in
+			// any case, as DNS names are), or with that ID, if it is
+			// created or running. It reads every container's state.json
+			// each time, so it always sees containers as they come and go,
+			// and needs nothing kept up to date.
+			lookup: func(name string) net.IP {
+				if name == "" {
+					return nil
+				}
+				states, err := listStates(StateRoot)
+				if err != nil {
+					return nil
+				}
+				for _, state := range states {
+					// Skip containers on other networks, stopped ones (whose
+					// address is cleared), and ones with other names.
+					// EqualFold compares without regard to case.
+					if state.Network != networkName || state.IPAddress == "" || !(strings.EqualFold(state.Name, name) || state.ID == name) {
+						continue
+					}
+					// One whose monitor was killed is gone, though its state
+					// says otherwise.
+					if initAlive(state.Pid) {
+						return net.ParseIP(state.IPAddress)
+					}
+				}
+				return nil
+			},
+			upstreams: upstreams,
+		}
+		if s.udp, s.tcp, err = listenDNS(pid); err != nil {
+			return fmt.Errorf("start DNS server: %w", err)
+		}
+		go s.serveUDP()
+		go s.serveTCP()
+		n.dns = s
 	}
 	return nil
-}
-
-// leave unpublishes the container's ports, unplugs it from the bridge, and
-// gives its address back. It keeps going past errors, so that one thing
-// failing doesn't leave the rest behind, and returns them all together.
-func (n *containerNetwork) leave() error {
-	var errs []error
-	if n.dns != nil {
-		n.dns.close()
-	}
-	for _, port := range n.ports {
-		errs = append(errs, port.close())
-	}
-	if conn, err := openNetlink(); err != nil {
-		errs = append(errs, err)
-	} else {
-		// The pair also goes when the container's network namespace does,
-		// after its last process has exited, so it may be gone already:
-		// ENODEV, "no such device", is fine.
-		if err := conn.deleteLink(n.hostVeth); err != nil && !errors.Is(err, syscall.ENODEV) {
-			errs = append(errs, fmt.Errorf("delete veth %s: %w", n.hostVeth, err))
-		}
-		conn.Close()
-	}
-	// Only now, so that the next container to get the address can't find
-	// this one's veth still plugged in, or its port rules still in place.
-	errs = append(errs, n.reservation.release())
-	// errors.Join makes one error of several, leaving out the nils. If all
-	// of them are nil, so is the result.
-	return errors.Join(errs...)
 }
 
 // setup makes the network's bridge, gives it the gateway address, and sets
@@ -290,8 +450,24 @@ func (n *bridgeNetwork) setup() error {
 		return err
 	}
 	defer conn.Close()
-	gateway := n.gateway()
-	if err := conn.createBridge(n.bridge, macAddress(gateway)); err != nil && !errors.Is(err, syscall.EEXIST) {
+	// The gateway is the bridge's own address: the first in the subnet
+	// after the subnet's own (10.88.0.1). Containers send everything not
+	// for their own network there, for the host to route on. An IPv4
+	// address is 4 bytes, which read as one 32-bit number (big-endian, most
+	// significant byte first) can simply have 1 added.
+	gateway := net.IP(binary.BigEndian.AppendUint32(nil, binary.BigEndian.Uint32(n.subnet.IP.To4())+1))
+	// Make the bridge, a virtual switch, with a fixed MAC address.
+	// Otherwise a bridge takes the lowest MAC address of the interfaces
+	// plugged into it, which changes as containers come and go, and the
+	// containers' ARP caches would point at an address the gateway no
+	// longer has.
+	bridgeRequest := newRequest(syscall.RTM_NEWLINK, syscall.NLM_F_CREATE|syscall.NLM_F_EXCL, ifInfo(0, 0, 0))
+	bridgeRequest.attr(syscall.IFLA_IFNAME, cString(n.bridge))
+	bridgeRequest.attr(syscall.IFLA_ADDRESS, macAddress(gateway))
+	bridgeRequest.nested(syscall.IFLA_LINKINFO, func() {
+		bridgeRequest.attr(iflaInfoKind, cString("bridge"))
+	})
+	if err := conn.do(bridgeRequest); err != nil && !errors.Is(err, syscall.EEXIST) {
 		return fmt.Errorf("create bridge %s: %w", n.bridge, err)
 	}
 	bridge, err := net.InterfaceByName(n.bridge)
@@ -300,53 +476,53 @@ func (n *bridgeNetwork) setup() error {
 	}
 	// Giving the bridge an address makes the host a member of the
 	// network, which containers reach it through, and use as their gateway.
-	if err := conn.addAddress(bridge.Index, &net.IPNet{IP: gateway, Mask: n.subnet.Mask}); err != nil && !errors.Is(err, syscall.EEXIST) {
+	// The kernel adds a route to the address's subnet through the bridge.
+	address := &net.IPNet{IP: gateway, Mask: n.subnet.Mask}
+	prefix, _ := address.Mask.Size()
+	// struct ifaddrmsg: family, prefix length, flags, scope, and interface.
+	body := make([]byte, syscall.SizeofIfAddrmsg)
+	body[0] = syscall.AF_INET
+	body[1] = byte(prefix)
+	binary.NativeEndian.PutUint32(body[4:], uint32(bridge.Index))
+	addressRequest := newRequest(syscall.RTM_NEWADDR, syscall.NLM_F_CREATE|syscall.NLM_F_EXCL, body)
+	addressRequest.attr(syscall.IFA_LOCAL, address.IP.To4())
+	addressRequest.attr(syscall.IFA_ADDRESS, address.IP.To4())
+	if err := conn.do(addressRequest); err != nil && !errors.Is(err, syscall.EEXIST) {
 		return fmt.Errorf("give bridge %s address %s: %w", n.bridge, gateway, err)
 	}
-	if err := conn.setUp(bridge.Index); err != nil {
+	if err := conn.do(newRequest(syscall.RTM_NEWLINK, 0, ifInfo(bridge.Index, syscall.IFF_UP, syscall.IFF_UP))); err != nil {
 		return fmt.Errorf("bring up bridge %s: %w", n.bridge, err)
 	}
-	if err := enableForwarding(); err != nil {
-		return err
+	// Let the host route packets from one interface to another, here from
+	// the bridge to the outside world and back. Docker turns it on the same
+	// way, and leaves it on. Files under /proc/sys are kernel settings:
+	// writing 1 to this one turns forwarding on.
+	const forwardPath = "/proc/sys/net/ipv4/ip_forward"
+	if current, err := os.ReadFile(forwardPath); err != nil || strings.TrimSpace(string(current)) != "1" {
+		if err := os.WriteFile(forwardPath, []byte("1\n"), 0o644); err != nil {
+			return fmt.Errorf("turn on IP forwarding: %w", err)
+		}
 	}
-	return n.setupIptables()
-}
-
-// enableForwarding lets the host route packets from one interface to
-// another, here from the bridge to the outside world and back. Docker turns
-// it on the same way, and leaves it on. Files under /proc/sys are kernel
-// settings: writing 1 to this one turns forwarding on.
-func enableForwarding() error {
-	const path = "/proc/sys/net/ipv4/ip_forward"
-	if current, err := os.ReadFile(path); err == nil && strings.TrimSpace(string(current)) == "1" {
-		return nil
+	// Add whichever of the shared rules and the network's rules are
+	// missing. They go first in their chains, ahead of any rules that would
+	// drop the packets. The shared rules go in first, so the network's come
+	// ahead of the one that isolates networks: each rule inserted at the top
+	// pushes the earlier ones down.
+	//
+	// First, the chain of our own for published ports, unless it is there
+	// already. iptables -L lists a chain, and fails if there is no such
+	// chain; -N makes a new one.
+	if _, err := runIptables("-t", "nat", "-n", "-L", portsChain); err != nil {
+		if _, err := runIptables("-t", "nat", "-N", portsChain); err != nil {
+			return err
+		}
 	}
-	if err := os.WriteFile(path, []byte("1\n"), 0o644); err != nil {
-		return fmt.Errorf("turn on IP forwarding: %w", err)
-	}
-	return nil
-}
-
-// portsChain is the nat chain for published ports' rules (see
-// publishedPort), as the DOCKER chain is for Docker.
-//
-// iptables, briefly: the kernel passes each packet through chains of rules,
-// at fixed points on its way. PREROUTING sees packets as they arrive,
-// FORWARD those the host routes from one interface to another, OUTPUT those
-// the host itself sends, and POSTROUTING all packets as they leave. Chains
-// are grouped in tables by purpose: nat rewrites addresses, and filter lets
-// packets through (ACCEPT) or drops them (DROP). The first rule in a chain
-// that matches a packet decides what happens to it. A rule can also jump
-// (-j) to a chain of our own, like RUNT.
-const portsChain = "RUNT"
-
-// sharedRules are the iptables rules all networks share. Each is a table, a
-// chain, and the rule, as iptables takes it on its command line.
-func sharedRules() []iptablesRule {
-	return []iptablesRule{
+	// The rules all networks share. Each is a table, a chain, and the rule,
+	// as iptables takes it on its command line.
+	shared := []iptablesRule{
 		// Nothing passes from one network to another, unless a rule ahead
-		// of this one lets it through: the networks' own (see rules) only
-		// let through what stays on the network or leaves for the outside.
+		// of this one lets it through: the networks' own (below) only let
+		// through what stays on the network or leaves for the outside.
 		// -i is the interface a packet came in on, and -o the one it is
 		// about to leave by.
 		{"filter", "FORWARD", []string{"-i", allBridges, "-o", allBridges, "-j", "DROP"}},
@@ -359,13 +535,10 @@ func sharedRules() []iptablesRule {
 		{"nat", "PREROUTING", []string{"-m", "addrtype", "--dst-type", "LOCAL", "-j", portsChain}},
 		{"nat", "OUTPUT", []string{"!", "-d", "127.0.0.0/8", "-m", "addrtype", "--dst-type", "LOCAL", "-j", portsChain}},
 	}
-}
-
-// rules are the network's iptables rules, each a table, a chain, and the
-// rule.
-func (n *bridgeNetwork) rules() []iptablesRule {
+	// The network's own rules, each a table, a chain, and the rule
+	// (RemoveNetwork removes the same ones).
 	subnet := n.subnet.String()
-	return []iptablesRule{
+	own := []iptablesRule{
 		// Masquerading: a packet from a container that leaves the host by
 		// any other interface gets the host's address as its source.
 		// Connection tracking remembers the change, and undoes it on the
@@ -384,26 +557,33 @@ func (n *bridgeNetwork) rules() []iptablesRule {
 		{"filter", "FORWARD", []string{"-o", n.bridge, "-m", "conntrack", "--ctstate", "RELATED,ESTABLISHED", "-j", "ACCEPT"}},
 		{"filter", "FORWARD", []string{"-o", n.bridge, "-m", "conntrack", "--ctstate", "DNAT", "-j", "ACCEPT"}},
 	}
-}
-
-// setupIptables adds whichever of the shared rules and the network's rules
-// are missing. They go first in their chains, ahead of any rules that would
-// drop the packets. The shared rules go in first, so the network's come
-// ahead of the one that isolates networks: each rule inserted at the top
-// pushes the earlier ones down.
-func (n *bridgeNetwork) setupIptables() error {
-	if err := ensureChain("nat", portsChain); err != nil {
-		return err
-	}
 	// append(a, b...) joins two slices; the ... passes b's elements one by
-	// one.
-	for _, rule := range append(sharedRules(), n.rules()...) {
-		if err := rule.insert(); err != nil {
+	// one. Each rule is put first in its chain unless it is there already:
+	// iptables -C (check) succeeds if it is. Checking first makes setting
+	// up a network safe to repeat, which it is, for every container.
+	for _, rule := range append(shared, own...) {
+		if rule.run("-C") == nil {
+			continue
+		}
+		if err := rule.run("-I"); err != nil {
 			return err
 		}
 	}
 	return nil
 }
+
+// portsChain is the nat chain for published ports' rules (see
+// publishedPort), as the DOCKER chain is for Docker.
+//
+// iptables, briefly: the kernel passes each packet through chains of rules,
+// at fixed points on its way. PREROUTING sees packets as they arrive,
+// FORWARD those the host routes from one interface to another, OUTPUT those
+// the host itself sends, and POSTROUTING all packets as they leave. Chains
+// are grouped in tables by purpose: nat rewrites addresses, and filter lets
+// packets through (ACCEPT) or drops them (DROP). The first rule in a chain
+// that matches a packet decides what happens to it. A rule can also jump
+// (-j) to a chain of our own, like RUNT.
+const portsChain = "RUNT"
 
 // configureNetwork runs in init: it gives eth0, which runt has moved into the
 // container's network namespace, its address, brings it up, and makes the
@@ -427,15 +607,39 @@ func configureNetwork(network *initNetwork) error {
 		return err
 	}
 	defer conn.Close()
-	if err := conn.addAddress(link.Index, &net.IPNet{IP: ip, Mask: subnet.Mask}); err != nil {
+	// Give eth0 its IPv4 address. The kernel adds a route to the address's
+	// subnet through the interface.
+	address := &net.IPNet{IP: ip, Mask: subnet.Mask}
+	prefix, _ := address.Mask.Size()
+	// struct ifaddrmsg: family, prefix length, flags, scope, and interface.
+	body := make([]byte, syscall.SizeofIfAddrmsg)
+	body[0] = syscall.AF_INET
+	body[1] = byte(prefix)
+	binary.NativeEndian.PutUint32(body[4:], uint32(link.Index))
+	addressRequest := newRequest(syscall.RTM_NEWADDR, syscall.NLM_F_CREATE|syscall.NLM_F_EXCL, body)
+	addressRequest.attr(syscall.IFA_LOCAL, address.IP.To4())
+	addressRequest.attr(syscall.IFA_ADDRESS, address.IP.To4())
+	if err := conn.do(addressRequest); err != nil {
 		return fmt.Errorf("give %s address %s: %w", containerInterface, network.Address, err)
 	}
-	if err := conn.setUp(link.Index); err != nil {
+	if err := conn.do(newRequest(syscall.RTM_NEWLINK, 0, ifInfo(link.Index, syscall.IFF_UP, syscall.IFF_UP))); err != nil {
 		return fmt.Errorf("bring up %s: %w", containerInterface, err)
 	}
-	// The default route: anything not on the container's own network goes
-	// to the gateway, the host's end of the bridge.
-	if err := conn.addDefaultRoute(gateway); err != nil {
+	// The default route: anything not on the container's own network, with
+	// no more specific route, goes to the gateway, the host's end of the
+	// bridge.
+	//
+	// struct rtmsg: family, destination and source prefix lengths (0, so
+	// any destination), TOS, table, protocol, scope, type, and flags.
+	routeBody := make([]byte, syscall.SizeofRtMsg)
+	routeBody[0] = syscall.AF_INET
+	routeBody[4] = syscall.RT_TABLE_MAIN
+	routeBody[5] = syscall.RTPROT_BOOT
+	routeBody[6] = syscall.RT_SCOPE_UNIVERSE
+	routeBody[7] = syscall.RTN_UNICAST
+	routeRequest := newRequest(syscall.RTM_NEWROUTE, syscall.NLM_F_CREATE|syscall.NLM_F_EXCL, routeBody)
+	routeRequest.attr(syscall.RTA_GATEWAY, gateway.To4())
+	if err := conn.do(routeRequest); err != nil {
 		return fmt.Errorf("add default route via %s: %w", gateway, err)
 	}
 	return nil

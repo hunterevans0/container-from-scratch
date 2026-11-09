@@ -7,11 +7,9 @@ package runtime
 
 import (
 	"errors"
-	"fmt"
 	"io"
 	"net"
 	"net/netip"
-	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -47,104 +45,13 @@ type publishedPort struct {
 	packets  *net.UDPConn
 }
 
-// publish publishes the container's ports, as each of ports says. If one
-// fails, those already published stay in n.ports, for the caller to undo
-// with leave.
-func (n *containerNetwork) publish(ports []PortMapping) error {
-	for _, mapping := range ports {
-		port, err := publishPort(mapping, n.reservation.ip)
-		if err != nil {
-			return err
-		}
-		n.ports = append(n.ports, port)
-	}
-	return nil
-}
-
-// publishPort publishes mapping, for the container at ip. The order matters:
-//
-//  1. Listen on the host port. This fails if anything else holds the port,
-//     and with port 0 the system picks one.
-//  2. Remove any rules a dead container left for the port, which only the
-//     holder of the port may do.
-//  3. Add the DNAT rule.
-//  4. Start relaying what the proxy gets, in a goroutine of its own, which
-//     runs until the port is closed.
-func publishPort(mapping PortMapping, ip net.IP) (*publishedPort, error) {
-	host := mapping.HostIP
-	if host == "" {
-		host = "0.0.0.0"
-	}
-	// JoinHostPort makes "0.0.0.0:8080" (and would add brackets around an
-	// IPv6 address).
-	address := net.JoinHostPort(host, strconv.Itoa(mapping.HostPort))
-	port := &publishedPort{mapping: mapping}
-	if mapping.Protocol == "udp" {
-		// "udp4" and "tcp4" ask for IPv4 sockets only.
-		conn, err := net.ListenPacket("udp4", address)
-		if err != nil {
-			return nil, fmt.Errorf("publish port %d/udp: %w", mapping.ContainerPort, err)
-		}
-		// ListenPacket returns an interface that could hold several kinds
-		// of socket. For "udp4" it is always a *net.UDPConn, and the type
-		// assertions take that out, and the *net.UDPAddr its address is,
-		// to learn the port actually bound.
-		port.packets = conn.(*net.UDPConn)
-		port.mapping.HostPort = conn.LocalAddr().(*net.UDPAddr).Port
-	} else {
-		listener, err := net.Listen("tcp4", address)
-		if err != nil {
-			return nil, fmt.Errorf("publish port %d/tcp: %w", mapping.ContainerPort, err)
-		}
-		port.listener = listener
-		port.mapping.HostPort = listener.Addr().(*net.TCPAddr).Port
-	}
-	hostPort := strconv.Itoa(port.mapping.HostPort)
-	// Rules for the same port and protocol, at an address that overlaps
-	// ours, are stale: if their owner were alive, it would hold the port,
-	// and listening above would have failed. Rules for the same port at
-	// another single address belong to whoever listens there.
-	err := removeStaleDNAT(func(rule dnatRule) bool {
-		return rule.protocol == mapping.Protocol && rule.port == hostPort &&
-			(rule.hostIP == "" || mapping.HostIP == "" || rule.hostIP == mapping.HostIP)
-	})
-	if err != nil {
-		port.close()
-		return nil, err
-	}
-	// The rule, as on iptables' command line, for example:
-	// -d 127.0.0.1 ! -i runt+ -p tcp -m tcp --dport 8080 -j DNAT --to-destination 10.88.0.2:80
-	// That is: packets for this host address (if one was given), not coming
-	// from one of runt's bridges, for this protocol and port, get their
-	// destination rewritten to the container's address and port.
-	var spec []string
-	if mapping.HostIP != "" {
-		spec = append(spec, "-d", mapping.HostIP)
-	}
-	backend := net.JoinHostPort(ip.String(), strconv.Itoa(mapping.ContainerPort))
-	spec = append(spec, "!", "-i", allBridges, "-p", mapping.Protocol, "-m", mapping.Protocol, "--dport", hostPort,
-		"-j", "DNAT", "--to-destination", backend)
-	rule := iptablesRule{"nat", portsChain, spec}
-	if err := rule.add(); err != nil {
-		port.close()
-		return nil, err
-	}
-	port.rule = rule
-	if port.listener != nil {
-		go proxyTCP(port.listener, backend)
-	} else {
-		go proxyUDP(port.packets, backend)
-	}
-	return port, nil
-}
-
 // close unpublishes the port. The rule goes before the port is let go, so
 // that it can't remove rules another container has made for the port since.
 // Closing the socket also ends the proxy's goroutine, whose next attempt to
 // accept or read fails with net.ErrClosed.
 func (p *publishedPort) close() error {
 	var err error
-	// spec is nil until the rule has been added (see publishPort).
+	// spec is nil until the rule has been added (see joinNetwork).
 	if p.rule.spec != nil {
 		err = p.rule.remove()
 	}
@@ -194,24 +101,6 @@ func parseDNATRule(line string) (dnatRule, bool) {
 		}
 	}
 	return rule, true
-}
-
-// removeStaleDNAT removes the published ports' rules that match: rules left
-// behind by containers whose supervisors were killed. match is a function
-// the caller passes, which says yes or no to each rule.
-func removeStaleDNAT(match func(dnatRule) bool) error {
-	output, err := runIptables("-t", "nat", "-S", portsChain)
-	if err != nil {
-		return err
-	}
-	for _, line := range strings.Split(output, "\n") {
-		if rule, ok := parseDNATRule(line); ok && match(rule) {
-			if err := (iptablesRule{"nat", portsChain, rule.spec}).remove(); err != nil {
-				return err
-			}
-		}
-	}
-	return nil
 }
 
 // proxyTCP relays each connection listener accepts to backend, until the

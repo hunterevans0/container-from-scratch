@@ -78,80 +78,13 @@ type dnsServer struct {
 	network string
 	// lookup returns the address of the container called name on the
 	// network, or nil if there is none. It is a field holding a function,
-	// rather than a call to lookupContainer, so the tests can give the
+	// rather than code of the server's own, so the tests can give the
 	// server a pretend list of containers.
 	lookup func(name string) net.IP
 	// upstreams are the host's DNS servers, as host:port.
 	upstreams []string
 	udp       net.PacketConn
 	tcp       net.Listener
-}
-
-// startDNS starts a DNS server for the container whose init is pid, on
-// network. It returns once the sockets are ready; the serving goes on in two
-// goroutines, one for UDP and one for TCP, until close.
-func startDNS(pid int, network string) (*dnsServer, error) {
-	s := &dnsServer{
-		network:   network,
-		lookup:    func(name string) net.IP { return lookupContainer(network, name) },
-		upstreams: hostNameservers(),
-	}
-	var err error
-	if s.udp, s.tcp, err = listenDNS(pid); err != nil {
-		return nil, fmt.Errorf("start DNS server: %w", err)
-	}
-	go s.serveUDP()
-	go s.serveTCP()
-	return s, nil
-}
-
-// close stops the server. The serving goroutines see their sockets closed
-// and return.
-func (s *dnsServer) close() {
-	s.udp.Close()
-	s.tcp.Close()
-}
-
-// hostNameservers are the host's DNS servers, as host:port, for the DNS
-// server to pass questions on to.
-func hostNameservers() []string {
-	nameservers := hostResolvConf().nameservers
-	if len(nameservers) == 0 {
-		nameservers = fallbackNameservers
-	}
-	var upstreams []string
-	for _, nameserver := range nameservers {
-		upstreams = append(upstreams, net.JoinHostPort(nameserver, "53"))
-	}
-	return upstreams
-}
-
-// lookupContainer returns the address of the container on network called
-// name (in any case, as DNS names are), or with that ID, if it is created
-// or running. It reads every container's state.json each time, so it always
-// sees containers as they come and go, and needs nothing kept up to date.
-func lookupContainer(network, name string) net.IP {
-	if name == "" {
-		return nil
-	}
-	states, err := listStates(StateRoot)
-	if err != nil {
-		return nil
-	}
-	for _, state := range states {
-		// Skip containers on other networks, stopped ones (whose address
-		// is cleared), and ones with other names. EqualFold compares
-		// without regard to case.
-		if state.Network != network || state.IPAddress == "" || !(strings.EqualFold(state.Name, name) || state.ID == name) {
-			continue
-		}
-		// One whose monitor was killed is gone, though its state says
-		// otherwise.
-		if initAlive(state.Pid) {
-			return net.ParseIP(state.IPAddress)
-		}
-	}
-	return nil
 }
 
 // ipFreebind is the IP_FREEBIND socket option, which lets a socket bind an
@@ -370,28 +303,19 @@ func (s *dnsServer) answer(query []byte, tcp bool) []byte {
 			return dnsReply(query, question, 0, addresses)
 		}
 	}
-	reply, err := s.forward(query, tcp)
-	if err != nil {
-		// SERVFAIL tells the client the server couldn't answer, so it can
-		// give up at once rather than wait.
-		return dnsReply(query, question, dnsRcodeServFail, nil)
-	}
-	return reply
-}
-
-// forward asks the host's servers query, one after another until one
-// answers, the same way the client asked, so that a reply too big for UDP
-// comes back truncated, and the client asks again over TCP. The query and
-// reply pass through unchanged.
-func (s *dnsServer) forward(query []byte, tcp bool) ([]byte, error) {
-	err := errors.New("no DNS servers to ask")
+	// Ask the host's servers query, one after another until one answers,
+	// the same way the client asked, so that a reply too big for UDP comes
+	// back truncated, and the client asks again over TCP. The query and
+	// reply pass through unchanged.
 	for _, upstream := range s.upstreams {
-		var reply []byte
-		if reply, err = exchangeDNS(upstream, query, tcp); err == nil {
-			return reply, nil
+		if reply, err := exchangeDNS(upstream, query, tcp); err == nil {
+			return reply
 		}
 	}
-	return nil, err
+	// None answered, or there are none to ask. SERVFAIL tells the client
+	// the server couldn't answer, so it can give up at once rather than
+	// wait.
+	return dnsReply(query, question, dnsRcodeServFail, nil)
 }
 
 // exchangeDNS sends query to server, over TCP if tcp is set, and returns its

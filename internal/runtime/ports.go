@@ -73,28 +73,25 @@ func ParsePortMapping(s string) (PortMapping, error) {
 			mapping.HostIP = ip.String()
 		}
 	}
-	var err error
-	if mapping.ContainerPort, err = parsePort(containerPort); err != nil {
-		return mapping, fmt.Errorf("invalid port mapping %q: %w", s, err)
+	// The port numbers. strconv.Atoi turns a string into an int, and fails
+	// on anything that isn't a whole number, such as a range like
+	// 8000-8010, which runt doesn't support.
+	port, err := strconv.Atoi(containerPort)
+	if err != nil || port < 1 || port > 65535 {
+		mapping.ContainerPort = 0
+		return mapping, fmt.Errorf("invalid port mapping %q: %w", s, fmt.Errorf("%q is not a port number from 1 to 65535", containerPort))
 	}
+	mapping.ContainerPort = port
 	// An empty host port, as in "80" or "127.0.0.1::80", leaves HostPort 0.
 	if hostPort != "" {
-		if mapping.HostPort, err = parsePort(hostPort); err != nil {
-			return mapping, fmt.Errorf("invalid port mapping %q: %w", s, err)
+		port, err := strconv.Atoi(hostPort)
+		if err != nil || port < 1 || port > 65535 {
+			mapping.HostPort = 0
+			return mapping, fmt.Errorf("invalid port mapping %q: %w", s, fmt.Errorf("%q is not a port number from 1 to 65535", hostPort))
 		}
+		mapping.HostPort = port
 	}
 	return mapping, nil
-}
-
-// parsePort parses a port number. strconv.Atoi turns a string into an int,
-// and fails on anything that isn't a whole number, such as a range like
-// 8000-8010, which runt doesn't support.
-func parsePort(s string) (int, error) {
-	port, err := strconv.Atoi(s)
-	if err != nil || port < 1 || port > 65535 {
-		return 0, fmt.Errorf("%q is not a port number from 1 to 65535", s)
-	}
-	return port, nil
 }
 
 // String formats the mapping as docker ps shows it, as in

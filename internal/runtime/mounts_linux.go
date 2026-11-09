@@ -8,14 +8,16 @@ package runtime
 //  1. The supervisor, as host root, makes any volumes that don't exist yet,
 //     filling new ones from the image, and bind-mounts each bind mount's and
 //     volume's directory onto a staging directory of the container's own,
-//     /run/runt-mounts/<id>/<n> (stageMounts). Init couldn't do this itself:
-//     it runs as container root, an unprivileged host user, who can't
-//     usually get to a directory such as /home/you/project.
+//     /run/runt-mounts/<id>/<n> (see supervise in container_linux.go).
+//     Init couldn't do this itself: it runs as container root, an
+//     unprivileged host user, who can't usually get to a directory such as
+//     /home/you/project.
 //  2. Init, cloned with a copy of the host's mounts, staging ones included,
 //     bind-mounts each staging directory to where it belongs in the
-//     container's root filesystem, and mounts each tmpfs (makeMounts). This
-//     comes before pivot_root, while the staging directories are still in
-//     sight, and after /dev is made, so a mount can go inside it.
+//     container's root filesystem, and mounts each tmpfs (makeMount, called
+//     from setupContainer in runtime_linux.go). This comes before
+//     pivot_root, while the staging directories are still in sight, and
+//     after /dev is made, so a mount can go inside it.
 //  3. Once init is ready, the supervisor unmounts the staging directories
 //     (unstageMounts). Init's copies of the mounts are its own, and stay.
 //
@@ -28,7 +30,6 @@ import (
 	"io/fs"
 	"os"
 	"path/filepath"
-	"strconv"
 	"strings"
 	"syscall"
 )
@@ -38,92 +39,12 @@ import (
 // tmpfs, so nothing is left here after a reboot.
 const mountStagingRoot = "/run/runt-mounts"
 
-func mountStagingDir(id string) string {
-	return filepath.Join(mountStagingRoot, id)
-}
-
-// stageMounts runs in the supervisor, before init is cloned. It returns
-// mounts as init is to make them: each volume made if need be, and each bind
-// mount and volume turned into a bind mount from its staging directory.
-// rootfs is the container's root filesystem, as mounted on the host, which
-// new volumes are filled from if populate is set. The caller holds the
-// volumes' lock, and calls unstageMounts afterwards, even if this fails.
-func stageMounts(id string, mounts []Mount, rootfs string, populate bool, uids, gids IDRange) ([]Mount, error) {
-	// Container root has to find the mount points, and nobody else need
-	// see what they are: 0711 lets anyone pass through the top directory,
-	// and the container's own lets in only its group, container root's.
-	if err := os.MkdirAll(mountStagingRoot, 0o711); err != nil {
-		return nil, fmt.Errorf("create %s: %w", mountStagingRoot, err)
-	}
-	dir := mountStagingDir(id)
-	if err := os.Mkdir(dir, 0o710); err != nil {
-		return nil, fmt.Errorf("create mount staging directory: %w", err)
-	}
-	if err := os.Chown(dir, 0, gids.Base); err != nil {
-		return nil, fmt.Errorf("set owner of %s: %w", dir, err)
-	}
-	staged := make([]Mount, len(mounts))
-	for i, mount := range mounts {
-		if mount.Type == MountTmpfs {
-			staged[i] = mount
-			continue
-		}
-		source := mount.Source
-		if mount.Type == MountVolume {
-			volume, _, err := ensureVolume(mount.Source, uids, gids)
-			if err != nil {
-				return nil, err
-			}
-			source = volume.Mountpoint
-			if populate && !mount.hasOption("nocopy") {
-				if err := populateVolume(source, rootfs, mount.Destination); err != nil {
-					return nil, fmt.Errorf("fill volume %s from the image: %w", mount.Source, err)
-				}
-			}
-		}
-		// Stat follows a symbolic link, as the bind mount will.
-		info, err := os.Stat(source)
-		if errors.Is(err, os.ErrNotExist) {
-			return nil, fmt.Errorf("bind mount source %s does not exist", source)
-		}
-		if err != nil {
-			return nil, err
-		}
-		// A bind mount goes onto a directory if its source is one, and
-		// onto a file otherwise.
-		target := filepath.Join(dir, strconv.Itoa(i))
-		if info.IsDir() {
-			err = os.Mkdir(target, 0o700)
-		} else {
-			err = os.WriteFile(target, nil, 0o600)
-		}
-		if err != nil {
-			return nil, fmt.Errorf("create mount point %s: %w", target, err)
-		}
-		// MS_REC takes along whatever is mounted inside the source, as
-		// Docker's bind mounts do.
-		if err := syscall.Mount(source, target, "", syscall.MS_BIND|syscall.MS_REC, ""); err != nil {
-			return nil, fmt.Errorf("bind mount %s: %w", source, err)
-		}
-		// A bind mount ignores MS_RDONLY and the like the first time, so
-		// read-only takes a second step. Init's copy keeps the flags, and,
-		// as it came from the host, can't be made writable again.
-		if flags, _ := mountFlags(mount.Options); flags != 0 {
-			if err := remountBind(target, flags); err != nil {
-				return nil, fmt.Errorf("make the mount of %s %s: %w", source, strings.Join(mount.Options, ","), err)
-			}
-		}
-		staged[i] = Mount{Type: MountBind, Source: target, Destination: mount.Destination}
-	}
-	return staged, nil
-}
-
 // unstageMounts unmounts container id's staging directories and removes
 // them. Each is removed with os.Remove, never os.RemoveAll: if one were
 // still mounted somehow, RemoveAll would delete the files of the directory
 // mounted there, on the host.
 func unstageMounts(id string) error {
-	dir := mountStagingDir(id)
+	dir := filepath.Join(mountStagingRoot, id)
 	entries, err := os.ReadDir(dir)
 	if errors.Is(err, os.ErrNotExist) {
 		return nil
@@ -142,47 +63,6 @@ func unstageMounts(id string) error {
 		}
 	}
 	return os.Remove(dir)
-}
-
-// mountFlags turns mount options into the flags for the mount system call
-// (ro, nosuid, nodev, and noexec), and the options it passes on to the
-// filesystem (those with an =, such as tmpfs's size=). Others, such as
-// nocopy, are runt's own, and left out.
-func mountFlags(options []string) (flags uintptr, data string) {
-	var passed []string
-	for _, option := range options {
-		switch option {
-		case "ro":
-			flags |= syscall.MS_RDONLY
-		case "nosuid":
-			flags |= syscall.MS_NOSUID
-		case "nodev":
-			flags |= syscall.MS_NODEV
-		case "noexec":
-			flags |= syscall.MS_NOEXEC
-		default:
-			if strings.Contains(option, "=") {
-				passed = append(passed, option)
-			}
-		}
-	}
-	return flags, strings.Join(passed, ",")
-}
-
-// remountBind adds flags, such as MS_RDONLY, to the bind mount at path. A
-// remount sets every flag at once, so it has to repeat the nosuid, nodev,
-// and noexec flags the mount already has, or it would take them away. In a
-// user namespace, the kernel also locks them on mounts that came from a
-// more privileged one, and refuses a remount that would clear them.
-func remountBind(path string, flags uintptr) error {
-	var stat syscall.Statfs_t
-	if err := syscall.Statfs(path, &stat); err != nil {
-		return fmt.Errorf("read mount flags of %s: %w", path, err)
-	}
-	// ST_NOSUID, ST_NODEV, and ST_NOEXEC have the same values as the MS_
-	// flags.
-	kept := uintptr(stat.Flags) & (syscall.MS_NOSUID | syscall.MS_NODEV | syscall.MS_NOEXEC)
-	return syscall.Mount("", path, "", syscall.MS_BIND|syscall.MS_REMOUNT|flags|kept, "")
 }
 
 // populateVolume fills an empty volume, whose files are in data, with what
@@ -210,18 +90,14 @@ func populateVolume(data, rootfs, destination string) error {
 	if err != nil {
 		return err
 	}
-	return copyTree(source, data)
-}
-
-// copyTree copies the directory source into the existing directory target:
-// directories, regular files, and symbolic links, with their owners and
-// permissions, and target takes source's own. Anything else, such as a
-// device or a socket, is skipped. Symbolic links are copied as links, never
-// followed, so nothing outside source is copied.
-//
-// filepath.WalkDir calls the function for source and everything under it,
-// each directory before what is in it.
-func copyTree(source, target string) error {
+	// Copy the directory source into the existing directory data:
+	// directories, regular files, and symbolic links, with their owners and
+	// permissions, and data takes source's own. Anything else, such as a
+	// device or a socket, is skipped. Symbolic links are copied as links,
+	// never followed, so nothing outside source is copied.
+	//
+	// filepath.WalkDir calls the function for source and everything under
+	// it, each directory before what is in it.
 	return filepath.WalkDir(source, func(path string, entry fs.DirEntry, err error) error {
 		if err != nil {
 			return err
@@ -234,7 +110,7 @@ func copyTree(source, target string) error {
 		if err != nil {
 			return err
 		}
-		to := filepath.Join(target, relative)
+		to := filepath.Join(data, relative)
 		mode := info.Mode()
 		switch {
 		case relative == ".":
@@ -288,37 +164,18 @@ func copyFile(from, to string) error {
 	return out.Close()
 }
 
-// makeMounts runs in init, before pivot_root: it makes each of mounts, as
-// stageMounts returned them, at its destination in rootfs, in order. A
-// destination that doesn't exist is made, in the container's writable
-// layer, unless keepRoot is set: then the root is a bundle's root
-// filesystem, which runt doesn't change.
-func makeMounts(rootfs string, mounts []Mount, keepRoot bool) error {
-	if len(mounts) == 0 {
-		return nil
-	}
-	// The root as it really is, symbolic links and all followed, for
-	// openMountTarget to check paths against.
-	root, err := filepath.EvalSymlinks(rootfs)
-	if err != nil {
-		return err
-	}
-	for _, mount := range mounts {
-		if err := makeMount(root, mount, keepRoot); err != nil {
-			return fmt.Errorf("mount %s: %w", mount.Destination, err)
-		}
-	}
-	return nil
-}
-
-// makeMount makes one mount at its destination in root.
+// makeMount makes one mount at its destination in root. It runs in init,
+// before pivot_root, for each of the mounts the supervisor staged (see
+// setupContainer). A destination that doesn't exist is made, in the
+// container's writable layer, unless keepRoot is set: then the root is a
+// bundle's root filesystem, which runt doesn't change.
 //
 // It mounts onto /proc/self/fd/N, N being a descriptor for the mount point,
 // rather than onto the mount point's path. The path would be looked up
 // again when mounting, and could lead somewhere else by then; the
-// descriptor is the very directory or file openMountTarget checked. This is
-// how runc makes its mounts too. /proc is still the host's at this point,
-// in which init is a process like any other.
+// descriptor is the very directory or file checked below. This is how runc
+// makes its mounts too. /proc is still the host's at this point, in which
+// init is a process like any other.
 func makeMount(root string, mount Mount, keepRoot bool) error {
 	dir := true
 	if mount.Type == MountBind {
@@ -328,45 +185,25 @@ func makeMount(root string, mount Mount, keepRoot bool) error {
 		}
 		dir = info.IsDir()
 	}
-	target, err := openMountTarget(root, mount.Destination, dir, keepRoot)
+	// Open the mount point for mount.Destination in root, making it if need
+	// be: a directory if dir is set, or else an empty file. Then check that
+	// what was opened is under root, and is of the right kind.
+	//
+	// O_PATH opens a file only to refer to it, not to read or write it,
+	// which works for a directory too, and O_NOFOLLOW opens a symbolic link
+	// itself rather than where it leads.
+	path, err := resolveInRoot(root, mount.Destination)
 	if err != nil {
 		return err
 	}
-	defer target.Close()
-	through := fmt.Sprintf("/proc/self/fd/%d", target.Fd())
-	if mount.Type == MountBind {
-		// The staging mount's flags, read-only for one, come along.
-		return syscall.Mount(mount.Source, through, "", syscall.MS_BIND|syscall.MS_REC, "")
-	}
-	flags, data := mountFlags(mount.Options)
-	return syscall.Mount("tmpfs", through, "tmpfs", flags, data)
-}
-
-// oPath is O_PATH, which the syscall package doesn't define, from
-// <asm-generic/fcntl.h>, as on amd64 and arm64.
-const oPath = 0o10000000
-
-// openMountTarget opens the mount point for destination in root, making it
-// if need be (see makeMounts): a directory if dir is set, or else an empty
-// file. It checks that what it opened is under root, and is of the right
-// kind.
-//
-// O_PATH opens a file only to refer to it, not to read or write it, which
-// works for a directory too, and O_NOFOLLOW opens a symbolic link itself
-// rather than where it leads.
-func openMountTarget(root, destination string, dir, keepRoot bool) (*os.File, error) {
-	path, err := resolveInRoot(root, destination)
-	if err != nil {
-		return nil, err
-	}
 	if _, err := os.Lstat(path); errors.Is(err, os.ErrNotExist) {
 		if keepRoot {
-			return nil, errors.New("no such file or directory in the bundle's root filesystem, which runt doesn't change")
+			return errors.New("no such file or directory in the bundle's root filesystem, which runt doesn't change")
 		}
 		// resolveInRoot followed every symbolic link there was, so these
 		// are made where the container will see them.
 		if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
-			return nil, err
+			return err
 		}
 		if dir {
 			err = os.Mkdir(path, 0o755)
@@ -377,22 +214,22 @@ func openMountTarget(root, destination string, dir, keepRoot bool) (*os.File, er
 			}
 		}
 		if err != nil {
-			return nil, err
+			return err
 		}
 	} else if err != nil {
-		return nil, err
+		return err
 	}
 
 	fd, err := syscall.Open(path, oPath|syscall.O_NOFOLLOW|syscall.O_CLOEXEC, 0)
 	if err != nil {
-		return nil, err
+		return err
 	}
 	target := os.NewFile(uintptr(fd), path)
 	// fail closes the descriptor and returns an error, for the checks
 	// below.
-	fail := func(format string, args ...any) (*os.File, error) {
+	fail := func(format string, args ...any) error {
 		target.Close()
-		return nil, fmt.Errorf(format, args...)
+		return fmt.Errorf(format, args...)
 	}
 	// The kernel's own idea of where the descriptor leads.
 	real, err := os.Readlink(fmt.Sprintf("/proc/self/fd/%d", fd))
@@ -414,8 +251,40 @@ func openMountTarget(root, destination string, dir, keepRoot bool) (*os.File, er
 	case !dir && kind == syscall.S_IFDIR:
 		return fail("the mount point is a directory, and what is mounted there isn't")
 	}
-	return target, nil
+	defer target.Close()
+	through := fmt.Sprintf("/proc/self/fd/%d", target.Fd())
+	if mount.Type == MountBind {
+		// The staging mount's flags, read-only for one, come along.
+		return syscall.Mount(mount.Source, through, "", syscall.MS_BIND|syscall.MS_REC, "")
+	}
+	// The mount options become the flags for the mount system call (ro,
+	// nosuid, nodev, and noexec), and the options passed on to the
+	// filesystem (those with an =, such as tmpfs's size=). Others, such as
+	// nocopy, are runt's own, and left out.
+	var flags uintptr
+	var passed []string
+	for _, option := range mount.Options {
+		switch option {
+		case "ro":
+			flags |= syscall.MS_RDONLY
+		case "nosuid":
+			flags |= syscall.MS_NOSUID
+		case "nodev":
+			flags |= syscall.MS_NODEV
+		case "noexec":
+			flags |= syscall.MS_NOEXEC
+		default:
+			if strings.Contains(option, "=") {
+				passed = append(passed, option)
+			}
+		}
+	}
+	return syscall.Mount("tmpfs", through, "tmpfs", flags, strings.Join(passed, ","))
 }
+
+// oPath is O_PATH, which the syscall package doesn't define, from
+// <asm-generic/fcntl.h>, as on amd64 and arm64.
+const oPath = 0o10000000
 
 // resolveInRoot returns the path that p, a path in the container, leads to
 // in root, the container's root filesystem as the host sees it: with each

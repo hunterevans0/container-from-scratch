@@ -50,67 +50,74 @@ func (p *ipam) reserve(id string) (*reservation, error) {
 	ones, bits := p.subnet.Mask.Size()
 	size := uint64(1) << (bits - ones)
 	for n := uint64(2); n+1 < size; n++ {
-		r, err := p.tryReserve(subnetAddress(p.subnet, uint32(n)), id)
-		if err != nil {
-			return nil, fmt.Errorf("reserve an address: %w", err)
-		}
-		if r != nil {
-			return r, nil
-		}
-	}
-	return nil, fmt.Errorf("no free addresses left in %s", p.subnet)
-}
-
-// tryReserve holds ip for container id, or returns nil if it is taken.
-//
-// Three cases: no file (nobody has the address: create one, locked), a
-// file somebody holds locked (taken: return nil), or a file nobody holds
-// (its owner died: take it over). Other processes may be doing the same at
-// the same moment, so where the situation may have changed between two
-// steps, the loop starts over (continue) and looks again.
-func (p *ipam) tryReserve(ip net.IP, id string) (*reservation, error) {
-	path := filepath.Join(p.dir, ip.String())
-	for {
-		file, err := os.OpenFile(path, os.O_RDWR, 0)
-		if errors.Is(err, os.ErrNotExist) {
-			file, err = createLocked(path, id)
-			if errors.Is(err, os.ErrExist) {
-				// Someone took it just now; see whether they still hold it.
-				continue
+		// The nth address in the subnet, counting the subnet's own as 0. An
+		// IPv4 address is 4 bytes, which read as one 32-bit number
+		// (big-endian, most significant byte first) can simply have n
+		// added.
+		ip := net.IP(binary.BigEndian.AppendUint32(nil, binary.BigEndian.Uint32(p.subnet.IP.To4())+uint32(n)))
+		// Hold ip for container id, or move on to the next address if it
+		// is taken.
+		//
+		// Three cases: no file (nobody has the address: create one,
+		// locked), a file somebody holds locked (taken: try the next
+		// address), or a file nobody holds (its owner died: take it over).
+		// Other processes may be doing the same at the same moment, so
+		// where the situation may have changed between two steps, the loop
+		// starts over (continue) and looks again.
+		path := filepath.Join(p.dir, ip.String())
+		for {
+			file, err := os.OpenFile(path, os.O_RDWR, 0)
+			if errors.Is(err, os.ErrNotExist) {
+				file, err = createLocked(path, id)
+				if errors.Is(err, os.ErrExist) {
+					// Someone took it just now; see whether they still hold it.
+					continue
+				}
+				if err != nil {
+					return nil, fmt.Errorf("reserve an address: %w", err)
+				}
+				return &reservation{ip: ip, path: path, file: file}, nil
 			}
 			if err != nil {
-				return nil, err
+				return nil, fmt.Errorf("reserve an address: %w", err)
+			}
+			if err := flock(file, syscall.LOCK_EX|syscall.LOCK_NB); err != nil {
+				file.Close()
+				if errors.Is(err, syscall.EWOULDBLOCK) {
+					// Taken.
+					break
+				}
+				return nil, fmt.Errorf("reserve an address: %w", err)
+			}
+			// Nobody holds the address, but its file may have been released,
+			// and so removed, between opening and locking it, and perhaps
+			// reserved again since, as a new file: file must still be the
+			// file at path, rather than one that has since been removed and
+			// replaced by another of the same name. os.SameFile compares the
+			// two by device and inode number, which identify a file whatever
+			// its name.
+			same := false
+			if opened, err := file.Stat(); err == nil {
+				named, err := os.Stat(path)
+				same = err == nil && os.SameFile(opened, named)
+			}
+			if !same {
+				file.Close()
+				continue
+			}
+			// Its owner died without releasing it. Take it over.
+			if err := file.Truncate(0); err != nil {
+				file.Close()
+				return nil, fmt.Errorf("reserve an address: %w", err)
+			}
+			if _, err := file.WriteAt([]byte(id), 0); err != nil {
+				file.Close()
+				return nil, fmt.Errorf("reserve an address: %w", err)
 			}
 			return &reservation{ip: ip, path: path, file: file}, nil
 		}
-		if err != nil {
-			return nil, err
-		}
-		if err := flock(file, syscall.LOCK_EX|syscall.LOCK_NB); err != nil {
-			file.Close()
-			if errors.Is(err, syscall.EWOULDBLOCK) {
-				return nil, nil
-			}
-			return nil, err
-		}
-		// Nobody holds the address, but its file may have been released,
-		// and so removed, between opening and locking it, and perhaps
-		// reserved again since, as a new file.
-		if !samePath(file, path) {
-			file.Close()
-			continue
-		}
-		// Its owner died without releasing it. Take it over.
-		if err := file.Truncate(0); err != nil {
-			file.Close()
-			return nil, err
-		}
-		if _, err := file.WriteAt([]byte(id), 0); err != nil {
-			file.Close()
-			return nil, err
-		}
-		return &reservation{ip: ip, path: path, file: file}, nil
 	}
+	return nil, fmt.Errorf("no free addresses left in %s", p.subnet)
 }
 
 // createLocked creates the file at path for a new reservation, holding id.
@@ -135,19 +142,6 @@ func createLocked(path, id string) (*os.File, error) {
 		return nil, err
 	}
 	return file, nil
-}
-
-// samePath reports whether file is still the file at path, rather than one
-// that has since been removed and replaced by another of the same name.
-// os.SameFile compares the two by device and inode number, which identify
-// a file whatever its name.
-func samePath(file *os.File, path string) bool {
-	opened, err := file.Stat()
-	if err != nil {
-		return false
-	}
-	named, err := os.Stat(path)
-	return err == nil && os.SameFile(opened, named)
 }
 
 // release gives the address back. The file is removed before it is
@@ -204,13 +198,6 @@ func (p *ipam) inUse() (bool, error) {
 		}
 	}
 	return false, nil
-}
-
-// subnetAddress returns the nth address in an IPv4 subnet, counting the
-// subnet's own as 0. An IPv4 address is 4 bytes, which read as one 32-bit
-// number (big-endian, most significant byte first) can simply have n added.
-func subnetAddress(subnet *net.IPNet, n uint32) net.IP {
-	return binary.BigEndian.AppendUint32(nil, binary.BigEndian.Uint32(subnet.IP.To4())+n)
 }
 
 // macAddress makes a MAC address from an IPv4 address, as Docker does: 02:42

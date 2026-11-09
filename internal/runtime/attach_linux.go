@@ -16,6 +16,7 @@ import (
 	"sync"
 	"syscall"
 	"time"
+	"unsafe"
 )
 
 // runt attach connects to a container that runs in the background. Whatever
@@ -372,7 +373,9 @@ func Attach(ref string, options AttachOptions) error {
 		}
 		if terminal != nil {
 			resize := func() {
-				if size, err := getWinsize(terminal); err == nil && size.rows > 0 && size.cols > 0 {
+				// The terminal's size, in rows and columns.
+				var size winsize
+				if err := ioctl(terminal, syscall.TIOCGWINSZ, unsafe.Pointer(&size)); err == nil && size.rows > 0 && size.cols > 0 {
 					send(frameResize, binary.BigEndian.AppendUint16(binary.BigEndian.AppendUint16(nil, size.rows), size.cols))
 				}
 			}
@@ -442,8 +445,18 @@ func Attach(ref string, options AttachOptions) error {
 	if options.Start {
 		// Whether the command runs or not, the exit code comes back over
 		// the connection, and init's error, if any, as output.
-		if err := writeStartFifo(state.ID); err != nil {
-			return err
+		//
+		// Tell the container's init to run the command. O_NONBLOCK makes
+		// the open fail with ENXIO, instead of waiting, if no init has the
+		// FIFO open for reading.
+		fifo, err := os.OpenFile(filepath.Join(stateDir(StateRoot, state.ID), startFifoName), os.O_WRONLY|syscall.O_NONBLOCK, 0)
+		if err != nil {
+			return fmt.Errorf("container %s is not waiting to start: %w", state.ID, err)
+		}
+		_, err = fifo.Write([]byte{0})
+		fifo.Close()
+		if err != nil {
+			return fmt.Errorf("start container %s: %w", state.ID, err)
 		}
 	}
 

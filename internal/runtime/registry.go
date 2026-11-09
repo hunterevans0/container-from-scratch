@@ -159,9 +159,14 @@ func (c *registryClient) do(method, target string, header http.Header, body requ
 		}
 		request.Header.Set("User-Agent", "runt/0.1.0")
 		// Credentials only go to the registry itself, not to wherever an
-		// upload's Location may point.
-		if c.authorization != "" && sameHost(target, c.base) {
-			request.Header.Set("Authorization", c.authorization)
+		// upload's Location may point: target must be on the same host and
+		// port.
+		if c.authorization != "" {
+			targetURL, targetErr := url.Parse(target)
+			baseURL, baseErr := url.Parse(c.base)
+			if targetErr == nil && baseErr == nil && targetURL.Host == baseURL.Host {
+				request.Header.Set("Authorization", c.authorization)
+			}
 		}
 		if body != nil {
 			content, size, err := body()
@@ -181,40 +186,31 @@ func (c *registryClient) do(method, target string, header http.Header, body requ
 		}
 		challenge := response.Header.Get("WWW-Authenticate")
 		response.Body.Close()
-		if c.authorization, err = c.authenticate(challenge); err != nil {
-			return nil, err
+		// Answer the WWW-Authenticate challenge, with the Authorization
+		// header to send from now on (none, if it can't be answered).
+		scheme, params := parseChallenge(challenge)
+		user, password := c.credentials()
+		switch strings.ToLower(scheme) {
+		case "basic":
+			if user == "" {
+				c.authorization = ""
+				return nil, errors.New("the registry needs a user name and password; log in with runt login")
+			}
+			// HTTP Basic authentication: "Basic " and USER:PASSWORD in
+			// base64, an encoding of bytes as letters, digits, + and /.
+			c.authorization = "Basic " + base64.StdEncoding.EncodeToString([]byte(user+":"+password))
+		case "bearer":
+			token, err := c.fetchToken(params, user, password)
+			if err != nil {
+				c.authorization = ""
+				return nil, err
+			}
+			c.authorization = "Bearer " + token
+		default:
+			c.authorization = ""
+			return nil, fmt.Errorf("the registry asks for unsupported authentication %q", challenge)
 		}
 	}
-}
-
-// sameHost reports whether two URLs are on the same host and port.
-func sameHost(a, b string) bool {
-	ua, errA := url.Parse(a)
-	ub, errB := url.Parse(b)
-	return errA == nil && errB == nil && ua.Host == ub.Host
-}
-
-// authenticate answers a WWW-Authenticate challenge, returning the
-// Authorization header to send from now on.
-func (c *registryClient) authenticate(challenge string) (string, error) {
-	scheme, params := parseChallenge(challenge)
-	user, password := c.credentials()
-	switch strings.ToLower(scheme) {
-	case "basic":
-		if user == "" {
-			return "", errors.New("the registry needs a user name and password; log in with runt login")
-		}
-		// HTTP Basic authentication: "Basic " and USER:PASSWORD in base64,
-		// an encoding of bytes as letters, digits, + and /.
-		return "Basic " + base64.StdEncoding.EncodeToString([]byte(user+":"+password)), nil
-	case "bearer":
-		token, err := c.fetchToken(params, user, password)
-		if err != nil {
-			return "", err
-		}
-		return "Bearer " + token, nil
-	}
-	return "", fmt.Errorf("the registry asks for unsupported authentication %q", challenge)
 }
 
 // fetchToken asks the token server named in a Bearer challenge for a token
@@ -328,32 +324,6 @@ func parseChallenge(header string) (scheme string, params map[string]string) {
 	return scheme, params
 }
 
-// registryError turns an unsuccessful response into an error, with the
-// message from the registry's JSON error body if it sent one.
-func registryError(response *http.Response, what string) error {
-	detail := registryErrorDetail(response)
-	if response.StatusCode == http.StatusNotFound || response.StatusCode == http.StatusUnauthorized {
-		return fmt.Errorf("%s: %s (does the image exist, and do you need runt login?)", what, detail)
-	}
-	return fmt.Errorf("%s: %s", what, detail)
-}
-
-// registryErrorDetail is what went wrong, by the registry's JSON error body
-// if it sent one, or else the response's status.
-func registryErrorDetail(response *http.Response) string {
-	var body struct {
-		Errors []struct {
-			Code    string `json:"code"`
-			Message string `json:"message"`
-		} `json:"errors"`
-	}
-	json.NewDecoder(io.LimitReader(response.Body, 64*1024)).Decode(&body)
-	if len(body.Errors) > 0 {
-		return strings.ToLower(body.Errors[0].Code) + ": " + body.Errors[0].Message
-	}
-	return response.Status
-}
-
 // fetchManifest gets the manifest or index that ref (a tag or digest)
 // names, and checks it against the digest if ref is one. It returns the
 // manifest's descriptor and content.
@@ -364,7 +334,24 @@ func (c *registryClient) fetchManifest(ref string) (ociDescriptor, []byte, error
 	}
 	defer response.Body.Close()
 	if response.StatusCode != http.StatusOK {
-		return ociDescriptor{}, nil, registryError(response, "get manifest "+c.repository+":"+ref)
+		// What went wrong, by the registry's JSON error body if it sent
+		// one, or else the response's status.
+		var body struct {
+			Errors []struct {
+				Code    string `json:"code"`
+				Message string `json:"message"`
+			} `json:"errors"`
+		}
+		json.NewDecoder(io.LimitReader(response.Body, 64*1024)).Decode(&body)
+		detail := response.Status
+		if len(body.Errors) > 0 {
+			detail = strings.ToLower(body.Errors[0].Code) + ": " + body.Errors[0].Message
+		}
+		what := "get manifest " + c.repository + ":" + ref
+		if response.StatusCode == http.StatusNotFound || response.StatusCode == http.StatusUnauthorized {
+			return ociDescriptor{}, nil, fmt.Errorf("%s: %s (does the image exist, and do you need runt login?)", what, detail)
+		}
+		return ociDescriptor{}, nil, fmt.Errorf("%s: %s", what, detail)
 	}
 	// Read one byte more than allowed, so a manifest that is too big shows
 	// up as too long, rather than being cut short and looking fine.
@@ -412,7 +399,24 @@ func (c *registryClient) fetchBlob(desc ociDescriptor, path string) error {
 	}
 	defer response.Body.Close()
 	if response.StatusCode != http.StatusOK {
-		return registryError(response, "get blob "+desc.Digest)
+		// What went wrong, by the registry's JSON error body if it sent
+		// one, or else the response's status.
+		var body struct {
+			Errors []struct {
+				Code    string `json:"code"`
+				Message string `json:"message"`
+			} `json:"errors"`
+		}
+		json.NewDecoder(io.LimitReader(response.Body, 64*1024)).Decode(&body)
+		detail := response.Status
+		if len(body.Errors) > 0 {
+			detail = strings.ToLower(body.Errors[0].Code) + ": " + body.Errors[0].Message
+		}
+		what := "get blob " + desc.Digest
+		if response.StatusCode == http.StatusNotFound || response.StatusCode == http.StatusUnauthorized {
+			return fmt.Errorf("%s: %s (does the image exist, and do you need runt login?)", what, detail)
+		}
+		return fmt.Errorf("%s: %s", what, detail)
 	}
 	file, err := os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0o600)
 	if err != nil {
@@ -525,10 +529,23 @@ func (c *registryClient) putManifest(tag string, desc ociDescriptor, data []byte
 	return nil
 }
 
-// pushError is registryError for a push, whose usual trouble is not being
-// allowed to.
+// pushError turns an unsuccessful response to a push into an error, with
+// the message from the registry's JSON error body if it sent one. A push's
+// usual trouble is not being allowed to.
 func pushError(response *http.Response, what string) error {
-	detail := registryErrorDetail(response)
+	// What went wrong, by the registry's JSON error body if it sent
+	// one, or else the response's status.
+	var body struct {
+		Errors []struct {
+			Code    string `json:"code"`
+			Message string `json:"message"`
+		} `json:"errors"`
+	}
+	json.NewDecoder(io.LimitReader(response.Body, 64*1024)).Decode(&body)
+	detail := response.Status
+	if len(body.Errors) > 0 {
+		detail = strings.ToLower(body.Errors[0].Code) + ": " + body.Errors[0].Message
+	}
 	if response.StatusCode == http.StatusUnauthorized || response.StatusCode == http.StatusForbidden {
 		return fmt.Errorf("%s: %s (pushing needs runt login, as a user allowed to push to the repository)", what, detail)
 	}
@@ -569,23 +586,6 @@ func credentialKey(domain string) string {
 	return domain
 }
 
-// readDockerConfig reads config.json as raw JSON fields, so that writing it
-// back keeps the fields runt doesn't know about. A missing file is empty.
-func readDockerConfig(path string) (map[string]json.RawMessage, error) {
-	config := map[string]json.RawMessage{}
-	data, err := os.ReadFile(path)
-	if errors.Is(err, os.ErrNotExist) {
-		return config, nil
-	}
-	if err != nil {
-		return nil, err
-	}
-	if err := json.Unmarshal(data, &config); err != nil {
-		return nil, fmt.Errorf("%s: %w", path, err)
-	}
-	return config, nil
-}
-
 // storedCredentials returns the user name and password stored for a
 // registry, or empty strings if there are none.
 func storedCredentials(domain string) (user, password string, err error) {
@@ -593,9 +593,16 @@ func storedCredentials(domain string) (user, password string, err error) {
 	if err != nil {
 		return "", "", err
 	}
-	config, err := readDockerConfig(path)
-	if err != nil {
-		return "", "", err
+	// Read config.json as raw JSON fields. A missing file is empty.
+	config := map[string]json.RawMessage{}
+	data, err := os.ReadFile(path)
+	if !errors.Is(err, os.ErrNotExist) {
+		if err != nil {
+			return "", "", err
+		}
+		if err := json.Unmarshal(data, &config); err != nil {
+			return "", "", fmt.Errorf("%s: %w", path, err)
+		}
 	}
 	// Decode the three fields runt reads. Errors are ignored: a field
 	// that is missing or malformed simply stays empty.
@@ -636,16 +643,12 @@ func storedCredentials(domain string) (user, password string, err error) {
 	if helper == "" {
 		return "", "", nil
 	}
-	return helperCredentials(helper, key)
-}
-
-// helperCredentials asks the credential helper docker-credential-NAME for a
-// registry's credentials: it reads the registry's key on its input and
-// prints them as JSON.
-func helperCredentials(name, key string) (user, password string, err error) {
-	// strings.NewReader makes an io.Reader of a string, which becomes the
-	// helper's input. Output runs the program and returns what it printed.
-	command := exec.Command("docker-credential-"+name, "get")
+	// Ask the credential helper docker-credential-NAME for the registry's
+	// credentials: it reads the registry's key on its input and prints them
+	// as JSON. strings.NewReader makes an io.Reader of a string, which
+	// becomes the helper's input. Output runs the program and returns what
+	// it printed.
+	command := exec.Command("docker-credential-"+helper, "get")
 	command.Stdin = strings.NewReader(key)
 	output, err := command.Output()
 	if err != nil {
@@ -653,14 +656,14 @@ func helperCredentials(name, key string) (user, password string, err error) {
 		if errors.As(err, &exitErr) && strings.Contains(string(output)+string(exitErr.Stderr), "not found") {
 			return "", "", nil
 		}
-		return "", "", fmt.Errorf("credential helper docker-credential-%s: %w", name, err)
+		return "", "", fmt.Errorf("credential helper docker-credential-%s: %w", helper, err)
 	}
 	var credentials struct {
 		Username string `json:"Username"`
 		Secret   string `json:"Secret"`
 	}
 	if err := json.Unmarshal(output, &credentials); err != nil {
-		return "", "", fmt.Errorf("credential helper docker-credential-%s: %w", name, err)
+		return "", "", fmt.Errorf("credential helper docker-credential-%s: %w", helper, err)
 	}
 	if credentials.Username == "<token>" {
 		// An identity token, for OAuth; runt doesn't do that.
@@ -673,9 +676,22 @@ func helperCredentials(name, key string) (user, password string, err error) {
 // such as docker.io or localhost:5000, and stores them in Docker's
 // config.json. It returns the file's path.
 func Login(server, user, password string) (string, error) {
-	domain, err := loginDomain(server)
-	if err != nil {
-		return "", err
+	// Turn the argument into a registry domain: empty means Docker Hub, and a
+	// URL is reduced to its host.
+	domain := server
+	if server == "" || server == dockerHubAuthKey || server == "index.docker.io" || server == dockerHubRegistry {
+		domain = dockerHubDomain
+	} else {
+		if strings.Contains(domain, "://") {
+			u, err := url.Parse(domain)
+			if err != nil {
+				return "", err
+			}
+			domain = u.Host
+		}
+		if !referenceDomain.MatchString(domain) {
+			return "", fmt.Errorf("invalid registry %q", domain)
+		}
 	}
 	if user == "" || password == "" {
 		return "", errors.New("a user name and password are required")
@@ -701,87 +717,112 @@ func Login(server, user, password string) (string, error) {
 		return "", err
 	}
 	auth := dockerConfigAuth{Auth: base64.StdEncoding.EncodeToString([]byte(user + ":" + password))}
-	// The anonymous function is the change to make: set this registry's
-	// entry. updateDockerAuths does the reading and writing around it.
-	return path, updateDockerAuths(path, func(auths map[string]json.RawMessage) error {
-		data, err := json.Marshal(auth)
-		auths[credentialKey(domain)] = data
-		return err
-	})
+	// Change the "auths" entries of config.json, keeping everything else in
+	// the file as it was. The file holds passwords, so it is only readable by
+	// its owner. json.RawMessage holds a piece of JSON undecoded, so entries
+	// and fields runt doesn't understand are written back exactly as they were
+	// read. A missing file is empty.
+	config := map[string]json.RawMessage{}
+	data, err := os.ReadFile(path)
+	if !errors.Is(err, os.ErrNotExist) {
+		if err != nil {
+			return path, err
+		}
+		if err := json.Unmarshal(data, &config); err != nil {
+			return path, fmt.Errorf("%s: %w", path, err)
+		}
+	}
+	auths := map[string]json.RawMessage{}
+	if raw, ok := config["auths"]; ok {
+		if err := json.Unmarshal(raw, &auths); err != nil {
+			return path, fmt.Errorf("%s: auths: %w", path, err)
+		}
+	}
+	// The change to make: set this registry's entry.
+	entry, err := json.Marshal(auth)
+	auths[credentialKey(domain)] = entry
+	if err != nil {
+		return path, err
+	}
+	if config["auths"], err = json.Marshal(auths); err != nil {
+		return path, err
+	}
+	data, err = json.MarshalIndent(config, "", "\t")
+	if err != nil {
+		return path, err
+	}
+	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+		return path, err
+	}
+	temp := path + ".tmp"
+	if err := os.WriteFile(temp, append(data, '\n'), 0o600); err != nil {
+		return path, err
+	}
+	return path, os.Rename(temp, path)
 }
 
 // Logout removes the credentials stored for a registry. It reports whether
 // there were any.
 func Logout(server string) (bool, error) {
-	domain, err := loginDomain(server)
-	if err != nil {
-		return false, err
+	// Turn the argument into a registry domain: empty means Docker Hub, and a
+	// URL is reduced to its host.
+	domain := server
+	if server == "" || server == dockerHubAuthKey || server == "index.docker.io" || server == dockerHubRegistry {
+		domain = dockerHubDomain
+	} else {
+		if strings.Contains(domain, "://") {
+			u, err := url.Parse(domain)
+			if err != nil {
+				return false, err
+			}
+			domain = u.Host
+		}
+		if !referenceDomain.MatchString(domain) {
+			return false, fmt.Errorf("invalid registry %q", domain)
+		}
 	}
 	path, err := dockerConfigPath()
 	if err != nil {
 		return false, err
 	}
 	found := false
-	err = updateDockerAuths(path, func(auths map[string]json.RawMessage) error {
-		_, found = auths[credentialKey(domain)]
-		delete(auths, credentialKey(domain))
-		return nil
-	})
-	return found, err
-}
-
-// loginDomain turns runt login's argument into a registry domain: empty
-// means Docker Hub, and a URL is reduced to its host.
-func loginDomain(server string) (string, error) {
-	if server == "" || server == dockerHubAuthKey || server == "index.docker.io" || server == dockerHubRegistry {
-		return dockerHubDomain, nil
-	}
-	if strings.Contains(server, "://") {
-		u, err := url.Parse(server)
+	// Change the "auths" entries of config.json, keeping everything else in
+	// the file as it was. The file holds passwords, so it is only readable by
+	// its owner. json.RawMessage holds a piece of JSON undecoded, so entries
+	// and fields runt doesn't understand are written back exactly as they were
+	// read. A missing file is empty.
+	config := map[string]json.RawMessage{}
+	data, err := os.ReadFile(path)
+	if !errors.Is(err, os.ErrNotExist) {
 		if err != nil {
-			return "", err
+			return found, err
 		}
-		server = u.Host
-	}
-	if !referenceDomain.MatchString(server) {
-		return "", fmt.Errorf("invalid registry %q", server)
-	}
-	return server, nil
-}
-
-// updateDockerAuths changes the "auths" entries of config.json, keeping
-// everything else in the file as it was. The file holds passwords, so it
-// is only readable by its owner.
-//
-// json.RawMessage holds a piece of JSON undecoded, so entries and fields
-// runt doesn't understand are written back exactly as they were read.
-func updateDockerAuths(path string, change func(auths map[string]json.RawMessage) error) error {
-	config, err := readDockerConfig(path)
-	if err != nil {
-		return err
+		if err := json.Unmarshal(data, &config); err != nil {
+			return found, fmt.Errorf("%s: %w", path, err)
+		}
 	}
 	auths := map[string]json.RawMessage{}
 	if raw, ok := config["auths"]; ok {
 		if err := json.Unmarshal(raw, &auths); err != nil {
-			return fmt.Errorf("%s: auths: %w", path, err)
+			return found, fmt.Errorf("%s: auths: %w", path, err)
 		}
 	}
-	if err := change(auths); err != nil {
-		return err
-	}
+	// The change to make: remove this registry's entry, if it has one.
+	_, found = auths[credentialKey(domain)]
+	delete(auths, credentialKey(domain))
 	if config["auths"], err = json.Marshal(auths); err != nil {
-		return err
+		return found, err
 	}
-	data, err := json.MarshalIndent(config, "", "\t")
+	data, err = json.MarshalIndent(config, "", "\t")
 	if err != nil {
-		return err
+		return found, err
 	}
 	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
-		return err
+		return found, err
 	}
 	temp := path + ".tmp"
 	if err := os.WriteFile(temp, append(data, '\n'), 0o600); err != nil {
-		return err
+		return found, err
 	}
-	return os.Rename(temp, path)
+	return found, os.Rename(temp, path)
 }

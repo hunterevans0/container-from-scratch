@@ -5,19 +5,24 @@ package runtime
 import (
 	"bufio"
 	"bytes"
+	"encoding/binary"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
+	"net"
 	"os"
 	"os/exec"
 	"os/signal"
+	"path"
 	"path/filepath"
 	"slices"
+	"strconv"
 	"strings"
 	"sync"
 	"syscall"
 	"time"
+	"unsafe"
 )
 
 // The container's life, from the host's side: making it (supervise, through
@@ -244,22 +249,82 @@ func supervise(config Config, foreground, autoStart bool, ready func(id string, 
 		defer unlockImages()
 		image = config.image
 		if image == nil {
-			if image, err = openImageRef(config.Image); err != nil {
-				return err
+			// Open the image config.Image names: an OCI image layout
+			// directory, or else an image in the store, whose lock is held
+			// above.
+			if isLayoutRef(config.Image) {
+				if image, err = openImage(config.Image); err != nil {
+					return err
+				}
+			} else {
+				found, err := defaultImageStore().find(config.Image)
+				if err != nil {
+					return err
+				}
+				image = found.image
 			}
 		}
 		if err := applyImageConfig(&config, image); err != nil {
 			return err
 		}
-		if layers, err = unpackImage(image, uids, gids); err != nil {
-			return err
+		// Make sure every layer of the image is unpacked, with its file
+		// ownership shifted into the container's ID ranges, and list the
+		// layer directories top first, the order overlayfs takes them in.
+		//
+		// Layers are stored by digest under layerRoot/<uid base>-<gid base>,
+		// since their ownership depends on the ranges, and are shared by
+		// every container that uses them. A layer is unpacked into a
+		// temporary directory and renamed into place when complete, so a
+		// half-unpacked layer is never used, and two runt processes
+		// unpacking the same layer at once don't get in each other's way.
+		store := filepath.Join(layerRoot, fmt.Sprintf("%d-%d", uids.Base, gids.Base))
+		if err := os.MkdirAll(store, 0o700); err != nil {
+			return fmt.Errorf("create layer store: %w", err)
 		}
+		var dirs []string
+		for i, layer := range image.manifest.Layers {
+			blob, err := image.blobPath(layer.Digest)
+			if err != nil {
+				return err
+			}
+			dir := filepath.Join(store, filepath.Base(blob))
+			dirs = append(dirs, dir)
+			if _, err := os.Stat(dir); err == nil {
+				continue
+			}
+			temp, err := os.MkdirTemp(store, "unpacking-")
+			if err != nil {
+				return fmt.Errorf("create layer directory: %w", err)
+			}
+			err = unpackLayer(blob, layer, image.config.RootFS.DiffIDs[i], temp, uids, gids)
+			if err == nil {
+				err = os.Rename(temp, dir)
+			}
+			if err != nil {
+				os.RemoveAll(temp)
+				if _, statErr := os.Stat(dir); statErr == nil {
+					// Another runt finished unpacking it first.
+					continue
+				}
+				return fmt.Errorf("unpack layer %s: %w", layer.Digest, err)
+			}
+		}
+		// The manifest lists layers bottom first; overlayfs wants them top
+		// first.
+		slices.Reverse(dirs)
+		layers = dirs
 	} else {
 		if config.Rootfs, err = filepath.Abs(config.Rootfs); err != nil {
 			return err
 		}
-		if err := checkRootfsOwner(config.Rootfs, uids, gids); err != nil {
-			return err
+		// Fail early with a helpful message if the rootfs has not been
+		// shifted into the user-namespace ID ranges.
+		var stat syscall.Stat_t
+		if err := syscall.Stat(config.Rootfs, &stat); err != nil {
+			return fmt.Errorf("stat rootfs %q: %w", config.Rootfs, err)
+		}
+		if int(stat.Uid) != uids.Base || int(stat.Gid) != gids.Base {
+			return fmt.Errorf("rootfs %q is owned by host %d:%d, but container root is host %d:%d; run `make rootfs` to shift its ownership", config.Rootfs, stat.Uid, stat.Gid, uids.Base, gids.Base)
 		}
 		if !config.DirectRootfs {
 			layers = []string{config.Rootfs}
@@ -276,10 +341,16 @@ func supervise(config Config, foreground, autoStart bool, ready func(id string, 
 		}
 		config.Env = mergeEnv(env, config.SetEnv)
 	}
-	if err := checkCwd(config.Cwd); err != nil {
-		return err
+	// Reject a working directory that isn't an absolute path, since there is
+	// nothing for a relative one to be relative to.
+	if config.Cwd != "" && !path.IsAbs(config.Cwd) {
+		return fmt.Errorf("the working directory %q must be an absolute path", config.Cwd)
 	}
-	useCgroup := cgroupV2()
+	// Whether the unified cgroup v2 hierarchy is mounted. statfs describes
+	// the filesystem a path is on, including a number saying what kind of
+	// filesystem it is.
+	var cgroupStat syscall.Statfs_t
+	useCgroup := syscall.Statfs(cgroupRoot, &cgroupStat) == nil && cgroupStat.Type == cgroup2SuperMagic
 	if !useCgroup && !config.Resources.IsZero() {
 		return errors.New("resource limits need cgroup v2 mounted at /sys/fs/cgroup")
 	}
@@ -347,11 +418,101 @@ func supervise(config Config, foreground, autoStart bool, ready func(id string, 
 
 	rootfs := config.Rootfs
 	if layers != nil {
-		pruneContainerFS()
-		rootfs, err = mountContainerFS(id, layers, uids, gids)
-		if err != nil {
-			return err
+		// Remove writable layers that no container owns any more. /run is a
+		// tmpfs, so after a reboot the containers' state is gone but their
+		// writable layers in /var/lib remain, with nothing left to remove
+		// them. Every container's state directory is made before its
+		// writable layer, and removed after it, so a layer without one is an
+		// orphan.
+		if entries, err := os.ReadDir(containerFSRoot); err == nil {
+			for _, entry := range entries {
+				if _, err := os.Stat(stateDir(StateRoot, entry.Name())); !errors.Is(err, os.ErrNotExist) {
+					continue
+				}
+				if err := removeContainerFS(entry.Name()); err != nil {
+					warn(err)
+				}
+			}
 		}
+		// Mount the container's root filesystem: an overlay of layers, given
+		// top first, under a new writable layer. rootfs is its mount point.
+		if len(layers) == 0 {
+			return errors.New("no filesystem layers")
+		}
+		for _, layer := range layers {
+			// The mount options use these to separate layers and options.
+			if strings.ContainsAny(layer, ":,\\") {
+				return fmt.Errorf("layer path %q contains ':', ',', or '\\', which overlayfs can't take", layer)
+			}
+		}
+		// Init runs as container root, an unprivileged host user, and has to
+		// reach the mount point. 0711 lets anyone pass through the top
+		// directory, and the container's own directory lets in only its
+		// group, container root's.
+		if err := os.MkdirAll(containerFSRoot, 0o711); err != nil {
+			return fmt.Errorf("create %s: %w", containerFSRoot, err)
+		}
+		fsDir := containerFSDir(id)
+		if err := os.Mkdir(fsDir, 0o710); err != nil {
+			return fmt.Errorf("create container filesystem directory: %w", err)
+		}
+		// cleanup removes what has been made so far, on any failure from
+		// here on.
+		cleanup := func() { os.RemoveAll(fsDir) }
+		if err := os.Chown(fsDir, 0, gids.Base); err != nil {
+			cleanup()
+			return fmt.Errorf("set owner of %s: %w", fsDir, err)
+		}
+
+		upper := filepath.Join(fsDir, "upper")
+		work := filepath.Join(fsDir, "work")
+		merged := filepath.Join(fsDir, "rootfs")
+		// The root directory of the overlay takes its owner and mode from
+		// the writable layer: container root, with the mode of the top
+		// layer's root.
+		mode := os.FileMode(0o755)
+		if info, err := os.Stat(layers[0]); err == nil {
+			mode = info.Mode().Perm()
+		}
+		// The steps are a slice of anonymous functions, run in order, so
+		// that one error check covers them all.
+		for _, step := range []func() error{
+			func() error { return os.Mkdir(upper, mode) },
+			func() error { return os.Chmod(upper, mode) }, // undo the umask
+			func() error { return os.Chown(upper, uids.Base, gids.Base) },
+			func() error { return os.Mkdir(work, 0o700) },
+			func() error { return os.Mkdir(merged, 0o755) },
+		} {
+			if err := step(); err != nil {
+				cleanup()
+				return fmt.Errorf("prepare container filesystem: %w", err)
+			}
+		}
+
+		// The overlay's options name its layers: lowerdir lists the
+		// read-only ones, top first and separated by colons, upperdir is the
+		// writable one, and workdir the scratch space.
+		//
+		// redirect_dir=off and metacopy=off keep the writable layer complete
+		// in itself, so runt build can turn it into an image layer (see
+		// buildlayer_linux.go). Otherwise, renaming a directory from a lower
+		// layer could leave only a pointer to it in the writable layer, and
+		// changing a file's owner or mode only its new metadata, without its
+		// content. Either feature may be on by default, depending on how the
+		// kernel was built.
+		options := fmt.Sprintf("lowerdir=%s,upperdir=%s,workdir=%s,redirect_dir=off,metacopy=off", strings.Join(layers, ":"), upper, work)
+		// Mount options must fit in one page.
+		if len(options) >= os.Getpagesize() {
+			cleanup()
+			return fmt.Errorf("too many layers (%d) to fit overlayfs's mount options", len(layers))
+		}
+		// nodev: an image could contain device files, and a mount made by
+		// host root would let the container open them.
+		if err := syscall.Mount("overlay", merged, "overlay", syscall.MS_NODEV, options); err != nil {
+			cleanup()
+			return fmt.Errorf("mount overlay filesystem: %w", err)
+		}
+		rootfs = merged
 		// The container's own namespace has its own copy of the mount, so
 		// the host's can go once init is gone. The writable layer stays
 		// for runt rm, unless the container never got going.
@@ -391,15 +552,143 @@ func supervise(config Config, foreground, autoStart bool, ready func(id string, 
 			}
 		})
 		defer unstage()
-		if mounts, err = stageMounts(id, config.Mounts, rootfs, layers != nil, uids, gids); err != nil {
-			return err
+		// Stage the mounts, as host root, before init is cloned: mounts is
+		// config.Mounts as init is to make them, each volume made if need
+		// be, and each bind mount and volume turned into a bind mount from
+		// its staging directory. New volumes are filled from rootfs, the
+		// container's root filesystem as mounted on the host, if it has
+		// layers.
+		//
+		// Container root has to find the mount points, and nobody else need
+		// see what they are: 0711 lets anyone pass through the top
+		// directory, and the container's own lets in only its group,
+		// container root's.
+		if err := os.MkdirAll(mountStagingRoot, 0o711); err != nil {
+			return fmt.Errorf("create %s: %w", mountStagingRoot, err)
 		}
+		stagingDir := filepath.Join(mountStagingRoot, id)
+		if err := os.Mkdir(stagingDir, 0o710); err != nil {
+			return fmt.Errorf("create mount staging directory: %w", err)
+		}
+		if err := os.Chown(stagingDir, 0, gids.Base); err != nil {
+			return fmt.Errorf("set owner of %s: %w", stagingDir, err)
+		}
+		staged := make([]Mount, len(config.Mounts))
+		for i, mount := range config.Mounts {
+			if mount.Type == MountTmpfs {
+				staged[i] = mount
+				continue
+			}
+			source := mount.Source
+			if mount.Type == MountVolume {
+				volume, _, err := ensureVolume(mount.Source, uids, gids)
+				if err != nil {
+					return err
+				}
+				source = volume.Mountpoint
+				if layers != nil && !slices.Contains(mount.Options, "nocopy") {
+					if err := populateVolume(source, rootfs, mount.Destination); err != nil {
+						return fmt.Errorf("fill volume %s from the image: %w", mount.Source, err)
+					}
+				}
+			}
+			// Stat follows a symbolic link, as the bind mount will.
+			info, err := os.Stat(source)
+			if errors.Is(err, os.ErrNotExist) {
+				return fmt.Errorf("bind mount source %s does not exist", source)
+			}
+			if err != nil {
+				return err
+			}
+			// A bind mount goes onto a directory if its source is one, and
+			// onto a file otherwise.
+			target := filepath.Join(stagingDir, strconv.Itoa(i))
+			if info.IsDir() {
+				err = os.Mkdir(target, 0o700)
+			} else {
+				err = os.WriteFile(target, nil, 0o600)
+			}
+			if err != nil {
+				return fmt.Errorf("create mount point %s: %w", target, err)
+			}
+			// MS_REC takes along whatever is mounted inside the source, as
+			// Docker's bind mounts do.
+			if err := syscall.Mount(source, target, "", syscall.MS_BIND|syscall.MS_REC, ""); err != nil {
+				return fmt.Errorf("bind mount %s: %w", source, err)
+			}
+			// A bind mount ignores MS_RDONLY and the like the first time, so
+			// read-only takes a second step. Init's copy keeps the flags,
+			// and, as it came from the host, can't be made writable again.
+			//
+			// The mount options that are flags for the mount system call:
+			// ro, nosuid, nodev, and noexec.
+			var flags uintptr
+			for _, option := range mount.Options {
+				switch option {
+				case "ro":
+					flags |= syscall.MS_RDONLY
+				case "nosuid":
+					flags |= syscall.MS_NOSUID
+				case "nodev":
+					flags |= syscall.MS_NODEV
+				case "noexec":
+					flags |= syscall.MS_NOEXEC
+				}
+			}
+			if flags != 0 {
+				// A remount sets every flag at once, so it has to repeat the
+				// nosuid, nodev, and noexec flags the mount already has, or
+				// it would take them away. In a user namespace, the kernel
+				// also locks them on mounts that came from a more privileged
+				// one, and refuses a remount that would clear them.
+				var stat syscall.Statfs_t
+				if err := syscall.Statfs(target, &stat); err != nil {
+					return fmt.Errorf("make the mount of %s %s: %w", source, strings.Join(mount.Options, ","), fmt.Errorf("read mount flags of %s: %w", target, err))
+				}
+				// ST_NOSUID, ST_NODEV, and ST_NOEXEC have the same values as
+				// the MS_ flags.
+				kept := uintptr(stat.Flags) & (syscall.MS_NOSUID | syscall.MS_NODEV | syscall.MS_NOEXEC)
+				if err := syscall.Mount("", target, "", syscall.MS_BIND|syscall.MS_REMOUNT|flags|kept, ""); err != nil {
+					return fmt.Errorf("make the mount of %s %s: %w", source, strings.Join(mount.Options, ","), err)
+				}
+			}
+			staged[i] = Mount{Type: MountBind, Source: target, Destination: mount.Destination}
+		}
+		mounts = staged
 	}
 
 	cgroupFD := -1
 	if useCgroup {
-		cgroup, err := createCgroup(id, config.Resources)
+		// Make the container's cgroup and write its limits. The container
+		// is placed in it as it is cloned (below), so it is limited from its
+		// first instruction.
+		//
+		// A controller can only be used in a cgroup if every ancestor
+		// enables it for its children in cgroup.subtree_control.
+		if err := os.MkdirAll(cgroupParent, 0o755); err != nil {
+			return fmt.Errorf("create cgroup %q: %w", cgroupParent, err)
+		}
+		available, err := os.ReadFile(filepath.Join(cgroupRoot, "cgroup.controllers"))
 		if err != nil {
+			return fmt.Errorf("read cgroup controllers: %w", err)
+		}
+		for _, controller := range cgroupControllers {
+			if !slices.Contains(strings.Fields(string(available)), controller) {
+				continue
+			}
+			for _, ancestor := range []string{cgroupRoot, cgroupParent} {
+				if err := writeCgroupFile(ancestor, "cgroup.subtree_control", "+"+controller); err != nil {
+					return err
+				}
+			}
+		}
+
+		cgroup := filepath.Join(cgroupParent, id)
+		if err := os.Mkdir(cgroup, 0o755); err != nil {
+			return fmt.Errorf("create cgroup %q: %w", cgroup, err)
+		}
+		if err := setCgroupLimits(cgroup, config.Resources); err != nil {
+			removeCgroup(cgroup)
 			return err
 		}
 		defer func() {
@@ -429,13 +718,53 @@ func supervise(config Config, foreground, autoStart bool, ready func(id string, 
 			return err
 		}
 		leaveNetwork = sync.OnceFunc(func() {
-			if err := network.leave(); err != nil {
+			// Unpublish the container's ports, unplug it from the bridge,
+			// and give its address back. Keep going past errors, so that
+			// one thing failing doesn't leave the rest behind, and report
+			// them all together.
+			var errs []error
+			if network.dns != nil {
+				// The DNS server's goroutines see their sockets closed and
+				// return.
+				network.dns.udp.Close()
+				network.dns.tcp.Close()
+			}
+			for _, port := range network.ports {
+				errs = append(errs, port.close())
+			}
+			if conn, err := openNetlink(); err != nil {
+				errs = append(errs, err)
+			} else {
+				// The pair also goes when the container's network namespace
+				// does, after its last process has exited, so it may be gone
+				// already: ENODEV, "no such device", is fine. Deleting
+				// either end of a veth pair deletes both.
+				deleteRequest := newRequest(syscall.RTM_DELLINK, 0, ifInfo(0, 0, 0))
+				deleteRequest.attr(syscall.IFLA_IFNAME, cString(network.hostVeth))
+				if err := conn.do(deleteRequest); err != nil && !errors.Is(err, syscall.ENODEV) {
+					errs = append(errs, fmt.Errorf("delete veth %s: %w", network.hostVeth, err))
+				}
+				conn.Close()
+			}
+			// Only now, so that the next container to get the address can't
+			// find this one's veth still plugged in, or its port rules still
+			// in place.
+			errs = append(errs, network.reservation.release())
+			// errors.Join makes one error of several, leaving out the nils.
+			// If all of them are nil, so is the result.
+			if err := errors.Join(errs...); err != nil {
 				warn(err)
 			}
 		})
 		defer leaveNetwork()
 		state.IPAddress = network.reservation.ip.String()
-		state.Ports = network.portMappings()
+		// The container's published ports, with the host ports the system
+		// picked, for state.json and runt ps.
+		var mappings []PortMapping
+		for _, port := range network.ports {
+			mappings = append(mappings, port.mapping)
+		}
+		state.Ports = mappings
 	}
 
 	// The start FIFO. Opening a FIFO for reading and writing never blocks,
@@ -472,10 +801,17 @@ func supervise(config Config, foreground, autoStart bool, ready func(id string, 
 	extraFiles := []*os.File{fifo, statusW, configR}
 	consoleSocket := -1
 	if config.Tty {
-		var child *os.File
-		if consoleSocket, child, err = consoleSocketPair(); err != nil {
-			return err
+		// The Unix socket the pseudo-terminal's master is sent over. Our end
+		// stays a raw descriptor for recvmsg; the child end is passed to the
+		// process that makes the pseudo-terminal. socketpair makes two sockets
+		// already connected to each other, like the two ends of a pipe that works
+		// both ways.
+		var fds [2]int
+		if fds, err = syscall.Socketpair(syscall.AF_UNIX, syscall.SOCK_STREAM|syscall.SOCK_CLOEXEC, 0); err != nil {
+			return fmt.Errorf("create console socket: %w", err)
 		}
+		consoleSocket = fds[0]
+		child := os.NewFile(uintptr(fds[1]), "console socket")
 		defer syscall.Close(consoleSocket)
 		childEnds = append(childEnds, child)
 		extraFiles = append(extraFiles, child)
@@ -547,14 +883,26 @@ func supervise(config Config, foreground, autoStart bool, ready func(id string, 
 	// background a pipe held open for runt attach. Otherwise it is empty.
 	// copies counts the goroutines copying output, so the supervisor can
 	// wait for the last of it before recording the exit.
+	//
+	// Each pipe for the container's input or output is owned by container
+	// root, as containerd does. Programs open /dev/stdout and /dev/stderr,
+	// which lead through /proc/self/fd to the pipe itself; nginx's logs are
+	// links to them, for example. Opening a pipe that way checks its owner
+	// and mode (0600), so a pipe owned by host root, as runt makes it, would
+	// be closed to the container. Both ends share one inode.
 	var copies sync.WaitGroup
 	if config.Interactive && !config.Tty {
 		if foreground {
 			command.Stdin = os.Stdin
 		} else {
-			r, w, err := containerPipe(uids, gids)
+			r, w, err := os.Pipe()
 			if err != nil {
 				return err
+			}
+			if err := r.Chown(uids.Base, gids.Base); err != nil {
+				r.Close()
+				w.Close()
+				return fmt.Errorf("set owner of container pipe: %w", err)
 			}
 			defer w.Close()
 			childEnds = append(childEnds, r)
@@ -566,9 +914,14 @@ func supervise(config Config, foreground, autoStart bool, ready func(id string, 
 	kinds := []byte{frameStdout, frameStderr}
 	outputs := []*os.File{os.Stdout, os.Stderr}
 	for i, ours := range outputs {
-		r, w, err := containerPipe(uids, gids)
+		r, w, err := os.Pipe()
 		if err != nil {
 			return err
+		}
+		if err := r.Chown(uids.Base, gids.Base); err != nil {
+			r.Close()
+			w.Close()
+			return fmt.Errorf("set owner of container pipe: %w", err)
 		}
 		outputs[i] = w
 		childEnds = append(childEnds, w)
@@ -626,7 +979,16 @@ func supervise(config Config, foreground, autoStart bool, ready func(id string, 
 			copies.Wait()
 			return err
 		}
-		networkConfig = network.initConfig()
+		// What init needs to configure eth0: the container's address, as
+		// eth0 gets it, which is the reserved address with the network's
+		// mask, telling the container which addresses are on its own
+		// network and reachable directly, through the bridge; and the
+		// gateway, the bridge's own address: the first in the subnet after
+		// the subnet's own (10.88.0.1). An IPv4 address is 4 bytes, which
+		// read as one 32-bit number (big-endian, most significant byte
+		// first) can simply have 1 added.
+		gateway := net.IP(binary.BigEndian.AppendUint32(nil, binary.BigEndian.Uint32(network.network.subnet.IP.To4())+1))
+		networkConfig = &initNetwork{Address: (&net.IPNet{IP: network.reservation.ip, Mask: network.network.subnet.Mask}).String(), Gateway: gateway.String()}
 	}
 	go func() {
 		for sig := range signals {
@@ -636,7 +998,39 @@ func supervise(config Config, foreground, autoStart bool, ready func(id string, 
 	// /etc/hosts and /etc/resolv.conf, which init mounts into the container
 	// (see etc_linux.go), unless the container mounts its own there, as
 	// with -v ./hosts:/etc/hosts. Docker leaves those alone too.
-	etc := etcFiles(config.Hostname, network)
+	//
+	// etc holds the files by path: the container's hostname and address in
+	// /etc/hosts, if it has one, and in /etc/resolv.conf, the DNS servers it
+	// should use. network is nil for a container with --network none.
+	hostname := config.Hostname
+	if hostname == "" {
+		hostname = defaultHostname
+	}
+	var ip net.IP
+	embeddedDNS := false
+	if network != nil {
+		ip = network.reservation.ip
+		embeddedDNS = network.network.dns
+	}
+	// The host's DNS configuration. On a host whose resolver is
+	// systemd-resolved, /etc/resolv.conf names only its stub server at
+	// 127.0.0.53, and the servers it asks are in
+	// /run/systemd/resolve/resolv.conf, as Docker knows to look. The error
+	// is ignored (_): a host with no resolv.conf has no servers, which
+	// containerResolvConf makes up for.
+	resolvData, _ := os.ReadFile("/etc/resolv.conf")
+	hostConf := parseResolvConf(string(resolvData))
+	if slices.Equal(hostConf.nameservers, []string{"127.0.0.53"}) {
+		if data, err := os.ReadFile("/run/systemd/resolve/resolv.conf"); err == nil {
+			hostConf = parseResolvConf(string(data))
+		}
+	}
+	// A map literal: each key, the file's path, with its value, the file's
+	// contents.
+	etc := map[string]string{
+		"/etc/hosts":       hostsFile(hostname, ip),
+		"/etc/resolv.conf": containerResolvConf(hostConf, embeddedDNS).String(),
+	}
 	for path := range etc {
 		if mountCovers(config.Mounts, path) {
 			delete(etc, path)
@@ -687,11 +1081,61 @@ func supervise(config Config, foreground, autoStart bool, ready func(id string, 
 			defer console.Close()
 			passthrough := hub.output(frameStdout)
 			if foreground {
-				disconnect, err := connectTerminal(console, config.Interactive)
-				if err != nil {
+				// Connect runt's own terminal to the container's pseudo-terminal:
+				// give the pseudo-terminal the same size and keep it in step when the
+				// window is resized, and with config.Interactive put the terminal in raw mode and
+				// send what is typed to the container. Undoing this is deferred.
+				//
+				// The terminal to copy the size from: runt's input, or else its output,
+				// whichever is a terminal.
+				var source *os.File
+				for _, file := range []*os.File{os.Stdin, os.Stdout} {
+					if isTerminal(file) {
+						source = file
+						break
+					}
+				}
+				resize := func() {
+					size := defaultWinsize
+					if source != nil {
+						// The terminal's size, in rows and columns.
+						var current winsize
+						if err := ioctl(source, syscall.TIOCGWINSZ, unsafe.Pointer(&current)); err == nil && current.rows > 0 && current.cols > 0 {
+							size = current
+						}
+					}
+					setWinsize(console, size)
+				}
+				resize()
+				// The kernel sends SIGWINCH when runt's terminal window is resized.
+				// signal.Notify delivers it on the channel winch instead of applying
+				// its default action, and the goroutine resizes the container's
+				// pseudo-terminal each time one comes. "for range winch" loops over
+				// values received from the channel, until it is closed.
+				winch := make(chan os.Signal, 1)
+				signal.Notify(winch, syscall.SIGWINCH)
+				go func() {
+					for range winch {
+						resize()
+					}
+				}()
+				stopResizing := func() {
+					signal.Stop(winch)
+					close(winch)
+				}
+				if !config.Interactive {
+					defer stopResizing()
+				} else if restore, err := makeRaw(os.Stdin); err != nil {
+					stopResizing()
 					warn(err)
 				} else {
-					defer disconnect()
+					// This copy ends at the first read after the container is gone, or
+					// when runt exits.
+					go io.Copy(console, os.Stdin)
+					defer func() {
+						stopResizing()
+						restore()
+					}()
 				}
 				passthrough = io.MultiWriter(passthrough, os.Stdout)
 			} else {
@@ -725,7 +1169,20 @@ func supervise(config Config, foreground, autoStart bool, ready func(id string, 
 		// Before the container is recorded as stopped, so its address is
 		// free again by the time runt stop returns.
 		leaveNetwork()
-		exitCode := exitStatus(command.ProcessState)
+		// init's exit code, or 128 plus the signal number if a signal
+		// killed it, as shells report it. Sys returns the operating
+		// system's own form of the exit status, which on Linux is a
+		// syscall.WaitStatus; the ", ok" type assertion checks that.
+		var exitCode int
+		if waitStatus, ok := command.ProcessState.Sys().(syscall.WaitStatus); ok {
+			if waitStatus.Signaled() {
+				exitCode = 128 + int(waitStatus.Signal())
+			} else {
+				exitCode = waitStatus.ExitStatus()
+			}
+		} else {
+			exitCode = command.ProcessState.ExitCode()
+		}
 		state.Status = StatusStopped
 		state.Pid = 0
 		state.IPAddress = ""
@@ -740,13 +1197,22 @@ func supervise(config Config, foreground, autoStart bool, ready func(id string, 
 	}
 
 	// Read init's first status line. It comes once init has set the
-	// container up, or failed to.
+	// container up, or failed to. line is "" if init closed the status
+	// pipe, and an "error MESSAGE" line is turned into an error.
 	status := bufio.NewScanner(statusR)
-	line := nextLine(status)
+	line := ""
+	if status.Scan() {
+		line = status.Text()
+	}
 	if line != "ready" {
 		waitErr := command.Wait()
 		copies.Wait()
-		setupErr := initError(line, "container init exited while setting up the container")
+		var setupErr error
+		if message, ok := strings.CutPrefix(line, "error "); ok {
+			setupErr = errors.New(message)
+		} else {
+			setupErr = errors.New("container init exited while setting up the container")
+		}
 		if ready != nil {
 			ready("", setupErr)
 		}
@@ -778,13 +1244,22 @@ func supervise(config Config, foreground, autoStart bool, ready func(id string, 
 
 	// Now init waits for the byte in the start FIFO, and then runs the
 	// command.
-	line = nextLine(status)
+	line = ""
+	if status.Scan() {
+		line = status.Text()
+	}
 	if line != "started" {
 		// The command could not be run, so init is exiting. Report its exit
 		// code too: 127 if the command was not found, as in the foreground.
 		waitErr := finish()
 		if ready != nil {
-			ready(id, &exitCodeError{initError(line, "container init exited before running the command"), *state.ExitCode})
+			var startErr error
+			if message, ok := strings.CutPrefix(line, "error "); ok {
+				startErr = errors.New(message)
+			} else {
+				startErr = errors.New("container init exited before running the command")
+			}
+			ready(id, &exitCodeError{startErr, *state.ExitCode})
 		}
 		return waitErr
 	}
@@ -797,25 +1272,6 @@ func supervise(config Config, foreground, autoStart bool, ready func(id string, 
 		ready(id, nil)
 	}
 	return finish()
-}
-
-// containerPipe makes a pipe for the container's input or output, owned by
-// container root, as containerd does. Programs open /dev/stdout and
-// /dev/stderr, which lead through /proc/self/fd to the pipe itself; nginx's
-// logs are links to them, for example. Opening a pipe that way checks its
-// owner and mode (0600), so a pipe owned by host root, as runt makes it,
-// would be closed to the container.
-func containerPipe(uids, gids IDRange) (r, w *os.File, err error) {
-	if r, w, err = os.Pipe(); err != nil {
-		return nil, nil, err
-	}
-	// Both ends share one inode.
-	if err := r.Chown(uids.Base, gids.Base); err != nil {
-		r.Close()
-		w.Close()
-		return nil, nil, fmt.Errorf("set owner of container pipe: %w", err)
-	}
-	return r, w, nil
 }
 
 // idRanges returns the host ID ranges the container's user namespace maps
@@ -849,23 +1305,6 @@ type exitCodeError struct {
 
 func (e *exitCodeError) Error() string { return e.err.Error() }
 func (e *exitCodeError) Unwrap() error { return e.err }
-
-// nextLine returns the next line init sends on the status pipe, or "" if
-// init closed it.
-func nextLine(scanner *bufio.Scanner) string {
-	if scanner.Scan() {
-		return scanner.Text()
-	}
-	return ""
-}
-
-// initError turns an "error MESSAGE" status line into an error.
-func initError(line, fallback string) error {
-	if message, ok := strings.CutPrefix(line, "error "); ok {
-		return errors.New(message)
-	}
-	return errors.New(fallback)
-}
 
 // initAlive reports whether pid is a container's init process that is still
 // running. Checking the command line guards against the PID having been
@@ -918,8 +1357,17 @@ func Start(ref string) error {
 	if state.Status != StatusCreated {
 		return fmt.Errorf("container %s is %s; only a created container can be started", state.ID, state.Status)
 	}
-	if err := writeStartFifo(state.ID); err != nil {
-		return err
+	// Tell the container's init to run the command. O_NONBLOCK makes the
+	// open fail with ENXIO, instead of waiting, if no init has the FIFO open
+	// for reading.
+	fifo, err := os.OpenFile(filepath.Join(stateDir(StateRoot, state.ID), startFifoName), os.O_WRONLY|syscall.O_NONBLOCK, 0)
+	if err != nil {
+		return fmt.Errorf("container %s is not waiting to start: %w", state.ID, err)
+	}
+	_, err = fifo.Write([]byte{0})
+	fifo.Close()
+	if err != nil {
+		return fmt.Errorf("start container %s: %w", state.ID, err)
 	}
 
 	// The monitor records whether the command started. A Go for loop has
@@ -943,22 +1391,6 @@ func Start(ref string) error {
 		}
 	}
 	return fmt.Errorf("timed out waiting for container %s to start", state.ID)
-}
-
-// writeStartFifo tells a created container's init to run the command.
-func writeStartFifo(id string) error {
-	// O_NONBLOCK makes the open fail with ENXIO, instead of waiting, if no
-	// init has the FIFO open for reading.
-	fifo, err := os.OpenFile(filepath.Join(stateDir(StateRoot, id), startFifoName), os.O_WRONLY|syscall.O_NONBLOCK, 0)
-	if err != nil {
-		return fmt.Errorf("container %s is not waiting to start: %w", id, err)
-	}
-	_, err = fifo.Write([]byte{0})
-	fifo.Close()
-	if err != nil {
-		return fmt.Errorf("start container %s: %w", id, err)
-	}
-	return nil
 }
 
 // Kill sends sig to a container's init, which passes it on to the command.
@@ -1000,7 +1432,14 @@ func Stop(ref string, timeout time.Duration) error {
 			return fmt.Errorf("container %s did not stop", state.ID)
 		}
 	}
-	waitForStopped(state.ID, 5*time.Second)
+	// Wait up to 5 seconds for the monitor to record that the container
+	// stopped, so that ps and rm see the final state.
+	for deadline := time.Now().Add(5 * time.Second); time.Now().Before(deadline); time.Sleep(50 * time.Millisecond) {
+		current, err := loadState(StateRoot, state.ID)
+		if err != nil || current.Status == StatusStopped {
+			break
+		}
+	}
 	return nil
 }
 
@@ -1020,10 +1459,17 @@ func Remove(ref string, force bool) error {
 		if !waitForExit(state.Pid, 5*time.Second) {
 			return fmt.Errorf("container %s did not stop", state.ID)
 		}
-		waitForStopped(state.ID, 5*time.Second)
+		// Wait up to 5 seconds for the monitor to record that the
+		// container stopped, so that ps and rm see the final state.
+		for deadline := time.Now().Add(5 * time.Second); time.Now().Before(deadline); time.Sleep(50 * time.Millisecond) {
+			current, err := loadState(StateRoot, state.ID)
+			if err != nil || current.Status == StatusStopped {
+				break
+			}
+		}
 	}
-	// The writable layer goes before the state directory; see
-	// pruneContainerFS.
+	// The writable layer goes before the state directory; see the pruning
+	// of orphaned writable layers in supervise.
 	if err := removeContainerFS(state.ID); err != nil {
 		return fmt.Errorf("remove container %s: %w", state.ID, err)
 	}
@@ -1054,17 +1500,6 @@ func waitForExit(pid int, timeout time.Duration) bool {
 		}
 		if time.Now().After(deadline) {
 			return false
-		}
-	}
-}
-
-// waitForStopped waits up to timeout for the monitor to record that the
-// container stopped, so that ps and rm see the final state.
-func waitForStopped(id string, timeout time.Duration) {
-	for deadline := time.Now().Add(timeout); time.Now().Before(deadline); time.Sleep(50 * time.Millisecond) {
-		state, err := loadState(StateRoot, id)
-		if err != nil || state.Status == StatusStopped {
-			return
 		}
 	}
 }

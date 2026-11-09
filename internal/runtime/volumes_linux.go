@@ -43,11 +43,6 @@ func lockVolumes(exclusive bool) (func(), error) {
 	return unlock, nil
 }
 
-// volumeData is the directory holding volume name's files.
-func volumeData(name string) string {
-	return filepath.Join(volumeRoot, name, "_data")
-}
-
 // readVolume reads what runt keeps about the volume called name.
 func readVolume(name string) (*Volume, error) {
 	// validName keeps a name such as ../x from leading out of volumeRoot.
@@ -86,7 +81,7 @@ func ensureVolume(name string, uids, gids IDRange) (volume *Volume, created bool
 		return nil, false, fmt.Errorf("create volume %s: %w", name, err)
 	}
 	defer os.RemoveAll(temp)
-	volume = &Volume{Name: name, Mountpoint: volumeData(name), Created: time.Now()}
+	volume = &Volume{Name: name, Mountpoint: filepath.Join(volumeRoot, name, "_data"), Created: time.Now()}
 	data, err := json.MarshalIndent(volume, "", "  ")
 	if err != nil {
 		return nil, false, err

@@ -14,7 +14,6 @@ import (
 	"io"
 	"io/fs"
 	"net/http"
-	"net/url"
 	"os"
 	"path"
 	"path/filepath"
@@ -334,7 +333,17 @@ func (w *rootWriter) put(p string, header *tar.Header, content io.Reader) error 
 			err = nil
 		}
 	case tar.TypeReg:
-		err = writeLayerFile(target, content)
+		// The file's content. O_EXCL fails if anything is already at
+		// target, and O_NOFOLLOW if it is a symlink, so the write can't be
+		// steered elsewhere.
+		var file *os.File
+		if file, err = os.OpenFile(target, os.O_WRONLY|os.O_CREATE|os.O_EXCL|syscall.O_NOFOLLOW, 0o600); err == nil {
+			if _, err = io.Copy(file, content); err != nil {
+				file.Close()
+			} else {
+				err = file.Close()
+			}
+		}
 	case tar.TypeSymlink:
 		err = os.Symlink(header.Linkname, target)
 	case tar.TypeLink:
@@ -447,9 +456,17 @@ func (w *rootWriter) extractArchive(host, dest string) error {
 		return err
 	}
 	defer file.Close()
-	reader, err := decompress(file)
-	if err != nil {
-		return err
+	// What file holds, decompressed if it is gzipped or bzipped.
+	buffered := bufio.NewReader(file)
+	head, _ := buffered.Peek(3)
+	var reader io.Reader = buffered
+	switch {
+	case len(head) >= 2 && head[0] == 0x1f && head[1] == 0x8b:
+		if reader, err = gzip.NewReader(buffered); err != nil {
+			return err
+		}
+	case string(head) == "BZh":
+		reader = bzip2.NewReader(buffered)
 	}
 	archive := tar.NewReader(reader)
 	if _, err := w.dir(dest); err != nil {
@@ -503,20 +520,6 @@ func archiveKind(path string) (string, error) {
 	return "", nil
 }
 
-// decompress returns a reader of what file holds, decompressed if it is
-// gzipped or bzipped.
-func decompress(file *os.File) (io.Reader, error) {
-	buffered := bufio.NewReader(file)
-	head, _ := buffered.Peek(3)
-	switch {
-	case len(head) >= 2 && head[0] == 0x1f && head[1] == 0x8b:
-		return gzip.NewReader(buffered)
-	case string(head) == "BZh":
-		return bzip2.NewReader(buffered), nil
-	}
-	return buffered, nil
-}
-
 // download fetches a URL for ADD into a new file in dir, checking it
 // against checksum (a digest) if one is given, and returns it as a source.
 // Its time is the server's Last-Modified, if it sends one, and its
@@ -553,21 +556,6 @@ func download(rawURL, checksum, dir string) (copySource, error) {
 		return copySource{}, err
 	}
 	return copySource{host: file.Name(), info: info, url: rawURL}, nil
-}
-
-// urlBase is the file name ADD gives what it downloads from rawURL: the last
-// part of its path.
-func urlBase(rawURL string) string {
-	u, err := url.Parse(rawURL)
-	if err != nil {
-		return ""
-	}
-	return path.Base(u.Path)
-}
-
-// isURL reports whether an ADD source is a URL to download.
-func isURL(source string) bool {
-	return strings.HasPrefix(source, "http://") || strings.HasPrefix(source, "https://")
 }
 
 // parseChown works out --chown's user and group, USER[:GROUP], by name or
@@ -632,26 +620,4 @@ func parseChmod(text string) (fs.FileMode, error) {
 		result |= fs.ModeSticky
 	}
 	return result, nil
-}
-
-// mountReadOnly makes an image's root filesystem readable on the host at
-// target, for COPY --from: its layers, given top first, under a read-only
-// overlay, or the one layer itself, or an empty directory if it has none.
-// It returns where the root filesystem is, and a function that unmounts it.
-func mountReadOnly(layers []string, target string) (string, func(), error) {
-	switch len(layers) {
-	case 0:
-		return target, func() {}, os.MkdirAll(target, 0o755)
-	case 1:
-		return layers[0], func() {}, nil
-	}
-	if err := os.MkdirAll(target, 0o755); err != nil {
-		return "", nil, err
-	}
-	// An overlay with no writable layer is read-only, and needs at least
-	// two layers.
-	if err := syscall.Mount("overlay", target, "overlay", syscall.MS_RDONLY|syscall.MS_NODEV, "lowerdir="+strings.Join(layers, ":")); err != nil {
-		return "", nil, fmt.Errorf("mount stage filesystem: %w", err)
-	}
-	return target, func() { syscall.Unmount(target, syscall.MNT_DETACH) }, nil
 }

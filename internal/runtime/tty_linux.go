@@ -7,7 +7,6 @@ import (
 	"fmt"
 	"io"
 	"os"
-	"os/signal"
 	"strings"
 	"syscall"
 	"unsafe"
@@ -69,64 +68,10 @@ func isTerminal(file *os.File) bool {
 	return ioctl(file, syscall.TCGETS, unsafe.Pointer(&termios)) == nil
 }
 
-// getWinsize reads a terminal's size, in rows and columns.
-func getWinsize(file *os.File) (winsize, error) {
-	var size winsize
-	err := ioctl(file, syscall.TIOCGWINSZ, unsafe.Pointer(&size))
-	return size, err
-}
-
 // setWinsize sets a pseudo-terminal's size. The kernel sends SIGWINCH to its
 // foreground process group, so programs like vim redraw.
 func setWinsize(file *os.File, size winsize) error {
 	return ioctl(file, syscall.TIOCSWINSZ, unsafe.Pointer(&size))
-}
-
-// openPTY makes a new pseudo-terminal pair from /dev/ptmx. Neither end
-// becomes this process's controlling terminal.
-//
-// Opening /dev/ptmx makes a new pair and returns its master end; the slave
-// end appears as /dev/pts/N, which is then opened by name. The results are
-// named (master, slave, err), so they are declared at the start of the
-// function like other variables.
-func openPTY() (master, slave *os.File, err error) {
-	masterFD, err := syscall.Open("/dev/ptmx", syscall.O_RDWR|syscall.O_NOCTTY|syscall.O_CLOEXEC, 0)
-	if err != nil {
-		return nil, nil, fmt.Errorf("open /dev/ptmx: %w", err)
-	}
-	master = os.NewFile(uintptr(masterFD), "/dev/ptmx")
-	// A new slave is locked until the master unlocks it (unlockpt), and its
-	// number says which /dev/pts entry it is (ptsname).
-	var unlock int32
-	if err := ioctl(master, syscall.TIOCSPTLCK, unsafe.Pointer(&unlock)); err != nil {
-		master.Close()
-		return nil, nil, fmt.Errorf("unlock pseudo-terminal: %w", err)
-	}
-	var number uint32
-	if err := ioctl(master, syscall.TIOCGPTN, unsafe.Pointer(&number)); err != nil {
-		master.Close()
-		return nil, nil, fmt.Errorf("get pseudo-terminal number: %w", err)
-	}
-	path := fmt.Sprintf("/dev/pts/%d", number)
-	slaveFD, err := syscall.Open(path, syscall.O_RDWR|syscall.O_NOCTTY|syscall.O_CLOEXEC, 0)
-	if err != nil {
-		master.Close()
-		return nil, nil, fmt.Errorf("open %s: %w", path, err)
-	}
-	return master, os.NewFile(uintptr(slaveFD), path), nil
-}
-
-// consoleSocketPair makes the Unix socket a pseudo-terminal's master is sent
-// over. The parent end stays a raw descriptor for sendmsg and recvmsg; the
-// child end is passed to the process that makes the pseudo-terminal.
-// socketpair makes two sockets already connected to each other, like the
-// two ends of a pipe that works both ways.
-func consoleSocketPair() (parent int, child *os.File, err error) {
-	fds, err := syscall.Socketpair(syscall.AF_UNIX, syscall.SOCK_STREAM|syscall.SOCK_CLOEXEC, 0)
-	if err != nil {
-		return -1, nil, fmt.Errorf("create console socket: %w", err)
-	}
-	return fds[0], os.NewFile(uintptr(fds[1]), "console socket"), nil
 }
 
 // sendFile passes file's descriptor over a Unix socket.
@@ -270,63 +215,4 @@ func ReadPassword(prompt string) (string, error) {
 			return "", err
 		}
 	}
-}
-
-// connectTerminal connects runt's own terminal to a container's
-// pseudo-terminal: it gives the pseudo-terminal the same size and keeps it
-// in step when the window is resized, and if interactive is set it puts the
-// terminal in raw mode and sends what is typed to the container. It returns
-// a function that undoes this. The caller copies the container's output.
-func connectTerminal(console *os.File, interactive bool) (func(), error) {
-	// The terminal to copy the size from: runt's input, or else its output,
-	// whichever is a terminal.
-	var source *os.File
-	for _, file := range []*os.File{os.Stdin, os.Stdout} {
-		if isTerminal(file) {
-			source = file
-			break
-		}
-	}
-	resize := func() {
-		size := defaultWinsize
-		if source != nil {
-			if current, err := getWinsize(source); err == nil && current.rows > 0 && current.cols > 0 {
-				size = current
-			}
-		}
-		setWinsize(console, size)
-	}
-	resize()
-	// The kernel sends SIGWINCH when runt's terminal window is resized.
-	// signal.Notify delivers it on the channel winch instead of applying
-	// its default action, and the goroutine resizes the container's
-	// pseudo-terminal each time one comes. "for range winch" loops over
-	// values received from the channel, until it is closed.
-	winch := make(chan os.Signal, 1)
-	signal.Notify(winch, syscall.SIGWINCH)
-	go func() {
-		for range winch {
-			resize()
-		}
-	}()
-	stopResizing := func() {
-		signal.Stop(winch)
-		close(winch)
-	}
-	if !interactive {
-		return stopResizing, nil
-	}
-
-	restore, err := makeRaw(os.Stdin)
-	if err != nil {
-		stopResizing()
-		return nil, err
-	}
-	// This copy ends at the first read after the container is gone, or
-	// when runt exits.
-	go io.Copy(console, os.Stdin)
-	return func() {
-		stopResizing()
-		restore()
-	}, nil
 }

@@ -13,7 +13,6 @@ import (
 	"os"
 	"path"
 	"path/filepath"
-	"slices"
 	"strings"
 	"syscall"
 	"time"
@@ -33,55 +32,6 @@ const (
 	whiteoutPrefix = ".wh."
 	whiteoutOpaque = ".wh..wh..opq"
 )
-
-// unpackImage makes sure every layer of an image is unpacked, with
-// its file ownership shifted into the container's ID ranges, and returns the
-// layer directories top first, the order overlayfs takes them in.
-//
-// Layers are stored by digest under layerRoot/<uid base>-<gid base>, since
-// their ownership depends on the ranges, and are shared by every container
-// that uses them. A layer is unpacked into a temporary directory and renamed
-// into place when complete, so a half-unpacked layer is never used, and two
-// runt processes unpacking the same layer at once don't get in each other's
-// way.
-func unpackImage(image *ociImage, uids, gids IDRange) ([]string, error) {
-	store := filepath.Join(layerRoot, fmt.Sprintf("%d-%d", uids.Base, gids.Base))
-	if err := os.MkdirAll(store, 0o700); err != nil {
-		return nil, fmt.Errorf("create layer store: %w", err)
-	}
-	var dirs []string
-	for i, layer := range image.manifest.Layers {
-		blob, err := image.blobPath(layer.Digest)
-		if err != nil {
-			return nil, err
-		}
-		dir := filepath.Join(store, filepath.Base(blob))
-		dirs = append(dirs, dir)
-		if _, err := os.Stat(dir); err == nil {
-			continue
-		}
-		temp, err := os.MkdirTemp(store, "unpacking-")
-		if err != nil {
-			return nil, fmt.Errorf("create layer directory: %w", err)
-		}
-		err = unpackLayer(blob, layer, image.config.RootFS.DiffIDs[i], temp, uids, gids)
-		if err == nil {
-			err = os.Rename(temp, dir)
-		}
-		if err != nil {
-			os.RemoveAll(temp)
-			if _, statErr := os.Stat(dir); statErr == nil {
-				// Another runt finished unpacking it first.
-				continue
-			}
-			return nil, fmt.Errorf("unpack layer %s: %w", layer.Digest, err)
-		}
-	}
-	// The manifest lists layers bottom first; overlayfs wants them top
-	// first.
-	slices.Reverse(dirs)
-	return dirs, nil
-}
 
 // unpackLayer extracts the layer blob into dest, checking it against both its
 // digest and diffID, the digest of its uncompressed content.
@@ -239,7 +189,18 @@ func extractLayer(r io.Reader, root string, uids, gids IDRange) error {
 				return err
 			}
 		case tar.TypeReg:
-			if err := writeLayerFile(target, archive); err != nil {
+			// The file's content. O_EXCL fails if anything is already at
+			// target, and O_NOFOLLOW if it is a symlink, so the write can't
+			// be steered elsewhere.
+			file, err := os.OpenFile(target, os.O_WRONLY|os.O_CREATE|os.O_EXCL|syscall.O_NOFOLLOW, 0o600)
+			if err != nil {
+				return err
+			}
+			if _, err := io.Copy(file, archive); err != nil {
+				file.Close()
+				return err
+			}
+			if err := file.Close(); err != nil {
 				return err
 			}
 		case tar.TypeSymlink:
@@ -339,19 +300,4 @@ func layerDir(root, dir string, uids, gids IDRange, create bool) (string, error)
 		}
 	}
 	return current, nil
-}
-
-// writeLayerFile writes a regular file's content. O_EXCL fails if anything
-// is already at target, and O_NOFOLLOW if it is a symlink, so the write
-// can't be steered elsewhere.
-func writeLayerFile(target string, content io.Reader) error {
-	file, err := os.OpenFile(target, os.O_WRONLY|os.O_CREATE|os.O_EXCL|syscall.O_NOFOLLOW, 0o600)
-	if err != nil {
-		return err
-	}
-	if _, err := io.Copy(file, content); err != nil {
-		file.Close()
-		return err
-	}
-	return file.Close()
 }

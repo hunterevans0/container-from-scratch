@@ -73,14 +73,10 @@ func applyImageConfig(config *Config, image *ociImage) error {
 	if config.UserSpec == "" && config.User == nil {
 		config.UserSpec = defaults.User
 	}
-	return checkCwd(config.Cwd)
-}
-
-// checkCwd rejects a working directory that isn't an absolute path, since
-// there is nothing for a relative one to be relative to.
-func checkCwd(cwd string) error {
-	if cwd != "" && !path.IsAbs(cwd) {
-		return fmt.Errorf("the working directory %q must be an absolute path", cwd)
+	// Reject a working directory that isn't an absolute path, since there
+	// is nothing for a relative one to be relative to.
+	if config.Cwd != "" && !path.IsAbs(config.Cwd) {
+		return fmt.Errorf("the working directory %q must be an absolute path", config.Cwd)
 	}
 	return nil
 }
@@ -139,33 +135,23 @@ type groupEntry struct {
 	members []string
 }
 
-// openAccountFile opens /etc/passwd or /etc/group, or returns nil if there
-// isn't one. An image could make either something other than a file, such
-// as a FIFO that would block reading forever, or a link to /dev/zero that
-// never ends, hence the check. io.ReadCloser is an interface for anything
-// that can be read and closed, as an *os.File can.
-func openAccountFile(name string) (io.ReadCloser, error) {
+// readAccountFile calls entry with the colon-separated fields of each line of
+// /etc/passwd or /etc/group.
+func readAccountFile(name string, entry func(fields []string)) error {
+	// Open the file, if there is one. An image could make either file
+	// something other than a file, such as a FIFO that would block reading
+	// forever, or a link to /dev/zero that never ends, hence the check.
 	file, err := os.Open(name)
 	if errors.Is(err, os.ErrNotExist) {
-		return nil, nil
+		return nil
 	}
 	if err != nil {
-		return nil, err
+		return err
 	}
 	info, err := file.Stat()
 	if err != nil || !info.Mode().IsRegular() {
 		file.Close()
-		return nil, fmt.Errorf("%s is not a regular file", name)
-	}
-	return file, nil
-}
-
-// readAccountFile calls entry with the colon-separated fields of each line of
-// /etc/passwd or /etc/group.
-func readAccountFile(name string, entry func(fields []string)) error {
-	file, err := openAccountFile(name)
-	if err != nil || file == nil {
-		return err
+		return fmt.Errorf("%s is not a regular file", name)
 	}
 	defer file.Close()
 	// LimitReader stops after maxAccountFile bytes. A Scanner reads a line

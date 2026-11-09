@@ -69,50 +69,15 @@ func exportLayer(upper string, uids, gids IDRange, skip func(rel string, info fs
 	compressed := gzip.NewWriter(io.MultiWriter(file, blobHash))
 	diffHash := sha256.New()
 	archive := tar.NewWriter(io.MultiWriter(compressed, diffHash))
-	written, err := writeChanges(archive, upper, uids, gids, skip)
-	if err != nil {
-		return nil, err
-	}
-	if written == 0 {
-		return nil, nil
-	}
-	// Closing each writer writes what it still holds: the end-of-archive
-	// marker, then the end of the compressed stream.
-	if err := archive.Close(); err != nil {
-		return nil, err
-	}
-	if err := compressed.Close(); err != nil {
-		return nil, err
-	}
-	info, err := file.Stat()
-	if err != nil {
-		return nil, err
-	}
-	if err := file.Close(); err != nil {
-		return nil, err
-	}
-	keep = true
-	return &layerBlob{
-		path: file.Name(),
-		desc: ociDescriptor{
-			MediaType: mediaTypeLayerGzip,
-			Digest:    "sha256:" + hex.EncodeToString(blobHash.Sum(nil)),
-			Size:      info.Size(),
-		},
-		diffID: "sha256:" + hex.EncodeToString(diffHash.Sum(nil)),
-	}, nil
-}
-
-// writeChanges writes an entry to archive for everything in upper, and
-// returns how many it wrote. WalkDir goes through upper in name order,
-// each directory before what is in it, which is the order a layer needs.
-func writeChanges(archive *tar.Writer, upper string, uids, gids IDRange, skip func(rel string, info fs.FileInfo) bool) (int, error) {
+	// Write an entry to archive for everything in upper, counting them in
+	// written. WalkDir goes through upper in name order, each directory
+	// before what is in it, which is the order a layer needs.
 	written := 0
 	// Hard links: the first path seen for each file (by device and inode
 	// number) that has more than one name. Later names become links to it.
 	type inode struct{ dev, ino uint64 }
 	linked := map[inode]string{}
-	err := filepath.WalkDir(upper, func(hostPath string, entry fs.DirEntry, err error) error {
+	err = filepath.WalkDir(upper, func(hostPath string, entry fs.DirEntry, err error) error {
 		if err != nil {
 			return err
 		}
@@ -190,7 +155,37 @@ func writeChanges(archive *tar.Writer, upper string, uids, gids IDRange, skip fu
 		}
 		return nil
 	})
-	return written, err
+	if err != nil {
+		return nil, err
+	}
+	if written == 0 {
+		return nil, nil
+	}
+	// Closing each writer writes what it still holds: the end-of-archive
+	// marker, then the end of the compressed stream.
+	if err := archive.Close(); err != nil {
+		return nil, err
+	}
+	if err := compressed.Close(); err != nil {
+		return nil, err
+	}
+	info, err := file.Stat()
+	if err != nil {
+		return nil, err
+	}
+	if err := file.Close(); err != nil {
+		return nil, err
+	}
+	keep = true
+	return &layerBlob{
+		path: file.Name(),
+		desc: ociDescriptor{
+			MediaType: mediaTypeLayerGzip,
+			Digest:    "sha256:" + hex.EncodeToString(blobHash.Sum(nil)),
+			Size:      info.Size(),
+		},
+		diffID: "sha256:" + hex.EncodeToString(diffHash.Sum(nil)),
+	}, nil
 }
 
 // copyInto writes the content of the file at path to w.

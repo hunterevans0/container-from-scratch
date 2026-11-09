@@ -16,9 +16,7 @@ import (
 	"math"
 	"os"
 	"path/filepath"
-	"slices"
 	"strconv"
-	"strings"
 	"syscall"
 	"time"
 )
@@ -37,49 +35,6 @@ const (
 
 // cgroupControllers are the controllers runt's limits need.
 var cgroupControllers = []string{"cpu", "memory", "pids", "io"}
-
-// cgroupV2 reports whether the unified cgroup v2 hierarchy is mounted.
-// statfs describes the filesystem a path is on, including a number saying
-// what kind of filesystem it is.
-func cgroupV2() bool {
-	var stat syscall.Statfs_t
-	return syscall.Statfs(cgroupRoot, &stat) == nil && stat.Type == cgroup2SuperMagic
-}
-
-// createCgroup makes the container's cgroup and writes its limits. The
-// container is placed in it as it is cloned (see Run), so it is limited from
-// its first instruction.
-func createCgroup(id string, resources Resources) (string, error) {
-	// A controller can only be used in a cgroup if every ancestor enables
-	// it for its children in cgroup.subtree_control.
-	if err := os.MkdirAll(cgroupParent, 0o755); err != nil {
-		return "", fmt.Errorf("create cgroup %q: %w", cgroupParent, err)
-	}
-	available, err := os.ReadFile(filepath.Join(cgroupRoot, "cgroup.controllers"))
-	if err != nil {
-		return "", fmt.Errorf("read cgroup controllers: %w", err)
-	}
-	for _, controller := range cgroupControllers {
-		if !slices.Contains(strings.Fields(string(available)), controller) {
-			continue
-		}
-		for _, dir := range []string{cgroupRoot, cgroupParent} {
-			if err := writeCgroupFile(dir, "cgroup.subtree_control", "+"+controller); err != nil {
-				return "", err
-			}
-		}
-	}
-
-	dir := filepath.Join(cgroupParent, id)
-	if err := os.Mkdir(dir, 0o755); err != nil {
-		return "", fmt.Errorf("create cgroup %q: %w", dir, err)
-	}
-	if err := setCgroupLimits(dir, resources); err != nil {
-		removeCgroup(dir)
-		return "", err
-	}
-	return dir, nil
-}
 
 // setCgroupLimits writes each limit that is set to its file in the cgroup
 // directory dir. A limit left at zero isn't written, which leaves it
@@ -130,10 +85,27 @@ func setCgroupLimits(dir string, resources Resources) error {
 	}
 	for _, io := range ioLimits {
 		for _, limit := range io.limits {
-			device, err := blockDeviceNumber(limit.Path)
-			if err != nil {
-				return err
+			// The "major:minor" number of the block device at limit.Path.
+			// The kernel knows a device by two numbers: the major number
+			// says which driver (8 is SCSI disks), and the minor which
+			// device of that driver's (0 is the first, sda). stat on a
+			// device file reports them packed together in Rdev, which this
+			// unpacks with shifts (>>) and masks (&). S_IFMT picks out the
+			// file's type from its mode, which must be S_IFBLK, a block
+			// device.
+			var stat syscall.Stat_t
+			if err := syscall.Stat(limit.Path, &stat); err != nil {
+				return fmt.Errorf("device %q: %w", limit.Path, err)
 			}
+			if stat.Mode&syscall.S_IFMT != syscall.S_IFBLK {
+				return fmt.Errorf("%q is not a block device", limit.Path)
+			}
+			// The glibc encoding of dev_t: the major number is bits 8-19 and
+			// 32-43, the minor number is bits 0-7 and 20-31.
+			rdev := uint64(stat.Rdev)
+			major := (rdev>>8)&0xfff | (rdev>>32)&^0xfff
+			minor := rdev&0xff | (rdev>>12)&^0xff
+			device := fmt.Sprintf("%d:%d", major, minor)
 			line := fmt.Sprintf("%s %s=%d", device, io.key, limit.Rate)
 			if err := writeCgroupFile(dir, "io.max", line); err != nil {
 				return fmt.Errorf("%w (io.max limits whole disks, such as /dev/sda, not partitions)", err)
@@ -141,29 +113,6 @@ func setCgroupLimits(dir string, resources Resources) error {
 		}
 	}
 	return nil
-}
-
-// blockDeviceNumber returns the "major:minor" number of the block device at
-// path. The kernel knows a device by two numbers: the major number says
-// which driver (8 is SCSI disks), and the minor which device of that
-// driver's (0 is the first, sda). stat on a device file reports them packed
-// together in Rdev, which this unpacks with shifts (>>) and masks (&).
-// S_IFMT picks out the file's type from its mode, which must be S_IFBLK, a
-// block device.
-func blockDeviceNumber(path string) (string, error) {
-	var stat syscall.Stat_t
-	if err := syscall.Stat(path, &stat); err != nil {
-		return "", fmt.Errorf("device %q: %w", path, err)
-	}
-	if stat.Mode&syscall.S_IFMT != syscall.S_IFBLK {
-		return "", fmt.Errorf("%q is not a block device", path)
-	}
-	// The glibc encoding of dev_t: the major number is bits 8-19 and 32-43,
-	// the minor number is bits 0-7 and 20-31.
-	rdev := uint64(stat.Rdev)
-	major := (rdev>>8)&0xfff | (rdev>>32)&^0xfff
-	minor := rdev&0xff | (rdev>>12)&^0xff
-	return fmt.Sprintf("%d:%d", major, minor), nil
 }
 
 // removeCgroup kills anything left in the cgroup and removes it. The
@@ -197,23 +146,6 @@ func writeCgroupFile(dir, name, value string) error {
 	path := filepath.Join(dir, name)
 	if err := os.WriteFile(path, []byte(value), 0o644); err != nil {
 		return fmt.Errorf("write %q to %s: %w", value, path, err)
-	}
-	return nil
-}
-
-// mountCgroup mounts the container's cgroup read-only at /sys/fs/cgroup, so
-// programs inside can read their limits and usage. Because init is in its
-// own cgroup namespace, the mount's root is the container's cgroup and the
-// host's cgroups aren't visible. Read-only stops the container from
-// raising its own limits.
-func mountCgroup(rootfs string) error {
-	if !cgroupV2() {
-		return nil
-	}
-	target := filepath.Join(rootfs, "sys/fs/cgroup")
-	flags := uintptr(syscall.MS_RDONLY | syscall.MS_NOSUID | syscall.MS_NOEXEC | syscall.MS_NODEV)
-	if err := syscall.Mount("cgroup2", target, "cgroup2", flags, ""); err != nil {
-		return fmt.Errorf("mount /sys/fs/cgroup: %w", err)
 	}
 	return nil
 }

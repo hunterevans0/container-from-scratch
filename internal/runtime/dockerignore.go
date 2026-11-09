@@ -54,7 +54,49 @@ func parseDockerignore(r io.Reader) ([]ignorePattern, error) {
 		if line == "" {
 			continue
 		}
-		re, err := regexp.Compile(ignoreRegexp(line))
+		// Turn the pattern into a regular expression matching the same
+		// paths, a character at a time. Regular expressions give special
+		// meanings to characters a path may have, such as . and +, so
+		// those are escaped with QuoteMeta.
+		var expr strings.Builder
+		expr.WriteString("^")
+		for i := 0; i < len(line); i++ {
+			ch := line[i]
+			switch {
+			case strings.HasPrefix(line[i:], "**/"):
+				// Any number of directories, including none.
+				expr.WriteString("(.*/)?")
+				i += 2
+			case strings.HasPrefix(line[i:], "**"):
+				expr.WriteString(".*")
+				i++
+			case ch == '*':
+				expr.WriteString("[^/]*")
+			case ch == '?':
+				expr.WriteString("[^/]")
+			case ch == '[':
+				// A range, written as regular expressions write them, up to
+				// its ]; one that is never closed is taken as a [.
+				end := strings.IndexByte(line[i+1:], ']')
+				if end < 0 {
+					expr.WriteString(`\[`)
+					continue
+				}
+				class := line[i+1 : i+1+end]
+				if strings.HasPrefix(class, "!") {
+					class = "^" + class[1:]
+				}
+				expr.WriteString("[" + strings.ReplaceAll(class, `\`, `\\`) + "]")
+				i += end + 1
+			case ch == '\\' && i+1 < len(line):
+				i++
+				expr.WriteString(regexp.QuoteMeta(line[i : i+1]))
+			default:
+				expr.WriteString(regexp.QuoteMeta(string(ch)))
+			}
+		}
+		expr.WriteString("$")
+		re, err := regexp.Compile(expr.String())
 		if err != nil {
 			return nil, err
 		}
@@ -63,74 +105,22 @@ func parseDockerignore(r io.Reader) ([]ignorePattern, error) {
 	return patterns, scanner.Err()
 }
 
-// ignoreRegexp turns a pattern into a regular expression matching the
-// same paths, a character at a time. Regular expressions give special
-// meanings to characters a path may have, such as . and +, so those are
-// escaped with QuoteMeta.
-func ignoreRegexp(pattern string) string {
-	var re strings.Builder
-	re.WriteString("^")
-	for i := 0; i < len(pattern); i++ {
-		ch := pattern[i]
-		switch {
-		case strings.HasPrefix(pattern[i:], "**/"):
-			// Any number of directories, including none.
-			re.WriteString("(.*/)?")
-			i += 2
-		case strings.HasPrefix(pattern[i:], "**"):
-			re.WriteString(".*")
-			i++
-		case ch == '*':
-			re.WriteString("[^/]*")
-		case ch == '?':
-			re.WriteString("[^/]")
-		case ch == '[':
-			// A range, written as regular expressions write them, up to
-			// its ]; one that is never closed is taken as a [.
-			end := strings.IndexByte(pattern[i+1:], ']')
-			if end < 0 {
-				re.WriteString(`\[`)
-				continue
-			}
-			class := pattern[i+1 : i+1+end]
-			if strings.HasPrefix(class, "!") {
-				class = "^" + class[1:]
-			}
-			re.WriteString("[" + strings.ReplaceAll(class, `\`, `\\`) + "]")
-			i += end + 1
-		case ch == '\\' && i+1 < len(pattern):
-			i++
-			re.WriteString(regexp.QuoteMeta(pattern[i : i+1]))
-		default:
-			re.WriteString(regexp.QuoteMeta(string(ch)))
-		}
-	}
-	re.WriteString("$")
-	return re.String()
-}
-
 // ignored reports whether patterns leave out rel, a slash-separated path
 // relative to the context: whether the last pattern that matches it or a
 // directory it is in isn't an exception.
 func ignored(patterns []ignorePattern, rel string) bool {
 	excluded := false
 	for _, p := range patterns {
-		if matchesOrParent(p.pattern, rel) {
-			excluded = !p.exception
+		// Whether the pattern matches rel, or one of the directories it is
+		// in.
+		for dir := rel; dir != "." && dir != "/" && dir != ""; dir = path.Dir(dir) {
+			if p.pattern.MatchString(dir) {
+				excluded = !p.exception
+				break
+			}
 		}
 	}
 	return excluded
-}
-
-// matchesOrParent reports whether re matches rel, or one of the directories
-// it is in.
-func matchesOrParent(re *regexp.Regexp, rel string) bool {
-	for p := rel; p != "." && p != "/" && p != ""; p = path.Dir(p) {
-		if re.MatchString(p) {
-			return true
-		}
-	}
-	return false
 }
 
 // hasExceptions reports whether any pattern is an exception, which could

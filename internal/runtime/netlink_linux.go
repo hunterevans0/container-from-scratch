@@ -6,7 +6,6 @@ import (
 	"encoding/binary"
 	"errors"
 	"fmt"
-	"net"
 	"syscall"
 )
 
@@ -117,11 +116,6 @@ func cString(s string) []byte {
 	return append([]byte(s), 0)
 }
 
-// uint32Value is n as 4 bytes, for an attribute holding a number.
-func uint32Value(n int) []byte {
-	return binary.NativeEndian.AppendUint32(nil, uint32(n))
-}
-
 // ifInfo is a struct ifinfomsg: which interface (0 for one being created,
 // or one named by IFLA_IFNAME), and the flags to change (change) and what
 // to set them to (flags).
@@ -173,85 +167,4 @@ func (c *netlinkConn) do(r *netlinkRequest) error {
 			return nil
 		}
 	}
-}
-
-// createBridge makes a bridge, a virtual switch, with a fixed MAC address.
-// Otherwise a bridge takes the lowest MAC address of the interfaces plugged
-// into it, which changes as containers come and go, and the containers'
-// ARP caches would point at an address the gateway no longer has.
-func (c *netlinkConn) createBridge(name string, mac net.HardwareAddr) error {
-	r := newRequest(syscall.RTM_NEWLINK, syscall.NLM_F_CREATE|syscall.NLM_F_EXCL, ifInfo(0, 0, 0))
-	r.attr(syscall.IFLA_IFNAME, cString(name))
-	r.attr(syscall.IFLA_ADDRESS, mac)
-	r.nested(syscall.IFLA_LINKINFO, func() {
-		r.attr(iflaInfoKind, cString("bridge"))
-	})
-	return c.do(r)
-}
-
-// createVeth makes a veth pair, two interfaces joined like the ends of a
-// cable: name, up and plugged into the bridge with index master, and peer,
-// with MAC address peerMAC, in the network namespace of process peerPID.
-func (c *netlinkConn) createVeth(name string, master int, peer string, peerMAC net.HardwareAddr, peerPID int) error {
-	r := newRequest(syscall.RTM_NEWLINK, syscall.NLM_F_CREATE|syscall.NLM_F_EXCL, ifInfo(0, syscall.IFF_UP, syscall.IFF_UP))
-	r.attr(syscall.IFLA_IFNAME, cString(name))
-	r.attr(syscall.IFLA_MASTER, uint32Value(master))
-	r.nested(syscall.IFLA_LINKINFO, func() {
-		r.attr(iflaInfoKind, cString("veth"))
-		r.nested(iflaInfoData, func() {
-			// The peer is described as an interface of its own: an
-			// ifinfomsg, then its attributes.
-			r.nested(vethInfoPeer, func() {
-				r.data = append(r.data, ifInfo(0, 0, 0)...)
-				r.attr(syscall.IFLA_IFNAME, cString(peer))
-				r.attr(syscall.IFLA_ADDRESS, peerMAC)
-				r.attr(syscall.IFLA_NET_NS_PID, uint32Value(peerPID))
-			})
-		})
-	})
-	return c.do(r)
-}
-
-// deleteLink deletes the interface called name. Deleting either end of a
-// veth pair deletes both.
-func (c *netlinkConn) deleteLink(name string) error {
-	r := newRequest(syscall.RTM_DELLINK, 0, ifInfo(0, 0, 0))
-	r.attr(syscall.IFLA_IFNAME, cString(name))
-	return c.do(r)
-}
-
-// setUp brings an interface up.
-func (c *netlinkConn) setUp(index int) error {
-	return c.do(newRequest(syscall.RTM_NEWLINK, 0, ifInfo(index, syscall.IFF_UP, syscall.IFF_UP)))
-}
-
-// addAddress gives an interface an IPv4 address. The kernel adds a route to
-// the address's subnet through the interface.
-func (c *netlinkConn) addAddress(index int, address *net.IPNet) error {
-	prefix, _ := address.Mask.Size()
-	// struct ifaddrmsg: family, prefix length, flags, scope, and interface.
-	body := make([]byte, syscall.SizeofIfAddrmsg)
-	body[0] = syscall.AF_INET
-	body[1] = byte(prefix)
-	binary.NativeEndian.PutUint32(body[4:], uint32(index))
-	r := newRequest(syscall.RTM_NEWADDR, syscall.NLM_F_CREATE|syscall.NLM_F_EXCL, body)
-	r.attr(syscall.IFA_LOCAL, address.IP.To4())
-	r.attr(syscall.IFA_ADDRESS, address.IP.To4())
-	return c.do(r)
-}
-
-// addDefaultRoute sends everything that has no more specific route to
-// gateway.
-func (c *netlinkConn) addDefaultRoute(gateway net.IP) error {
-	// struct rtmsg: family, destination and source prefix lengths (0, so
-	// any destination), TOS, table, protocol, scope, type, and flags.
-	body := make([]byte, syscall.SizeofRtMsg)
-	body[0] = syscall.AF_INET
-	body[4] = syscall.RT_TABLE_MAIN
-	body[5] = syscall.RTPROT_BOOT
-	body[6] = syscall.RT_SCOPE_UNIVERSE
-	body[7] = syscall.RTN_UNICAST
-	r := newRequest(syscall.RTM_NEWROUTE, syscall.NLM_F_CREATE|syscall.NLM_F_EXCL, body)
-	r.attr(syscall.RTA_GATEWAY, gateway.To4())
-	return c.do(r)
 }
