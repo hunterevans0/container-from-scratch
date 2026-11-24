@@ -3,7 +3,7 @@ ROOTFS ?= /var/lib/runt/rootfs
 # Empty means the user running sudo.
 USERNS_USER ?=
 
-.PHONY: build build-debug test integration features vet hello hello-image rootfs apparmor shell debug debug-init debug-attach-init debug-integration clean
+.PHONY: build build-debug test integration features vet hello hello-image sqlite-image sqlite-from-scratch-image rootfs apparmor shell debug debug-init debug-attach-init debug-integration clean
 
 # CGO_ENABLED=0: dropping capabilities uses syscall.AllThreadsSyscall, which
 # does not work in a cgo binary.
@@ -41,6 +41,22 @@ hello:
 hello-image: build
 	CGO_ENABLED=0 go build -o examples/hello/hello ./examples/hello
 	sudo ./runt build -t hello examples/hello
+
+# A SQLite image, called sqlite: Alpine with sqlite3 (see examples/sqlite).
+# Building pulls alpine:3.20 and installs the package, so it needs the
+# internet. Run it with a volume, so the database is kept:
+# sudo ./runt run -it -v sqlitedata:/data --image sqlite
+sqlite-image: build
+	sudo ./runt build -t sqlite examples/sqlite
+
+# The same shell FROM scratch, called sqlite-from-scratch: sqlite3 compiled
+# statically in an Alpine stage, and only the binary copied into an empty
+# image (see examples/sqlite-from-scratch). Compare the two in runt images.
+# Building downloads alpine:3.20, gcc, and SQLite's source, so it needs the
+# internet. Run it as the sqlite image is:
+# sudo ./runt run -it -v sqlitedata:/data --image sqlite-from-scratch
+sqlite-from-scratch-image: build
+	sudo ./runt build -t sqlite-from-scratch examples/sqlite-from-scratch
 
 rootfs:
 	sudo USERNS_USER=$(USERNS_USER) scripts/make-rootfs.sh $(ROOTFS)
